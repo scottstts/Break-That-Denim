@@ -5,6 +5,7 @@ import { add, dot, normalize, scale, sub, transformPoint, type Vec3 } from '../r
 import { Interaction } from '../simulation/gpu/interaction';
 import { GPU_DEFAULTS, GpuSolver } from '../simulation/gpu/solver';
 import { loadDrape, settleDrape } from '../simulation/gpu/settle';
+import { Topology } from '../simulation/gpu/topology';
 import { compileScene, defaultSceneSpecs, type CompiledScene } from '../simulation/scene';
 import type { DevCommand, FromEngine, PointerCommand, ToEngine } from '../shared/messages';
 
@@ -22,10 +23,10 @@ const MAX_SUBSTEPS_PER_FRAME = 4;
 /** Presentation interval while simulating (s): physics runs in natural time, frames at <= 30/s. */
 const SIM_FRAME_INTERVAL = 1 / 30 - 0.002;
 /** Grip handle: maximum speed (m/s) and engagement lift toward the camera (m). */
-const HANDLE_MAX_SPEED = 0.35;
-const ENGAGE_LIFT = 0.0006;
+const HANDLE_MAX_SPEED = 0.8;
+const ENGAGE_LIFT = 0.002;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
-const REST_SPEED = 0.0015;
+const REST_SPEED = 0.003;
 const REST_TIME = 0.4;
 
 interface GripState {
@@ -45,6 +46,9 @@ class Engine {
   private solver!: GpuSolver;
   private renderer!: Renderer;
   private interaction!: Interaction;
+  private topology!: Topology;
+  /** Ruptures + pull-outs at the last connectivity analysis. */
+  private topologyEvents = 0;
   private camera: CameraState = { ...DEFAULT_CAMERA };
   private width = 1;
   private height = 1;
@@ -100,11 +104,14 @@ class Engine {
     this.interaction = new Interaction(this.device, this.solver, this.scene);
     this.solver.preSubstep = (pass) => this.interaction.encodeSubstep(pass);
     this.solver.preAssemble = (dispatch) => this.interaction.encode(dispatch);
+    this.topology = new Topology(this.device, this.solver, this.scene);
     this.renderer = new Renderer(this.device, format, this.solver, this.scene);
     this.renderer.resize(width, height);
     this.speedProbe = this.device.createBuffer({ label: 'speedProbe', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     await this.settle();
+    // authored defects could leave pieces disconnected from the start
+    await this.topology.request([]);
     this.ready = true;
     this.asleep = true;
     this.lastFrame = performance.now();
@@ -143,7 +150,11 @@ class Engine {
     enc.copyBufferToBuffer(this.snapshot.tails, 0, this.solver.tails, 0, this.solver.tails.size);
     enc.clearBuffer(this.solver.v);
     enc.clearBuffer(this.solver.ext);
+    enc.clearBuffer(this.solver.counters);
     this.device.queue.submit([enc.finish()]);
+    this.topology.reset();
+    void this.topology.request([]);
+    this.topologyEvents = 0;
     this.simBacklog = 0;
     this.asleep = true;
     this.dirty = true;
@@ -201,7 +212,8 @@ class Engine {
     const m = cameraMatrices(this.camera, this.width / this.height);
     const px = (c.x / this.cssWidth) * this.width;
     const py = (c.y / this.cssHeight) * this.height;
-    const radius = Math.max(4, 0.006 * this.height);
+    // larger than the projected node spacing (~3.5 mm cells, ~1.1% of the view height)
+    const radius = Math.max(8, 0.016 * this.height);
     const hit = await this.interaction.pickAt(m.viewProj, px, py, this.width, this.height, radius);
     if (token !== this.pickToken || !this.pointerDown || !hit) return;
     const forward = normalize(sub(this.camera.target, m.eye));
@@ -226,6 +238,8 @@ class Engine {
   private endGrip(): void {
     if (this.grip) {
       this.interaction.release();
+      // pieces held only by the grip are free now
+      void this.topology.request([]);
       this.grip = null;
       send({ type: 'cursor', cursor: 'grab' });
     }
@@ -233,9 +247,9 @@ class Engine {
 
   wheel(deltaY: number): void {
     if (this.grip) {
-      this.grip.depth = Math.max(-0.01, Math.min(0.03, this.grip.depth - deltaY * 0.00002));
+      this.grip.depth = Math.max(-0.03, Math.min(0.1, this.grip.depth - deltaY * 0.00006));
     } else {
-      this.camera.distance = Math.max(0.1, Math.min(0.36, this.camera.distance * Math.exp(deltaY * 0.0008)));
+      this.camera.distance = Math.max(0.3, Math.min(1.15, this.camera.distance * Math.exp(deltaY * 0.0008)));
       this.dirty = true;
     }
   }
@@ -270,8 +284,15 @@ class Engine {
     this.device.queue.submit([enc.finish()]);
     probe.mapAsync(GPUMapMode.READ).then(
       () => {
-        const speed = new Float32Array(probe.getMappedRange())[2];
+        const range = probe.getMappedRange();
+        const speed = new Float32Array(range)[2];
+        const c = new Uint32Array(range, 0, 2);
+        const events = c[0] + c[1];
         probe.unmap();
+        if (events !== this.topologyEvents) {
+          this.topologyEvents = events;
+          void this.topology.request(this.interaction.coreNodes);
+        }
         this.probeBusy = false;
         if (this.grip || this.asleep) {
           this.restFor = 0;

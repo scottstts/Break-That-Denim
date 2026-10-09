@@ -35,7 +35,7 @@ function coupon(nu: number, nv: number): LayerSpec {
     compressV: 0.01,
     shear: 0.01,
     collarRows: 2,
-    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, defectThreshold: 2, defectDensity: 0 },
+    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0 },
     wearStrengthLoss: [0, 0],
     seed: 3,
     perturbation: 0.3e-3,

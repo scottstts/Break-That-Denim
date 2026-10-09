@@ -98,7 +98,8 @@ fn gripInit(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 fn hasMaterial(n: u32) -> bool {
-  // a crossing with at least one intact span (isolated fragments are not grab targets)
+  // a cloth crossing with at least one intact span (debris and isolated fragments are not grab targets)
+  if (x[n].w > 0.5) { return false; }
   let a = segs[2u * n].flags;
   let b = segs[2u * n + 1u].flags;
   return ((a & 3u) == 1u) || ((b & 3u) == 1u);

@@ -1,6 +1,7 @@
-import { axialEnergyDensity, damagedResponse, isSeparated } from '../axial';
+import { axialEnergyDensity, bundleBrokenMask, bundleResponse } from '../axial';
+import { bendPsi, bendPsiDelta, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
-import { SEG_BROKEN, SEG_EXISTS, type CompiledScene, type LayerInfo } from '../scene';
+import { SEG_BROKEN, SEG_EXISTS, SEG_YARN_SHIFT, type CompiledScene, type LayerInfo } from '../scene';
 import { newtonStepPCG, resetLaggedLevels, type MGConfig } from './newtonMultigrid';
 
 /**
@@ -49,7 +50,7 @@ export class ReferenceSolver {
   readonly layerOf: Uint8Array;
   readonly restLength: Float64Array;
   readonly maxExt: Float64Array;
-  readonly segFlags: Uint8Array;
+  readonly segFlags: Uint16Array;
   readonly tails: Float64Array;
   /** History updates (cohesive damage, crossing slip). Off only while settling an authored drape. */
   historyEnabled = true;
@@ -85,7 +86,7 @@ export class ReferenceSolver {
     this.pred = new Float64Array(3 * N);
     this.restLength = Float64Array.from(scene.restLength);
     this.maxExt = Float64Array.from(scene.maxExt);
-    this.segFlags = Uint8Array.from(scene.segFlags);
+    this.segFlags = Uint16Array.from(scene.segFlags);
     this.tails = Float64Array.from(scene.tails);
     this.nbr = new Int32Array(4 * N).fill(-1);
     this.layerOf = new Uint8Array(N);
@@ -227,18 +228,27 @@ export class ReferenceSolver {
     this.e[2] = e2 / l;
     const L = this.restLength[s];
     const yarn = this.layer(a).material.yarns[f];
-    const [T, K] = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], l / L - 1);
+    const [T, K] = this.response(s, l / L - 1);
     const c = yarn.axialViscosity / (L * this.params.h);
     const fs = T + c * (l - ln);
     return [fs, Math.max(K, 0) / L + c, Math.max(fs, 0) / l, l];
   }
 
-  /** Elastic and viscous bending coefficients of the triple centered at node b. */
-  bendCoeffs(b: number, f: number, s0: number, s1: number): [number, number] {
+  /**
+   * Bending coefficients of the triple centered at node b: elastic kb, viscous kd, and the fold
+   * scale a = 4 Lm^2 of the fold-stiffening energy 0.5 kb Psi(|r|^2) (laws.ts).
+   */
+  bendCoeffs(b: number, f: number, s0: number, s1: number): [number, number, number] {
     const yarn = this.layer(b).material.yarns[f];
     const Lm = 0.5 * (this.restLength[s0] + this.restLength[s1]);
     const kb = yarn.bendRigidity / (Lm * Lm * Lm);
-    return [kb, (kb * yarn.bendViscosity) / this.params.h];
+    return [kb, (kb * yarn.bendViscosity) / this.params.h, 4 * Lm * Lm];
+  }
+
+  /** Elastic gradient coefficient kb Psi'(|r|^2) of the triple last loaded into r. */
+  private bendGradCoeff(kb: number, a: number): number {
+    const r = this.r;
+    return kb * bendPsi(r[0] * r[0] + r[1] * r[1] + r[2] * r[2], a)[1];
   }
 
   private triple(a: number, b: number, c: number): void {
@@ -256,16 +266,18 @@ export class ReferenceSolver {
     const sNext = nxt >= 0 ? 2 * n + f : -1;
     const { r, rn } = this;
     if (this.segActive(sPrev) && this.segActive(sNext)) {
-      const [ke, kd] = this.bendCoeffs(n, f, sPrev, sNext);
+      const [kb, kd, ab] = this.bendCoeffs(n, f, sPrev, sNext);
       this.triple(prev, n, nxt);
+      const ke = this.bendGradCoeff(kb, ab);
       for (let k = 0; k < 3; k++) g[k] += -2 * (ke * r[k] + kd * (r[k] - rn[k]));
     }
     if (this.segActive(sNext)) {
       const nxt2 = this.nbr[4 * nxt + 2 * f + 1];
       const sNext2 = nxt2 >= 0 ? 2 * nxt + f : -1;
       if (this.segActive(sNext2)) {
-        const [ke, kd] = this.bendCoeffs(nxt, f, sNext, sNext2);
+        const [kb, kd, ab] = this.bendCoeffs(nxt, f, sNext, sNext2);
         this.triple(n, nxt, nxt2);
+        const ke = this.bendGradCoeff(kb, ab);
         for (let k = 0; k < 3; k++) g[k] += ke * r[k] + kd * (r[k] - rn[k]);
       }
     }
@@ -273,8 +285,9 @@ export class ReferenceSolver {
       const prev2 = this.nbr[4 * prev + 2 * f];
       const sPrev2 = prev2 >= 0 ? 2 * prev2 + f : -1;
       if (this.segActive(sPrev2)) {
-        const [ke, kd] = this.bendCoeffs(prev, f, sPrev2, sPrev);
+        const [kb, kd, ab] = this.bendCoeffs(prev, f, sPrev2, sPrev);
         this.triple(prev2, prev, n);
+        const ke = this.bendGradCoeff(kb, ab);
         for (let k = 0; k < 3; k++) g[k] += ke * r[k] + kd * (r[k] - rn[k]);
       }
     }
@@ -333,7 +346,7 @@ export class ReferenceSolver {
       const d1 = this.pb[1] - this.pa[1];
       const d2 = this.pb[2] - this.pa[2];
       const l = Math.hypot(d0, d1, d2);
-      const fs = ks * (l - this.shearRest(cell));
+      const fs = shearLaw(ks, this.shearRest(cell), l)[0];
       g[0] -= (fs * d0) / l;
       g[1] -= (fs * d1) / l;
       g[2] -= (fs * d2) / l;
@@ -384,23 +397,28 @@ export class ReferenceSolver {
           const de = [db[0] - dn[0], db[1] - dn[1], db[2] - dn[2]];
           const l0 = Math.hypot(ec[0], ec[1], ec[2]);
           const ln = Math.hypot(en[0], en[1], en[2]);
-          const T0 = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], l0 / L - 1)[0];
+          const T0 = this.response(s, l0 / L - 1)[0];
           const c = yarn.axialViscosity / (L * h);
           alphas.forEach((a, k) => {
             const [dl, la] = lenChange(ec, de, a, l0);
-            const Ta = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], la / L - 1)[0];
+            const Ta = this.response(s, la / L - 1)[0];
             out[k] += 0.5 * (T0 + Ta) * dl + 0.5 * c * dl * (la + l0 - 2 * ln);
           });
         }
         const prev = this.nbr[4 * n + 2 * f];
         if (prev >= 0 && next >= 0 && this.segActive(2 * prev + f) && this.segActive(s)) {
-          const [ke, kd] = this.bendCoeffs(n, f, 2 * prev + f, s);
+          const [kb, kd, ab] = this.bendCoeffs(n, f, 2 * prev + f, s);
           const rn = [0, 1, 2].map((q) => x[3 * prev + q] - 2 * x[3 * n + q] + x[3 * next + q]);
           const r0 = [0, 1, 2].map((q) => rn[q] + dx[3 * prev + q] - 2 * d0[q] + dx[3 * next + q]);
           const dp = dirOf(prev);
           const dq = dirOf(next);
           const dr = [0, 1, 2].map((q) => dp[q] - 2 * dn[q] + dq[q]);
-          quad(ke * dot(r0, dr) + kd * dot([r0[0] - rn[0], r0[1] - rn[1], r0[2] - rn[2]], dr), (ke + kd) * dot(dr, dr));
+          quad(kd * dot([r0[0] - rn[0], r0[1] - rn[1], r0[2] - rn[2]], dr), kd * dot(dr, dr));
+          const q0 = dot(r0, r0);
+          alphas.forEach((a, k) => {
+            const dqa = 2 * a * dot(r0, dr) + a * a * dot(dr, dr);
+            out[k] += 0.5 * kb * bendPsiDelta(q0, q0 + dqa, dqa, ab);
+          });
         }
       }
       if (this.cellActive(n)) {
@@ -418,9 +436,10 @@ export class ReferenceSolver {
           const dp = dirOf(p);
           const de = [dq[0] - dp[0], dq[1] - dp[1], dq[2] - dp[2]];
           const l0 = Math.hypot(ec[0], ec[1], ec[2]);
+          const f0 = shearLaw(ks, Ld, l0)[0];
           alphas.forEach((a, k) => {
             const [dl, la] = lenChange(ec, de, a, l0);
-            out[k] += 0.5 * ks * dl * (la + l0 - 2 * Ld);
+            out[k] += 0.5 * (f0 + shearLaw(ks, Ld, la)[0]) * dl;
           });
         }
       }
@@ -460,10 +479,11 @@ export class ReferenceSolver {
       E += 0.5 * c * (l - ln) * (l - ln);
       const nb = this.nbr[4 * b + 2 * f + 1];
       if (nb >= 0 && this.segActive(2 * b + f)) {
-        const [ke, kd] = this.bendCoeffs(b, f, s, 2 * b + f);
+        const [kb, kd, ab] = this.bendCoeffs(b, f, s, 2 * b + f);
         this.triple(a, b, nb);
+        const r = this.r;
+        E += 0.5 * kb * bendPsi(r[0] * r[0] + r[1] * r[1] + r[2] * r[2], ab)[0];
         for (let q = 0; q < 3; q++) {
-          E += 0.5 * ke * this.r[q] * this.r[q];
           const d = this.r[q] - this.rn[q];
           E += 0.5 * kd * d * d;
         }
@@ -483,7 +503,7 @@ export class ReferenceSolver {
         this.pos(p, this.pa);
         this.pos(q, this.pb);
         const l = Math.hypot(this.pb[0] - this.pa[0], this.pb[1] - this.pa[1], this.pb[2] - this.pa[2]);
-        E += 0.5 * ks * (l - Ld) * (l - Ld);
+        E += shearLaw(ks, Ld, l)[2];
       }
     }
     return E;
@@ -532,14 +552,17 @@ export class ReferenceSolver {
     return Math.hypot(this.x[3 * b] - this.x[3 * a], this.x[3 * b + 1] - this.x[3 * a + 1], this.x[3 * b + 2] - this.x[3 * a + 2]);
   }
 
+  /** Damaged bundle response (T, dT/deps) of span s at strain eps (yarn-level damage, axial.ts). */
+  response(s: number, eps: number): [number, number] {
+    const yarn = this.layer(s >> 1).material.yarns[s & 1];
+    return bundleResponse(yarn, yarn.strandsPerSpan ?? 1, this.restLength[s], this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], eps, this.scene.yarnPeaks[s]);
+  }
+
   /** Tension of an active segment at committed positions (no viscosity) and dT/dL at fixed length. */
   segTension(s: number): [number, number] {
-    const a = s >> 1;
-    const f = s & 1;
     const L = this.restLength[s];
     const l = this.segLength(s);
-    const yarn = this.layer(a).material.yarns[f];
-    const [T, K] = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], l / L - 1);
+    const [T, K] = this.response(s, l / L - 1);
     return [T, Math.max(K, 0) * (l / (L * L))];
   }
 
@@ -550,7 +573,10 @@ export class ReferenceSolver {
       const ext = this.segLength(s) - this.restLength[s];
       if (ext > this.maxExt[s]) this.maxExt[s] = ext;
       const yarn = this.layer(s >> 1).material.yarns[s & 1];
-      if (isSeparated(yarn, this.restLength[s], this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s])) {
+      const b = yarn.strandsPerSpan ?? 1;
+      const mask = bundleBrokenMask(yarn, b, this.restLength[s], this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], this.scene.yarnPeaks[s]);
+      this.segFlags[s] |= mask << SEG_YARN_SHIFT;
+      if (mask === (1 << b) - 1) {
         this.rupture(s);
         this.brokenCount++;
       }

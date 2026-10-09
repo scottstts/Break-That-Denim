@@ -18,7 +18,15 @@
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
 
-fn pinnedN(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u; }
+// mounted, or no longer part of the cloth solve (ballistic debris / retired, x.w > 0)
+fn pinnedN(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 0.5; }
+
+// Debris leaves the scene below this height or beyond this lateral distance (m) and is retired.
+const RETIRE_Z: f32 = -0.25;
+const RETIRE_R: f32 = 0.6;
+// Quadratic air drag of a cloth scrap per unit speed (1/m): 0.5 rho Cd / (areal density), with
+// Cd ~ 1 and 0.4 kg/m^2 denim; terminal fall speed sqrt(g / k) ~ 2.6 m/s.
+const DEBRIS_DRAG: f32 = 1.5;
 
 fn lattice(l: u32) -> vec4<u32> { return P.layers[l].lattice; }
 
@@ -38,12 +46,21 @@ fn nbr(n: u32, f: u32, dir: i32) -> i32 {
 fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
+  let h = P.hg.x;
+  let w = x[n].w;
+  if (w > 0.5 && w < 1.5) {
+    // ballistic debris: free fall with drag, outside the linear solve
+    let v0 = v[n].xyz;
+    let vb = v0 / (1.0 + DEBRIS_DRAG * h * length(v0)) + h * P.hg.yzw;
+    pred[n] = vec4<f32>(h * vb, 0.0);
+    dx[n] = vec4<f32>(h * vb, 0.0);
+    return;
+  }
   if (pinnedN(n)) {
     pred[n] = vec4<f32>(0.0);
     dx[n] = vec4<f32>(0.0);
     return;
   }
-  let h = P.hg.x;
   let hv = h * v[n].xyz;
   pred[n] = vec4<f32>(hv + h * h * P.hg.yzw, 0.0);
   dx[n] = vec4<f32>(hv, 0.0);
@@ -59,7 +76,9 @@ fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   let old = dx[n].xyz;
   // step length chosen by the line search (energy.wgsl)
   let alpha = bitcast<f32>(atomicLoad(&counters[3]));
-  var d = old + alpha * delta[n].xyz - m.xyz;
+  // firewall: a non-finite direction never enters the state
+  let dn = select(vec3<f32>(0.0), delta[n].xyz, finite3(delta[n].xyz) && finite1(alpha));
+  var d = old + alpha * dn - m.xyz;
   let l = length(d);
   if (l > m.w) { d = d * (m.w / l); }
   let nd = m.xyz + d;
@@ -74,12 +93,22 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   let d = dx[n].xyz;
+  let lastUpdate = dx[n].w;
+  let w = x[n].w;
+  dx[n] = vec4<f32>(0.0);
+  if (w > 1.5) { return; }
+  let p = x[n].xyz + d;
+  if (w > 0.5 && (p.z < RETIRE_Z || length(p.xy) > RETIRE_R)) {
+    // debris left the scene: freeze and hide it
+    x[n] = vec4<f32>(p, 2.0);
+    v[n] = vec4<f32>(0.0);
+    return;
+  }
   // v.w carries the node's last Newton update into the history kernels
-  v[n] = vec4<f32>(d / P.hg.x, dx[n].w);
+  v[n] = vec4<f32>(d / P.hg.x, lastUpdate);
   // largest speed since the host last cleared it (rest detection)
   atomicMax(&counters[2], bitcast<u32>(length(d) / P.hg.x));
-  x[n] = vec4<f32>(x[n].xyz + d, 0.0);
-  dx[n] = vec4<f32>(0.0);
+  x[n] = vec4<f32>(p, w);
 }
 
 @compute @workgroup_size(128)
@@ -91,11 +120,16 @@ fn damage(@builtin(global_invocation_id) gid: vec3<u32>) {
   let a = s >> 1u;
   let f = s & 1u;
   let b = u32(nbr(a, f, 1));
+  if (x[a].w > 0.5 || x[b].w > 0.5) { return; }
   // an unconverged iterate must not commit damage: defer until both ends have converged locally
   if (max(v[a].w, v[b].w) > historyTolerance()) { return; }
   let ext = length(x[b].xyz - x[a].xyz) - sg.rest;
   if (ext > sg.maxExt) { sg.maxExt = ext; }
-  if (isSeparated(sg.rest, sg)) {
+  let mat = P.layers[nodes[a].ijl >> 24u];
+  let strands = strandsOf(mat, f);
+  let mask = bundleBrokenMask(mat.yarn[f], strands, sg.rest, sg);
+  sg.flags = sg.flags | (mask << SEG_YARN_SHIFT);
+  if (mask == (1u << strands) - 1u) {
     sg.flags = sg.flags | SEG_BROKEN;
     tails[4u * a + 2u * f + 1u] += sg.rest * sg.failSite;
     tails[4u * b + 2u * f] += sg.rest * (1.0 - sg.failSite);
@@ -110,8 +144,8 @@ fn spanTension(owner: u32, f: u32) -> vec2<f32> {
   let b = u32(nbr(owner, f, 1));
   let l = length(x[b].xyz - x[owner].xyz);
   let L = sg.rest;
-  let y = P.layers[nodes[owner].ijl >> 24u].yarn[f];
-  let r = damagedResponse(y, L, sg, l / L - 1.0);
+  let mat = P.layers[nodes[owner].ijl >> 24u];
+  let r = bundleResponse(mat.yarn[f], strandsOf(mat, f), L, sg, l / L - 1.0);
   return vec2<f32>(r.x, max(r.y, 0.0) * l / (L * L));
 }
 

@@ -18,7 +18,7 @@ struct LayerMat {
   yarn: array<Yarn, 2>,
   // shearStiffness, crossingFriction, crossingWrap, pitchU
   a: vec4<f32>,
-  // pitchV, normal air drag (N s / m^3), unused, unused
+  // pitchV, normal air drag (N s / m^3), failure strands per span of family u, of family v
   b: vec4<f32>,
 };
 
@@ -43,17 +43,22 @@ struct NodeStatic {
 
 struct Seg {
   rest: f32,
+  // bundle peak tension (yarn k peaks at peak * multiplier k)
   peak: f32,
   soft: f32,
-  peakStrain: f32,
+  // packed u8 strength multiplier per bundled yarn (0 = absent), see axial.ts unpackYarnPeak
+  yarnPeaks: u32,
   maxExt: f32,
+  // bits 0..2 SEG_*, bits 8..11 yarn k absent or separated
   flags: u32,
   failSite: f32,
-  pad: f32,
+  // packed u8 failure site per bundled yarn (fraction from the owning node, /255; render only)
+  yarnSites: u32,
 };
 
 const SEG_EXISTS: u32 = 1u;
 const SEG_BROKEN: u32 = 2u;
+const SEG_YARN_SHIFT: u32 = 8u;
 const NODE_PINNED: u32 = 1u;
 
 struct LevelInfo {
@@ -80,25 +85,36 @@ fn axialStiffness(y: Yarn, eps: f32) -> f32 {
   return y.eaHigh;
 }
 
+// Strain at which the undamaged curve reaches tension t > 0 (cancellation-free quadratic root).
+fn strainAtTension(y: Yarn, t: f32) -> f32 {
+  let ec = y.crimpStrain;
+  let dk = y.eaHigh - y.eaLow;
+  let tc = y.eaLow * ec + dk * ec * 0.5;
+  if (t >= tc) { return ec + (t - tc) / y.eaHigh; }
+  let a = dk / (2.0 * ec);
+  return 2.0 * t / (y.eaLow + sqrt(y.eaLow * y.eaLow + 4.0 * a * t));
+}
+
 fn envelopeTension(peak: f32, peakExt: f32, soft: f32, ext: f32) -> f32 {
   if (ext <= peakExt) { return peak; }
   return max(0.0, peak * (1.0 - (ext - peakExt) / soft));
 }
 
-// Damaged tension and PSD solver tangent for committed history maxExt. Returns (T, K).
-fn damagedResponse(y: Yarn, L: f32, s: Seg, eps: f32) -> vec2<f32> {
-  let peakExt = s.peakStrain * L;
+// Damaged tension and PSD solver tangent of one yarn law (peak tension `peak`) for committed history
+// maxExt. Returns (T, K).
+fn damagedResponse(y: Yarn, L: f32, peak: f32, soft: f32, maxExt: f32, eps: f32) -> vec2<f32> {
+  let peakExt = strainAtTension(y, peak) * L;
   let ext = eps * L;
   let tEl = axialTension(y, eps);
   let kEl = axialStiffness(y, eps);
   var f = 1.0;
-  if (s.maxExt > peakExt) {
-    let tAtMax = axialTension(y, s.maxExt / L);
-    f = select(0.0, envelopeTension(s.peak, peakExt, s.soft, s.maxExt) / tAtMax, tAtMax > 0.0);
+  if (maxExt > peakExt) {
+    let tAtMax = axialTension(y, maxExt / L);
+    f = select(0.0, envelopeTension(peak, peakExt, soft, maxExt) / tAtMax, tAtMax > 0.0);
   }
   let tSec = f * tEl;
   if (ext > peakExt) {
-    let tEnv = envelopeTension(s.peak, peakExt, s.soft, ext);
+    let tEnv = envelopeTension(peak, peakExt, soft, ext);
     if (tEnv < tSec) {
       return vec2<f32>(tEnv, select(0.0, tEnv / tEl * kEl, tEl > 0.0));
     }
@@ -106,9 +122,105 @@ fn damagedResponse(y: Yarn, L: f32, s: Seg, eps: f32) -> vec2<f32> {
   return vec2<f32>(tSec, f * kEl);
 }
 
-fn isSeparated(L: f32, s: Seg) -> bool {
-  return s.maxExt >= s.peakStrain * L + s.soft;
+fn yarnPeakMultiplier(packed: u32, k: u32) -> f32 {
+  let u = (packed >> (8u * k)) & 0xFFu;
+  return select(0.4 + 1.2 * f32(u - 1u) / 254.0, 0.0, u == 0u);
 }
+
+fn strandsOf(mat: LayerMat, f: u32) -> u32 { return u32(select(mat.b.z, mat.b.w, f == 1u)); }
+
+// Strand-level damage in a bundled span of b strands (axial.ts bundleResponse): mean of the
+// per-strand responses.
+fn bundleResponse(y: Yarn, b: u32, L: f32, s: Seg, eps: f32) -> vec2<f32> {
+  var r = vec2<f32>(0.0);
+  for (var k = 0u; k < b; k++) {
+    let m = yarnPeakMultiplier(s.yarnPeaks, k);
+    if (m == 0.0) { continue; }
+    r += damagedResponse(y, L, s.peak * m, s.soft, s.maxExt, eps);
+  }
+  return r / f32(b);
+}
+
+// Bit k: strand k of the bundle (of b strands) is absent or fully separated.
+fn bundleBrokenMask(y: Yarn, b: u32, L: f32, s: Seg) -> u32 {
+  var mask = 0u;
+  for (var k = 0u; k < b; k++) {
+    let m = yarnPeakMultiplier(s.yarnPeaks, k);
+    if (m == 0.0 || s.maxExt >= strainAtTension(y, s.peak * m) * L + s.soft) { mask |= 1u << k; }
+  }
+  return mask;
+}
+
+// Finiteness by bit pattern (immune to fast-math assumptions about NaN).
+fn finite1(v: f32) -> bool { return (bitcast<u32>(v) & 0x7f800000u) != 0x7f800000u; }
+fn finite3(v: vec3<f32>) -> bool { return finite1(v.x) && finite1(v.y) && finite1(v.z); }
+
+// Inverse of an SPD pivot block, regularized relative to its scale: in f32 a Schur complement can
+// lose all of its inertia digits next to stiff yarn terms (exact cancellation); the shift keeps the
+// preconditioner finite and positive definite.
+fn pivotInverse(m: mat3x3<f32>) -> mat3x3<f32> {
+  let s = max(max(abs(m[0][0]), abs(m[1][1])), abs(m[2][2]));
+  let e = 2e-6 * s + 1e-30;
+  let r = m + mat3x3<f32>(vec3<f32>(e, 0.0, 0.0), vec3<f32>(0.0, e, 0.0), vec3<f32>(0.0, 0.0, e));
+  let inv = inverse3(r);
+  if (!finite3(inv[0]) || !finite3(inv[1]) || !finite3(inv[2])) {
+    let d = 1.0 / max(s, 1e-30);
+    return mat3x3<f32>(vec3<f32>(d, 0.0, 0.0), vec3<f32>(0.0, d, 0.0), vec3<f32>(0.0, 0.0, d));
+  }
+  return inv;
+}
+
+// ---------------------------------------------------------------- fold-stiffening bending
+
+// Bending energy of a yarn triple: 0.5 kb Psi(q), q = |x_a - 2 x_b + x_c|^2, a = 4 Lm^2 (fold
+// stiffening, see src/simulation/laws.ts, mirrored exactly here).
+const BEND_S0: f32 = 0.85;
+
+// (Psi, Psi', Psi'') at q.
+fn bendPsi(q: f32, a: f32) -> vec3<f32> {
+  let s = q / a;
+  if (s < BEND_S0) {
+    let d = 1.0 - s;
+    return vec3<f32>(q / d, 1.0 / (d * d), 2.0 / (a * d * d * d));
+  }
+  let d0 = 1.0 - BEND_S0;
+  let q0 = BEND_S0 * a;
+  let p1 = 1.0 / (d0 * d0);
+  let p2 = 2.0 / (a * d0 * d0 * d0);
+  let t = q - q0;
+  return vec3<f32>(q0 / d0 + p1 * t + 0.5 * p2 * t * t, p1 + p2 * t, p2);
+}
+
+// Psi(q1) - Psi(q0) without cancellation for small changes (dq = q1 - q0 computed stably).
+fn bendPsiDelta(q0: f32, q1: f32, dq: f32, a: f32) -> f32 {
+  let s0 = q0 / a;
+  let s1 = q1 / a;
+  if (s0 < BEND_S0 && s1 < BEND_S0) { return dq / ((1.0 - s0) * (1.0 - s1)); }
+  return bendPsi(q1, a).x - bendPsi(q0, a).x;
+}
+
+// Shear-locking diagonal (see shearLaw in src/simulation/laws.ts): (force, tangent stiffness).
+const SHEAR_JAM: f32 = 0.16;
+const SHEAR_RAMP: f32 = 0.08;
+const SHEAR_LOCK: f32 = 40.0;
+
+fn shearLaw(ks: f32, Ld: f32, l: f32) -> vec2<f32> {
+  var f = ks * (l - Ld);
+  var k = ks;
+  let c = (Ld - l) / Ld - SHEAR_JAM;
+  if (c > 0.0) {
+    let extra = ks * (SHEAR_LOCK - 1.0);
+    if (c < SHEAR_RAMP) {
+      f -= extra * Ld * c * c / (2.0 * SHEAR_RAMP);
+      k += extra * c / SHEAR_RAMP;
+    } else {
+      f -= extra * Ld * (c - 0.5 * SHEAR_RAMP);
+      k += extra;
+    }
+  }
+  return vec2<f32>(f, k);
+}
+
 
 fn segActive(s: Seg) -> bool {
   return (s.flags & (SEG_EXISTS | SEG_BROKEN)) == SEG_EXISTS;

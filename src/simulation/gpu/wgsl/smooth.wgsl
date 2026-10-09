@@ -104,7 +104,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     for (var k = ks + 1u; k < ke; k++) {
       let n = n0 + k * st;
       let rk = lineRow(n, k, len, fam);
-      let Minv = inverse3(rk.B - rk.A * Gp);
+      let Minv = pivotInverse(rk.B - rk.A * Gp);
       var G = zero3;
       var Cext = zero3;
       if (k + 1u < ke) { G = Minv * rk.C; } else { Cext = rk.C; }
@@ -171,7 +171,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
     var Gp = zero3;
     var yp = vec3<f32>(0.0);
     for (var q = 0u; q < Q; q++) {
-      let Minv = inverse3(qD[q] - qL[q] * Gp);
+      let Minv = pivotInverse(qD[q] - qL[q] * Gp);
       let G = Minv * qU[q];
       let y = Minv * (qr[q] - qL[q] * yp);
       qU[q] = G;

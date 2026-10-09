@@ -9,6 +9,8 @@
 @group(0) @binding(3) var<storage, read> cellFlags: array<u32>;
 @group(0) @binding(4) var shadowMap: texture_depth_2d;
 @group(0) @binding(5) var shadowSampler: sampler_comparison;
+@group(0) @binding(6) var weaveTile: texture_2d_array<f32>;
+@group(0) @binding(7) var tileSampler: sampler;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -18,6 +20,8 @@ struct VOut {
   @location(3) dPt: vec3<f32>,
   @location(4) wearV: f32,
   @location(5) @interpolate(flat) layer: u32,
+  // cell (i, j) and its missing-yarn masks (see CellYarns)
+  @location(6) @interpolate(flat) cell: vec4<u32>,
 };
 
 fn degenerate() -> VOut {
@@ -32,7 +36,9 @@ fn surfaceVertex(vi: u32, cell: u32) -> VOut {
     if (cell >= R.layers[k].refine.z) { l = k; }
   }
   let LR = R.layers[l];
-  if (cell >= R.counts.z || cellFlags[cell] == 0u) { return degenerate(); }
+  if (cell >= R.counts.z) { return degenerate(); }
+  let flags = cellFlags[cell];
+  if (flags == 0u) { return degenerate(); }
   let L = LR.lattice;
   let S = LR.twill.z;
   let local = cell - LR.refine.z;
@@ -55,6 +61,7 @@ fn surfaceVertex(vi: u32, cell: u32) -> VOut {
   let bv = f32(bundleOf(LR, 0u));
   o.uv = vec2<f32>((f32(I) / f32(S)) * bu + 0.5 * (bu - 1.0), (f32(J) / f32(S)) * bv + 0.5 * (bv - 1.0));
   o.layer = l;
+  o.cell = vec4<u32>(ci, cj, flags >> 8u, 0u);
   o.pos = F.viewProj * vec4<f32>(a.xyz, 1.0);
   return o;
 }
@@ -79,6 +86,9 @@ struct FsOut {
 @fragment
 fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let LR = R.layers[in.layer];
+  let bu = i32(bundleOf(LR, 1u));
+  let bv = i32(bundleOf(LR, 0u));
+  let cy = CellYarns(i32(in.cell.x) * bu, i32(in.cell.y) * bv, bu, bv, i32(yarnsPerStrand(LR, 1u)), i32(yarnsPerStrand(LR, 0u)), in.cell.z);
   let ls = length(in.dPs);
   let lt = length(in.dPt);
   let Tu = in.dPs / ls;
@@ -97,7 +107,13 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let dx = dpdx(in.uv);
   let dy = dpdy(in.uv);
   let fy = max(length(dx), length(dy));
-  let lod = smoothstep(0.45, 1.1, fy);
+  // yarns near the pixel size: the prefiltered tile shades the weave. Cells with missing yarns still
+  // evaluate the exact weave per sample for their coverage (the gaps are the damage) and for which
+  // family shows, so both kinds of cell share one appearance
+  let intactCell = in.cell.z == 0u;
+  let lodTile = smoothstep(0.28, 0.55, fy);
+  let lod = select(smoothstep(0.45, 1.1, fy), 0.0, intactCell);
+  var warpTop = 0.0;
 
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, Nf);
@@ -107,7 +123,13 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   // radius (~45 um), which blurs the weave the way loose fibres do (and fills sub-fuzz gaps)
   var offs = array<vec2<f32>, 4>(vec2<f32>(-0.125, -0.375), vec2<f32>(0.375, -0.125), vec2<f32>(-0.375, 0.125), vec2<f32>(0.125, 0.375));
   let fuzzR = vec2<f32>(45e-6 / (LR.pitch.x * su), 45e-6 / (LR.pitch.y * sv));
-  let rot = hash2f(u32(in.pos.x), u32(in.pos.y)) * 6.2831853;
+  let rotSeed = hash11(u32(in.pos.x) * 7919u + u32(in.pos.y));
+  let rot = hashf(rotSeed) * 6.2831853;
+  // weave below the pixel footprint: coverage left by the cell's missing yarns (warp-faced: a missing
+  // warp exposes the picks beneath, which still cover most of their area)
+  let missW = f32(countOneBits(in.cell.z & 0xFFu) * yarnsPerStrand(LR, 1u)) / f32(2 * bu);
+  let missP = f32(countOneBits(in.cell.z & 0xFF00u) * yarnsPerStrand(LR, 0u)) / f32(2 * bv);
+  let lodCover = 1.0 - missW * (0.3 + 0.7 * missP);
   let hTop = LR.warp.z + 0.5 * LR.warp.y;
   let sgn = select(-1.0, 1.0, front);
   // family-mean albedos for the softly blended second yarn
@@ -124,14 +146,16 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   var cnt = 0.0;
   var mask = 0u;
   for (var k = 0u; k < 4u; k++) {
+    if (lodTile >= 1.0 && intactCell) { break; }
     let ang = rot + f32(k) * 2.39996;
     let jr = sqrt((f32(k) + 0.5) / 4.0);
     let uvk = in.uv + dx * offs[k].x + dy * offs[k].y + vec2<f32>(cos(ang), sin(ang)) * jr * fuzzR;
-    let w2 = weave2(LR, uvk.x, uvk.y, su, sv, front, 0.018e-3);
-    if (w2.a.covered || lod >= 0.99) { mask |= (1u << k); }
+    let w2 = weave2(LR, uvk.x, uvk.y, su, sv, front, 0.018e-3, cy);
+    if (w2.a.covered || (lod >= 0.99 && hashf(rotSeed + k) < lodCover)) { mask |= (1u << k); }
     if (!w2.a.covered) { continue; }
     let hit = w2.a;
     let wb = w2.wb;
+    warpTop += select(0.0, 1.0, hit.fam == 1u) * (1.0 - wb) + select(0.0, 1.0, w2.b.covered && w2.b.fam == 1u) * wb;
     let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, in.wearV, pix);
     var albedo = look.albedo;
     var slope = hit.slope;
@@ -148,7 +172,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let tw = select(LR.weft.w, LR.warp.w, hit.fam == 1u);
     let hn = clamp((sgn * h + hTop) / (2.0 * hTop), 0.0, 1.0);
     // interstices between floats (where the weft shows) are deep and shadowed by the neighbours
-    let ao = mix(0.22, 1.0, hn * hn * (3.0 - 2.0 * hn));
+    let ao = weaveOcclusion(hn);
     albDirect += albedo * mix(0.55, 1.0, ao);
     albAmb += albedo * ao;
     nSum += Ny;
@@ -168,6 +192,29 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     acc *= cnt;
   }
   var color = acc / max(cnt, 1.0);
+  if (lodTile > 0.0) {
+    let rep = f32(LR.twill.x);
+    let tex = textureSampleGrad(weaveTile, tileSampler, in.uv / rep, in.layer, dx / rep, dy / rep);
+    // the back of a warp-faced twill shows mostly weft; a damaged cell shows what its samples hit
+    let wfTile = select(1.0 - tex.x, tex.x, front);
+    let wf = select(warpTop / max(cnt, 1.0), wfTile, intactCell || cnt == 0.0);
+    let Ny = normalize(Nf - sgn * (tex.z * Tu + tex.w * Tv));
+    let k = i32(round(in.uv.x));
+    let m = i32(round(in.uv.y));
+    let fl = i32(round((in.uv.y - warpUnderDist(LR, k, in.uv.y)) / rep));
+    let lw = yarnLook(LR, in.layer, 1u, k, fl, in.uv.y * LR.pitch.y, 0.3, in.wearV, pix);
+    let lf = yarnLook(LR, in.layer, 0u, m, 0, in.uv.x * LR.pitch.x, 0.3, in.wearV, pix);
+    let albedo = mix(lf.albedo, lw.albedo, wf);
+    let ao = tex.y;
+    let tw = mix(LR.weft.w, LR.warp.w, wf);
+    let Ta = select(Tu, Tv, wf > 0.5);
+    let Tf = normalize(cos(tw) * Ta + sin(tw) * cross(Ny, Ta));
+    let fz = mix(lf.fuzz, lw.fuzz, wf);
+    var ct = fiberShade(Ny, Tf, Vv, key.xyz, albedo * mix(0.55, 1.0, ao), fz) * (key.w * sh) + amb * albedo * ao;
+    ct = mix(ct, (key.w * sh * max(dot(Nf, key.xyz), 0.0) * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
+    color = select(mix(color, ct, lodTile), ct, cnt == 0.0 || (!intactCell && lodTile >= 1.0));
+    if (intactCell) { mask = 0xFu; }
+  }
   if (lod > 0.0) {
     // filtered appearance once the weave is below the pixel footprint
     let mw = yarnLook(LR, in.layer, 1u, i32(round(in.uv.x)), 0, in.uv.y * LR.pitch.y, 0.4, in.wearV, 1.0);

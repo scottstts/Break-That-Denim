@@ -62,11 +62,13 @@ fn degenerate() -> VOut {
 
 fn spanVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
   let b = bundleMax(R.layers[0]);
-  let s = spanEntry(ii / b);
-  let q = ii % b;
-  if (q >= bundleOf(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u)) { return degenerate(); }
-  let t = f32(vi >> 1u) / f32(SEGS);
-  return ribbon(spanYarn(s, q, t), vi, fromLight);
+  let k = ii / (2u * b);
+  let s = spanEntry(k);
+  let q = (ii % (2u * b)) >> 1u;
+  let bs = bundleOf(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u);
+  if (q >= bs || yarnInSurface(k, q, bs)) { return degenerate(); }
+  let u = f32(vi >> 1u) / f32(SEGS);
+  return ribbon(halfYarn(s, q, ii & 1u, u), vi, fromLight);
 }
 
 fn tailVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {

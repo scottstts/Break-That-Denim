@@ -20,7 +20,7 @@ struct FrameU {
 };
 
 struct LayerR {
-  // node offset, nx, ny, bundle (warps per column | picks per row << 16)
+  // node offset, nx, ny, bundle bytes (warps per column, picks per row, warp strands, pick strands)
   lattice: vec4<u32>,
   // fine yarn pitch u (between warps), pitch v (between picks), twill direction (+-1), unused
   pitch: vec4<f32>,
@@ -52,8 +52,12 @@ const SEG_BROKEN_R: u32 = 2u;
 const PI: f32 = 3.14159265;
 
 // Yarns carried by one lattice span of family f (1 = warp spans: warps per column; 0 = picks per row).
-fn bundleOf(L: LayerR, f: u32) -> u32 { return select(L.lattice.w >> 16u, L.lattice.w & 0xFFFFu, f == 1u); }
-fn bundleMax(L: LayerR) -> u32 { return max(L.lattice.w >> 16u, L.lattice.w & 0xFFFFu); }
+fn bundleOf(L: LayerR, f: u32) -> u32 { return select((L.lattice.w >> 8u) & 0xFFu, L.lattice.w & 0xFFu, f == 1u); }
+fn bundleMax(L: LayerR) -> u32 { return max((L.lattice.w >> 8u) & 0xFFu, L.lattice.w & 0xFFu); }
+// Yarns per failure strand of family f's spans.
+fn yarnsPerStrand(L: LayerR, f: u32) -> u32 {
+  return bundleOf(L, f) / select(L.lattice.w >> 24u, (L.lattice.w >> 16u) & 0xFFu, f == 1u);
+}
 
 // ---------------------------------------------------------------- hashing and noise
 
@@ -185,22 +189,30 @@ fn weftHit(L: LayerR, m: i32, U: f32, V: f32, su: f32, sv: f32) -> Hit {
   return o;
 }
 
-// Visible yarn at yarn coordinates (U warp index, V pick index) seen from the face (front = true)
-// or the back. Uncovered points are gaps in the weave.
-fn weave(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool) -> Hit {
-  var best: Hit;
-  best.covered = false;
-  best.h = select(1.0, -1.0, front);
-  let k0 = i32(round(U));
-  let m0 = i32(round(V));
-  for (var dk = -1; dk <= 1; dk++) {
-    let hw = warpHit(L, k0 + dk, U, V, su, sv);
-    if (hw.covered && (select((hw.h < best.h), (hw.h > best.h), front))) { best = hw; }
-    let hf = weftHit(L, m0 + dk, U, V, su, sv);
-    if (hf.covered && (select((hf.h < best.h), (hf.h > best.h), front))) { best = hf; }
-  }
-  return best;
+// Yarns missing from one lattice cell (strands absent or separated), from the strand masks of its
+// four spans. Fine warp k sits at U = k; the cell's left warp bundle holds warps warpBase ..
+// warpBase + bu - 1, its right bundle the next bu; picks likewise from pickBase (bottom, then top).
+struct CellYarns {
+  warpBase: i32,
+  pickBase: i32,
+  bu: i32,
+  bv: i32,
+  // yarns per strand: warp, pick
+  su: i32,
+  sv: i32,
+  // strand bits 0-3 left warp bundle, 4-7 right, 8-11 bottom pick bundle, 12-15 top
+  masks: u32,
+};
+
+fn bundleYarnGone(base: i32, b: i32, ys: i32, k: i32, masks: u32, shift: u32) -> bool {
+  let d = k - base;
+  if (d < 0 || d >= 2 * b) { return false; }
+  let side = select(0, 1, d >= b);
+  let bit = u32((d - side * b) / ys + 4 * side);
+  return ((masks >> (shift + bit)) & 1u) == 1u;
 }
+fn warpGone(c: CellYarns, k: i32) -> bool { return bundleYarnGone(c.warpBase, c.bu, c.su, k, c.masks, 0u); }
+fn pickGone(c: CellYarns, m: i32) -> bool { return bundleYarnGone(c.pickBase, c.bv, c.sv, m, c.masks, 8u); }
 
 // The two highest yarns at a point and the soft visibility weight of the second: real yarn surfaces
 // are hairy, so the boundary between overlapping yarns is a soft transition over ~tau of height.
@@ -210,7 +222,7 @@ struct Hit2 {
   wb: f32,
 };
 
-fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32) -> Hit2 {
+fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32, cy: CellYarns) -> Hit2 {
   // heights only for every candidate; full hits for the two highest
   let sgn = select(-1.0, 1.0, front);
   let k0 = i32(round(U));
@@ -218,7 +230,7 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32) ->
   let aw = 0.5 * L.warp.x;
   let af = 0.5 * L.weft.x;
   // warps overlap their neighbours (width > pitch): three candidates; picks only when stretched apart
-  let wefts = select(1, 3, af > 0.5 * L.pitch.y * sv);
+  let wefts = select(1, 3, af > 0.5 * L.pitch.y * sv || (cy.masks & 0xFF00u) != 0u);
   var ha = -1.0;
   var hb = -1.0;
   var ia = -1;
@@ -228,12 +240,12 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32) ->
     var hh: f32;
     if (q < 3) {
       x = (U - f32(k0 + q - 1)) * L.pitch.x * su / aw;
-      if (abs(x) >= 1.0) { continue; }
+      if (abs(x) >= 1.0 || warpGone(cy, k0 + q - 1)) { continue; }
       hh = L.warp.z * crimpProfile(warpUnderDist(L, k0 + q - 1, V)).x + 0.5 * L.warp.y * sqrt(1.0 - x * x);
     } else {
       let m = m0 + select(0, q - 4, wefts == 3);
       x = (V - f32(m)) * L.pitch.y * sv / af;
-      if (abs(x) >= 1.0) { continue; }
+      if (abs(x) >= 1.0 || pickGone(cy, m)) { continue; }
       hh = -L.weft.z * crimpProfile(weftOverDist(L, m, U)).x + 0.5 * L.weft.y * sqrt(1.0 - x * x);
     }
     hh *= sgn;
@@ -262,6 +274,13 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32) ->
 
 // ---------------------------------------------------------------- appearance
 
+// Occlusion of a point at normalized height hn (0 = bottom of the weave, 1 = top of the floats):
+// the twill grooves and interlacings are deep and shaded by the floats around them.
+fn weaveOcclusion(hn: f32) -> f32 {
+  let t = hn * hn * (3.0 - 2.0 * hn);
+  return mix(0.08, 1.0, t * t);
+}
+
 struct Look {
   albedo: vec3<f32>,
   // fraction of loose surface fibre (sheen strength)
@@ -286,7 +305,7 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
   let fiberRnd = hash2f(seedY * 31u + 7u, fiberIdx);
   if (fam == 1u) {
     // per-yarn dye depth, slubs along the yarn (mm to cm scale) and per-float variation
-    let yarnDye = 0.85 + 0.3 * hash2f(seedY, 3u);
+    let yarnDye = 0.92 + 0.16 * hash2f(seedY, 3u);
     let slub = 0.6 * noise1(seedY + 11u, along / 0.0035) + 0.4 * noise1(seedY + 23u, along / 0.014);
     let floatV = hash2f(seedY ^ 0x5bd1e995u, bitcast<u32>(float_));
     // sub-millimetre streaks along the yarn: twist irregularity exposes more or less undyed fibre
@@ -294,10 +313,17 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     // exposure of the pale core: abrasion acts on the crowns of the floats
     let abr = clamp(wear * (0.35 + 0.65 * crown) * (0.6 + 0.8 * floatV) + 0.1 * floatV * crown, 0.0, 1.0);
     let dye = clamp(yarnDye * (1.0 + 0.12 * slub) * (1.0 - 0.75 * abr), 0.0, 1.5);
-    let deep = vec3<f32>(0.02, 0.042, 0.112);
-    let pale = vec3<f32>(0.31, 0.36, 0.43);
+    // washed indigo: the dyed sheath is a greyish blue, the exposed core a cool off-white
+    let deep = vec3<f32>(0.03, 0.05, 0.13);
+    let pale = vec3<f32>(0.42, 0.45, 0.55);
+    // fibre clumps and uneven ring dyeing mottle the surface: elongated along the warp (slub-like,
+    // ~3 mm long, ~0.5 mm wide) plus fine isotropic clumps; faded below the pixel footprint
+    let pc = vec2<f32>(f32(yarn) * L.pitch.x + across, along);
+    let m1 = noise2(977u + layerIdx, pc / 0.4e-3) * clamp(1.5 - pix / 0.4e-3, 0.0, 1.0);
+    let m2 = noise2(1913u + layerIdx, pc / vec2<f32>(0.55e-3, 3.0e-3)) * clamp(1.5 - pix / 0.55e-3, 0.0, 1.0);
+    let mottle = 0.3 * m1 + 0.7 * m2;
     // mean fraction of undyed fibre showing on the surface; individual fibres alternate around it
-    let paleMean = clamp(0.07 + 0.45 * (1.0 - min(dye, 1.0)) + 0.08 * streak, 0.0, 1.0);
+    let paleMean = clamp(0.12 + 0.45 * (1.0 - min(dye, 1.0)) + 0.06 * streak + 0.1 * mottle, 0.0, 1.0);
     let paleFiber = select(0.0, 1.0, fiberRnd < paleMean);
     let paleFrac = mix(paleMean, paleFiber, fiberVis * 0.2);
     o.albedo = mix(deep * (0.75 + 0.5 * min(dye, 1.2)), pale, paleFrac);

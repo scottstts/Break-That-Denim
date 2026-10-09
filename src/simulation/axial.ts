@@ -47,10 +47,9 @@ export function strainAtTension(p: AxialParams, t: number): number {
   const dk = p.eaHigh - p.eaLow;
   const tc = p.eaLow * ec + (dk * ec) / 2;
   if (t >= tc) return ec + (t - tc) / p.eaHigh;
-  // Solve (dk/(2ec)) e^2 + eaLow e - t = 0.
+  // Solve (dk/(2ec)) e^2 + eaLow e - t = 0 (cancellation-free root).
   const a = dk / (2 * ec);
-  if (a <= 1e-12) return t / p.eaLow;
-  return (-p.eaLow + Math.sqrt(p.eaLow * p.eaLow + 4 * a * t)) / (2 * a);
+  return (2 * t) / (p.eaLow + Math.sqrt(p.eaLow * p.eaLow + 4 * a * t));
 }
 
 /** Remaining tension envelope at extension `ext` (only meaningful at/after peak). */
@@ -96,4 +95,47 @@ export function damagedResponse(
 /** Separation is complete once the committed history passes the end of the softening branch. */
 export function isSeparated(p: AxialParams, restLength: number, peakTension: number, softening: number, maxExt: number): boolean {
   return maxExt >= strainAtTension(p, peakTension) * restLength + softening;
+}
+
+/**
+ * Strand-level damage inside a bundled span. The span's yarns form S equal strands (material.ts
+ * strandsPerSpan); each strand stores one strength multiplier (packed u8, see unpackYarnPeak):
+ * strand k peaks at the bundle tension peak * m_k, i.e. at its own extension, and softens on its
+ * own; all share the span's extension history. The span force is the mean of the per-strand damaged
+ * responses evaluated at bundle scale, so a bundle fails strand by strand and keeps load in the
+ * survivors. A zero byte marks a strand that is absent (worn through before interaction). Mirrored
+ * in WGSL (common.wgsl: bundleResponse).
+ */
+/** Strength multiplier of packed byte u (0 = absent yarn). */
+export function unpackYarnPeak(u: number): number {
+  return u === 0 ? 0 : 0.4 + (1.2 * (u - 1)) / 254;
+}
+
+/** Byte for a strength multiplier m in [0.4, 1.6] (never 0: absence is explicit). */
+export function packYarnPeak(m: number): number {
+  return 1 + Math.round((Math.min(1.6, Math.max(0.4, m)) - 0.4) * (254 / 1.2));
+}
+
+/** Damaged (T, K) of a bundle of `b` strands with packed multipliers `peaks` (byte k = strand k). */
+export function bundleResponse(p: AxialParams, b: number, restLength: number, peakTension: number, softening: number, maxExt: number, eps: number, peaks: number): [number, number] {
+  let T = 0;
+  let K = 0;
+  for (let k = 0; k < b; k++) {
+    const m = unpackYarnPeak((peaks >>> (8 * k)) & 0xff);
+    if (m === 0) continue;
+    const [t, kk] = damagedResponse(p, restLength, peakTension * m, softening, maxExt, eps);
+    T += t;
+    K += kk;
+  }
+  return [T / b, K / b];
+}
+
+/** Bit k set when strand k of the bundle is absent or fully separated. */
+export function bundleBrokenMask(p: AxialParams, b: number, restLength: number, peakTension: number, softening: number, maxExt: number, peaks: number): number {
+  let mask = 0;
+  for (let k = 0; k < b; k++) {
+    const m = unpackYarnPeak((peaks >>> (8 * k)) & 0xff);
+    if (m === 0 || isSeparated(p, restLength, peakTension * m, softening, maxExt)) mask |= 1 << k;
+  }
+  return mask;
 }

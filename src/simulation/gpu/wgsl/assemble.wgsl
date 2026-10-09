@@ -18,7 +18,7 @@ fn fineLevel() -> LevelInfo {
   return lv;
 }
 
-fn isPinned(m: i32) -> bool { return (nodes[u32(m)].flags & NODE_PINNED) != 0u; }
+fn isPinned(m: i32) -> bool { return (nodes[u32(m)].flags & NODE_PINNED) != 0u || x[u32(m)].w > 0.5; }
 
 fn segAt(owner: i32, f: u32) -> Seg { return segs[2u * u32(owner) + f]; }
 
@@ -43,16 +43,19 @@ fn segForce(a: u32, b: u32, f: u32, mat: LayerMat) -> SegForce {
   let s = segs[2u * a + f];
   let y = mat.yarn[f];
   let L = s.rest;
-  let r = damagedResponse(y, L, s, l / L - 1.0);
+  let r = bundleResponse(y, strandsOf(mat, f), L, s, l / L - 1.0);
   let c = y.axialVisc / (L * P.hg.x);
   let fs = r.x + c * (l - ln);
   return SegForce(fs, max(r.y, 0.0) / L + c, max(fs, 0.0) / l, e / l);
 }
 
-// Bending of the triple (a, b, c) centered at b: returns (kElastic, kViscous) and fills r / rn.
+// Bending of the triple (a, b, c) centered at b (fold-stiffening energy, see bendPsi): the gradient
+// coefficient ke Psi' and a scalar stiffness k = ke (Psi' + 2 Psi'' q) + kd that majorizes the
+// exact Hessian ke (Psi' I + 2 Psi'' r r^T) + kd I (the operator stores this stencil as scalars).
 struct Triple {
   ke: f32,
   kd: f32,
+  k: f32,
   r: vec3<f32>,
   rn: vec3<f32>,
 };
@@ -60,11 +63,13 @@ struct Triple {
 fn triple(a: u32, b: u32, c: u32, f: u32, mat: LayerMat) -> Triple {
   let L = 0.5 * (segs[2u * a + f].rest + segs[2u * b + f].rest);
   let y = mat.yarn[f];
-  let ke = y.bendRigidity / (L * L * L);
-  let kd = ke * y.bendVisc / P.hg.x;
+  let kb = y.bendRigidity / (L * L * L);
+  let kd = kb * y.bendVisc / P.hg.x;
   let rn = x[a].xyz - 2.0 * x[b].xyz + x[c].xyz;
   let r = rn + dx[a].xyz - 2.0 * dx[b].xyz + dx[c].xyz;
-  return Triple(ke, kd, r, rn);
+  let q = dot(r, r);
+  let ps = bendPsi(q, 4.0 * L * L);
+  return Triple(kb * ps.y, kd, kb * (ps.y + 2.0 * ps.z * q) + kd, r, rn);
 }
 
 fn tripleGrad(t: Triple) -> vec3<f32> { return t.ke * t.r + t.kd * (t.r - t.rn); }
@@ -121,7 +126,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let mat = P.layers[l];
   let row = n * ROW_VEC4;
 
-  if ((st.flags & NODE_PINNED) != 0u) {
+  if (isPinned(i32(n))) {
     storeSym(row, symId(1.0), vec2<f32>(0.0));
     for (var k = 1u; k < 9u; k++) { storeSym(row + 2u * k, symZero(), vec2<f32>(0.0)); }
     rhs[n] = vec4<f32>(0.0);
@@ -185,7 +190,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (actPrev && actNext) {
       let t = triple(u32(prev), n, u32(next), f, mat);
       g += -2.0 * tripleGrad(t);
-      let k = t.ke + t.kd;
+      let k = t.k;
       D = symAdd(D, symId(4.0 * k));
       if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * k)); }
       if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * k)); }
@@ -194,7 +199,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (actNext && activeSeg(next, f) && next2 >= 0) {
       let t = triple(n, u32(next), u32(next2), f, mat);
       g += tripleGrad(t);
-      let k = t.ke + t.kd;
+      let k = t.k;
       D = symAdd(D, symId(k));
       if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * k)); }
       if (!isPinned(next2)) { C2[kp] += k; }
@@ -203,7 +208,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (actPrev && activeSeg(prev2, f)) {
       let t = triple(u32(prev2), u32(prev), n, f, mat);
       g += tripleGrad(t);
-      let k = t.ke + t.kd;
+      let k = t.k;
       D = symAdd(D, symId(k));
       if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * k)); }
       if (!isPinned(prev2)) { C2[km] += k; }
@@ -227,9 +232,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = (x[p].xyz - x[n].xyz) + (dx[p].xyz - dx[n].xyz);
     let len = length(d);
     let e = d / len;
-    let fs = ks * (len - shearRest(lv, l, ci, cj));
+    let sl = shearLaw(ks, shearRest(lv, l, ci, cj), len);
+    let fs = sl.x;
     g -= fs * e;
-    let H = axialBlock(ks, max(fs, 0.0) / len, e);
+    let H = axialBlock(sl.y, max(fs, 0.0) / len, e);
     D = symAdd(D, H);
     if (!isPinned(p)) { CD[c] = symScale(H, -1.0); }
   }

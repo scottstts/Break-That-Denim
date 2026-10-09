@@ -32,6 +32,10 @@ export class Interaction {
   private staging: GPUBuffer[] = [];
   /** Number of active grip entries (0 = no grip). */
   count = 0;
+  /** Nodes of the active grip patch. */
+  patchNodes: readonly number[] = [];
+  /** Core of the grip patch (full weight): what the grip actually holds (detached-piece anchors). */
+  coreNodes: readonly number[] = [];
   private stiffness = 0;
 
   constructor(device: GPUDevice, solver: GpuSolver, scene: CompiledScene) {
@@ -114,6 +118,8 @@ export class Interaction {
     }
     this.device.queue.writeBuffer(this.grip, 0, data);
     this.count = count;
+    this.patchNodes = entries.slice(0, count).map((e) => e[0]);
+    this.coreNodes = entries.slice(0, count).filter((e) => e[1] >= 0.5).map((e) => e[0]);
     this.stiffness = patch.stiffness;
     this.writeUniform(target, node);
     const enc = this.device.createCommandEncoder({ label: 'gripInit' });
@@ -144,6 +150,8 @@ export class Interaction {
   release(): void {
     if (this.count === 0) return;
     this.count = 0;
+    this.patchNodes = [];
+    this.coreNodes = [];
     this.device.queue.writeBuffer(this.gripU, 12, new Float32Array([0]));
     if (!this.solver.contactEnabled) {
       const enc = this.device.createCommandEncoder({ label: 'gripRelease' });

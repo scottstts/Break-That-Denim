@@ -1,3 +1,4 @@
+import { packYarnPeak } from './axial';
 import { DENIM, FAMILY_U, FAMILY_V, bundleWeave, crossingMass, type WeaveMaterial } from './material';
 import { fbm, noise1, rand01, smoothstep } from '../shared/noise';
 
@@ -17,6 +18,8 @@ export const SEG_EXISTS = 1;
 export const SEG_BROKEN = 2;
 /** Broken before interaction (authored defect), kept for the material ledger. */
 export const SEG_INITIAL_DEFECT = 4;
+/** Bits 8..11: yarn k of the span's bundle is absent or separated (maintained by the damage update). */
+export const SEG_YARN_SHIFT = 8;
 
 export interface WearSpec {
   /** World-rest-plane center of the worn zone (m). */
@@ -29,9 +32,11 @@ export interface WearSpec {
   amount: number;
   /** Cellular opening scale (m); 0 disables the cellular term. */
   cellSize: number;
-  /** Wear above which pre-existing broken v-yarn (warp) spans may appear. */
+  /** Length scale (m) of the wear field's internal structure (domain warp, fine variation). */
+  featureScale: number;
+  /** Wear above which individual warp yarns may be worn through (absent) before interaction. */
   defectThreshold: number;
-  /** Fraction of eligible spans that start broken. */
+  /** Fraction of eligible warp yarns (at full wear) that start worn through. */
   defectDensity: number;
 }
 
@@ -93,17 +98,33 @@ export interface CompiledScene {
   peakTension: Float64Array;
   softening: Float64Array;
   maxExt: Float64Array;
-  segFlags: Uint8Array;
+  segFlags: Uint16Array;
   /** Position of the failure site within the span (fraction from the owning node). */
   failSite: Float32Array;
+  /** Per span: packed u8 strength multiplier of each bundled yarn (axial.ts unpackYarnPeak; 0 = absent). */
+  yarnPeaks: Uint32Array;
+  /** Per span: packed u8 failure site of each bundled yarn (fraction from the owning node, /255). */
+  yarnSites: Uint32Array;
   /** Per-node crossing normal force at zero tension (wear-reduced), N. */
   crossingNormal0: Float64Array;
   tails: Float64Array;
 }
 
-/** Content hash of a compiled scene's initial state (validates precomputed drape assets). */
+/**
+ * Version of the mechanical model (laws and their constants outside the material assets). Bump it
+ * whenever equilibrium shapes change, so stale precomputed drapes are rejected.
+ */
+export const MECHANICS_VERSION = 2;
+
+/** Content hash of a compiled scene's initial state and mechanics (validates precomputed drapes). */
 export function sceneHash(s: CompiledScene): number {
   let h = 0x811c9dc5;
+  const mix = (v: number) => (h = Math.imul(h ^ v, 0x01000193) >>> 0);
+  mix(MECHANICS_VERSION);
+  for (const L of s.layers) {
+    const json = JSON.stringify(L.material);
+    for (let i = 0; i < json.length; i++) mix(json.charCodeAt(i));
+  }
   const f = new Float32Array(s.position);
   const u = new Uint32Array(f.buffer);
   for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193) >>> 0;
@@ -145,19 +166,20 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): numb
   const dy = y - spec.center[1];
   const a = (dx * ax + dy * ay) / spec.radii[0];
   const b = (-dx * ay + dy * ax) / spec.radii[1];
-  const warp = 0.32 * fbm(seed + 3, x / 0.014, y / 0.014, 4);
+  const S = spec.featureScale;
+  const warp = 0.32 * fbm(seed + 3, x / (1.4 * S), y / (1.4 * S), 4);
   const r = Math.hypot(a, b) + warp;
   let w = 1 - smoothstep(0.25, 1.05, r);
   if (spec.cellSize > 0) {
-    const jx = x + 0.004 * fbm(seed + 11, x / 0.01, y / 0.01, 3);
-    const jy = y + 0.004 * fbm(seed + 12, x / 0.01, y / 0.01, 3);
+    const jx = x + 0.4 * S * fbm(seed + 11, x / S, y / S, 3);
+    const jy = y + 0.4 * S * fbm(seed + 12, x / S, y / S, 3);
     const [f1, f2] = worley(seed + 5, jx / spec.cellSize, jy / spec.cellSize);
     // 1 at cell interiors, small near the boundaries between neighboring cells (retained ligaments).
     const ligament = smoothstep(0.0, 0.38, f2 - f1);
     w *= 0.5 + 0.5 * ligament;
   }
   // Fine correlated abrasion variation.
-  w *= 0.82 + 0.18 * fbm(seed + 7, x / 0.003, y / 0.003, 3);
+  w *= 0.82 + 0.18 * fbm(seed + 7, x / (0.3 * S), y / (0.3 * S), 3);
   return Math.min(1, Math.max(0, w * spec.amount));
 }
 
@@ -202,8 +224,10 @@ export function compileScene(specs: LayerSpec[]): CompiledScene {
     peakTension: new Float64Array(2 * N),
     softening: new Float64Array(2 * N),
     maxExt: new Float64Array(2 * N),
-    segFlags: new Uint8Array(2 * N),
+    segFlags: new Uint16Array(2 * N),
     failSite: new Float32Array(2 * N),
+    yarnPeaks: new Uint32Array(2 * N),
+    yarnSites: new Uint32Array(2 * N),
     crossingNormal0: new Float64Array(N),
     tails: new Float64Array(4 * N),
   };
@@ -246,8 +270,8 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
       const pinned = i < cr || j < cr || i >= nx - cr || j >= ny - cr;
       // Smooth out-of-plane seed for buckling. It is one world-space field shared by every layer (same
       // seed, radial fade) so the stacked plies start parallel at their contact separation.
-      const fadeIn = 1 - smoothstep(0.05, 0.075, Math.hypot(px, py));
-      const pz = pinned ? 0 : spec.perturbation * fadeIn * fbm(DRAPE_SEED, px / 0.012, py / 0.012, 3);
+      const fadeIn = 1 - smoothstep(0.16, 0.24, Math.hypot(px, py));
+      const pz = pinned ? 0 : spec.perturbation * fadeIn * fbm(DRAPE_SEED, px / 0.04, py / 0.04, 3);
       scene.position[3 * n] = px;
       scene.position[3 * n + 1] = py;
       scene.position[3 * n + 2] = mapOrigin[2] + pz;
@@ -276,13 +300,26 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
         scene.peakTension[sIdx] = yarn.strength * factor;
         scene.softening[sIdx] = yarn.softeningOpening * (1 + 2.5 * w);
         scene.failSite[sIdx] = 0.25 + 0.5 * rand01(seed + 77, sIdx, f);
-        // Authored pre-existing defects: broken warp spans in the most worn material.
-        if (f === FAMILY_V && w > spec.wear.defectThreshold) {
-          const p = (w - spec.wear.defectThreshold) / (1 - spec.wear.defectThreshold);
-          if (rand01(seed + 991, i, j) < spec.wear.defectDensity * p) {
-            breakSegmentInitial(scene, info, n, f);
-          }
+        // Strands of the bundle: strength varies along each real yarn (correlated over a few mm:
+        // slubs, thin places); in the most worn material some warp strands are worn through already.
+        const b = yarn.strandsPerSpan ?? 1;
+        const yarnsPerStrand = (yarn.yarnsPerSpan ?? 1) / b;
+        const pDefect = f === FAMILY_V && w > spec.wear.defectThreshold ? (spec.wear.defectDensity * (w - spec.wear.defectThreshold)) / (1 - spec.wear.defectThreshold) : 0;
+        let peaks = 0;
+        let sites = 0;
+        let absent = 0;
+        for (let k = 0; k < b; k++) {
+          const fine = (yarnIndex * b + k) * yarnsPerStrand;
+          const m = 1 + 0.32 * noise1(seed + 4099 + 13 * fine + 7 * f, along / 0.0025) + 0.12 * (rand01(seed + 211, sIdx, k) - 0.5);
+          const gone = pDefect > 0 && rand01(seed + 991, sIdx, k) < pDefect;
+          if (gone) absent |= 1 << k;
+          peaks |= (gone ? 0 : packYarnPeak(m)) << (8 * k);
+          sites |= Math.round(255 * (0.18 + 0.64 * rand01(seed + 313, sIdx, k))) << (8 * k);
         }
+        scene.yarnPeaks[sIdx] = peaks >>> 0;
+        scene.yarnSites[sIdx] = sites >>> 0;
+        scene.segFlags[sIdx] |= absent << SEG_YARN_SHIFT;
+        if (absent === (1 << b) - 1) breakSegmentInitial(scene, info, n, f);
       }
     }
   }
@@ -301,36 +338,39 @@ function breakSegmentInitial(scene: CompiledScene, info: LayerInfo, n: number, f
 }
 
 /**
- * The authored coupon: one warp-faced denim layer mounted at its border. Mechanical spans bundle
- * 3 warps x 2 picks (near-square 1.14 x 1.16 mm cells). Warps run close to horizontal in view, which
- * puts the twill lines at ~33 degrees as in the reference. The coupon extends beyond the supported
- * framing on every side so no mount is ever visible.
+ * The authored coupon: one warp-faced denim layer mounted at its border, at the reference's scale
+ * (about 35 cm of cloth across the view height: its twill wales are ~5.5 px apart on 1624 px native
+ * frames, i.e. 1.3 mm wales at ~0.23 mm per pixel). Mechanical spans bundle 9 warps x 6 picks
+ * (near-square 3.4 x 3.5 mm cells) that fail in strands of 3 warps / 2 picks. Warps run close to
+ * vertical in view, which puts the wales at ~57 degrees rising to the right as in the reference. The coupon
+ * extends beyond the supported framing on every side so no mount is ever visible.
  */
 export function defaultSceneSpecs(): LayerSpec[] {
   return [
     {
       material: DENIM,
-      bundle: [3, 2],
-      sizeU: 0.13,
-      sizeV: 0.19,
+      bundle: [9, 6],
+      sizeU: 0.62,
+      sizeV: 0.4,
       z: 0,
-      angle: Math.PI / 2 + 0.06,
-      compressU: 0.05,
-      compressV: 0.025,
+      angle: 0.06,
+      compressU: 0.025,
+      compressV: 0.015,
       shear: 0.06,
       collarRows: 2,
       wear: {
-        center: [0.003, -0.002],
+        center: [0.01, -0.006],
         axis: [1, -1.15],
-        radii: [0.03, 0.019],
+        radii: [0.12, 0.08],
         amount: 1,
-        cellSize: 0.0135,
+        cellSize: 0.042,
+        featureScale: 0.032,
         defectThreshold: 0.8,
         defectDensity: 0.55,
       },
-      wearStrengthLoss: [0.55, 0.93],
+      wearStrengthLoss: [0.85, 0.96],
       seed: 1001,
-      perturbation: 0.8e-3,
+      perturbation: 2.5e-3,
     },
   ];
 }

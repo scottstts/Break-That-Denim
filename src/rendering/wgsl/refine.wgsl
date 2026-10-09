@@ -24,14 +24,22 @@ override YARN_VERTS: u32 = 18u;
 override TAIL_VERTS: u32 = 14u;
 override FUZZ_VERTS: u32 = 10u;
 override FUZZ_PER_YARN: u32 = 10u;
-override FUZZ_PER_TAIL: u32 = 14u;
+override FUZZ_PER_TAIL: u32 = 24u;
+
+// Node still in the scene (retired debris, x.w = 2, is not drawn).
+fn live(n: u32) -> bool { return x[n].w < 1.5; }
 
 fn segOk(owner: u32, f: u32) -> bool {
   let fl = segw[2u * (2u * owner + f) + 1u].y;
-  return (fl & (SEG_EXISTS_R | SEG_BROKEN_R)) == SEG_EXISTS_R;
+  if ((fl & (SEG_EXISTS_R | SEG_BROKEN_R)) != SEG_EXISTS_R) { return false; }
+  let L = R.layers[layerOf(owner)].lattice;
+  return live(owner) && live(owner + select(L.y, 1u, f == 0u));
 }
 
 fn layerOf(n: u32) -> u32 { return nodes[n].ijl >> 24u; }
+
+// Bundled yarns of span (owner, f) that are absent or separated (bit k = yarn k).
+fn yarnMask(owner: u32, f: u32) -> u32 { return (segw[2u * (2u * owner + f) + 1u].y >> 8u) & 0xFu; }
 fn nodeI(n: u32) -> i32 { return i32(nodes[n].ijl & 0xFFFu); }
 fn nodeJ(n: u32) -> i32 { return i32((nodes[n].ijl >> 12u) & 0xFFFu); }
 
@@ -77,11 +85,6 @@ fn cellOf(layer: u32, ci: u32, cj: u32) -> u32 {
   return L.refine.z + cj * (L.lattice.y - 1u) + ci;
 }
 
-fn cellIntact(n: u32) -> bool {
-  let L = R.layers[layerOf(n)].lattice;
-  return segOk(n, 0u) && segOk(n, 1u) && segOk(n + 1u, 1u) && segOk(n + L.y, 0u);
-}
-
 // Per cell (lower-left node): 1 if all four spans carry material.
 @compute @workgroup_size(128)
 fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -92,7 +95,13 @@ fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = u32(nodeI(n));
   let j = u32(nodeJ(n));
   if (i + 1u >= L.y || j + 1u >= L.z) { return; }
-  cellFlags[cellOf(l, i, j)] = select(0u, 1u, cellIntact(n));
+  // bit 0: the cell is drawn as surface (all four spans carry material); bits 8..23: yarn masks of
+  // its left / right warp spans and bottom / top pick spans (yarns gone from the woven surface)
+  var flags = 0u;
+  if (segOk(n, 0u) && segOk(n, 1u) && segOk(n + 1u, 1u) && segOk(n + L.y, 0u)) {
+    flags = 1u | (yarnMask(n, 1u) << 8u) | (yarnMask(n + 1u, 1u) << 12u) | (yarnMask(n, 0u) << 16u) | (yarnMask(n + L.y, 0u) << 20u);
+  }
+  cellFlags[cellOf(l, i, j)] = flags;
 }
 
 fn cellOk(l: u32, ci: i32, cj: i32) -> bool {
@@ -115,15 +124,23 @@ fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
     let len = select(i32(L.z), i32(L.y), f == 0u);
     let a = select(j, i, f == 0u);
     if (a + 1 >= len || !segOk(n, f)) { continue; }
-    // the two cells sharing span (n, f)
-    var ok = true;
-    if (f == 0u) { ok = cellOk(l, i, j) && cellOk(l, i, j - 1); } else { ok = cellOk(l, i, j) && cellOk(l, i - 1, j); }
-    if (ok) { continue; }
+    // the two cells sharing span (n, f): on its +lateral side (+v for u-spans, +u for v-spans) and -side
+    var plus = true;
+    var minus = true;
+    if (f == 0u) {
+      plus = cellOk(l, i, j);
+      minus = cellOk(l, i, j - 1);
+    } else {
+      plus = cellOk(l, i, j);
+      minus = cellOk(l, i - 1, j);
+    }
+    if (plus && minus) { continue; }
     let k = atomicAdd(&lists[0], 1u);
-    if (k < MAX_SPANS) { atomicStore(&lists[SPAN_BASE + k], 2u * n + f); }
+    // bits 30 / 31: the +/- side cell is intact surface (its yarns are drawn there, not here)
+    if (k < MAX_SPANS) { atomicStore(&lists[SPAN_BASE + k], (2u * n + f) | (select(0u, 1u, plus) << 30u) | (select(0u, 1u, minus) << 31u)); }
   }
   for (var side = 0u; side < 4u; side++) {
-    if (tails[4u * n + side] > 1e-6) {
+    if (live(n) && tails[4u * n + side] > 1e-6) {
       let k = atomicAdd(&lists[1], 1u);
       if (k < MAX_TAILS) { atomicStore(&lists[SPAN_BASE + MAX_SPANS + k], 4u * n + side); }
     }
@@ -131,6 +148,7 @@ fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Indirect draw arguments: [yarns, tails, yarn fuzz, tail fuzz] x (vertexCount, instanceCount, 0, 0).
+// Each bundled yarn of an explicit span is drawn in two halves (a broken yarn: two stubs).
 @compute @workgroup_size(1)
 fn args() {
   let spans = min(atomicLoad(&lists[0]), MAX_SPANS);
@@ -138,7 +156,7 @@ fn args() {
   // instances per span / tail: the larger bundle (extra instances of the smaller family are empty)
   let b = bundleMax(R.layers[0]);
   drawArgs[0] = YARN_VERTS;
-  drawArgs[1] = spans * b;
+  drawArgs[1] = spans * b * 2u;
   drawArgs[2] = 0u;
   drawArgs[3] = 0u;
   drawArgs[4] = TAIL_VERTS;
@@ -146,7 +164,7 @@ fn args() {
   drawArgs[6] = 0u;
   drawArgs[7] = 0u;
   drawArgs[8] = FUZZ_VERTS;
-  drawArgs[9] = spans * b * FUZZ_PER_YARN;
+  drawArgs[9] = spans * b * 2u * FUZZ_PER_YARN;
   drawArgs[10] = 0u;
   drawArgs[11] = 0u;
   drawArgs[12] = FUZZ_VERTS;
@@ -166,24 +184,42 @@ fn crd(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> ve
   return 0.5 * ((p2 - p0) + 2.0 * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t + 3.0 * (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t);
 }
 
-// Node position at lattice (i, j), linearly extrapolated beyond the lattice border.
-fn latticeP(L: vec4<u32>, i: i32, j: i32) -> vec3<f32> {
-  let nx = i32(L.y);
-  let ny = i32(L.z);
-  let ci = clamp(i, 0, nx - 1);
-  let cj = clamp(j, 0, ny - 1);
-  let base = x[L.x + u32(cj * nx + ci)].xyz;
-  var p = base;
-  if (i != ci) {
-    let inner = x[L.x + u32(cj * nx + clamp(2 * ci - i, 0, nx - 1))].xyz;
-    p = 2.0 * base - inner;
+fn nodeAt(L: vec4<u32>, i: u32, j: u32) -> u32 { return L.x + j * L.y + i; }
+
+// The 4 x 4 Catmull-Rom control net of an intact cell (ci, cj): its own 2 x 2 corners plus the ring
+// around them. A ring point is used only when a surviving span connects it to the cell's corner;
+// otherwise (lattice border, torn span, debris) it is extrapolated from the cell, so a hole or a
+// falling piece never pulls the intact surface toward it.
+fn controlNet(L: vec4<u32>, ci: u32, cj: u32) -> array<vec3<f32>, 16> {
+  var P: array<vec3<f32>, 16>;
+  let nx = L.y;
+  let ny = L.z;
+  // inner rows q = 1, 2 (j = cj, cj + 1)
+  for (var q = 1u; q < 3u; q++) {
+    let j = cj + q - 1u;
+    let a = nodeAt(L, ci, j);
+    let b = a + 1u;
+    let pa = x[a].xyz;
+    let pb = x[b].xyz;
+    P[4u * q + 1u] = pa;
+    P[4u * q + 2u] = pb;
+    P[4u * q] = select(2.0 * pa - pb, x[a - 1u].xyz, ci > 0u && segOk(a - 1u, 0u));
+    P[4u * q + 3u] = select(2.0 * pb - pa, x[b + 1u].xyz, ci + 2u < nx && segOk(b, 0u));
   }
-  if (j != cj) {
-    let ii = clamp(i, 0, nx - 1);
-    let inner = x[L.x + u32(clamp(2 * cj - j, 0, ny - 1) * nx + ii)].xyz;
-    p = p + (base - inner);
+  // outer rows q = 0 (j = cj - 1) and q = 3 (j = cj + 2)
+  for (var c = 1u; c < 3u; c++) {
+    let i = ci + c - 1u;
+    let a = nodeAt(L, i, cj);
+    let b = nodeAt(L, i, cj + 1u);
+    P[c] = select(2.0 * P[4u + c] - P[8u + c], x[a - nx].xyz, cj > 0u && segOk(a - nx, 1u));
+    P[12u + c] = select(2.0 * P[8u + c] - P[4u + c], x[b + nx].xyz, cj + 2u < ny && segOk(b, 1u));
   }
-  return p;
+  // corners of the ring: parallelogram completion
+  P[0] = P[1] + P[4] - P[5];
+  P[3] = P[2] + P[7] - P[6];
+  P[12] = P[13] + P[8] - P[9];
+  P[15] = P[14] + P[11] - P[10];
+  return P;
 }
 
 // One refined vertex: position, d/ds and d/dt over the cell (s along u, t along v), wear.
@@ -207,16 +243,12 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let cj = min(J / S, L.z - 2u);
   let s = f32(I - ci * S) / f32(S);
   let t = f32(J - cj * S) / f32(S);
+  let net = controlNet(L, ci, cj);
   var rows: array<vec3<f32>, 4>;
   var drows: array<vec3<f32>, 4>;
-  for (var q = 0; q < 4; q++) {
-    let jj = i32(cj) - 1 + q;
-    let p0 = latticeP(L, i32(ci) - 1, jj);
-    let p1 = latticeP(L, i32(ci), jj);
-    let p2 = latticeP(L, i32(ci) + 1, jj);
-    let p3 = latticeP(L, i32(ci) + 2, jj);
-    rows[q] = cr(p0, p1, p2, p3, s);
-    drows[q] = crd(p0, p1, p2, p3, s);
+  for (var q = 0u; q < 4u; q++) {
+    rows[q] = cr(net[4u * q], net[4u * q + 1u], net[4u * q + 2u], net[4u * q + 3u], s);
+    drows[q] = crd(net[4u * q], net[4u * q + 1u], net[4u * q + 2u], net[4u * q + 3u], s);
   }
   let P = cr(rows[0], rows[1], rows[2], rows[3], t);
   let dPs = cr(drows[0], drows[1], drows[2], drows[3], t);

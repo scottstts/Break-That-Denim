@@ -6,7 +6,9 @@ override MAX_SPANS: u32 = 65536u;
 
 fn segOkR(owner: u32, f: u32) -> bool {
   let fl = segw[2u * (2u * owner + f) + 1u].y;
-  return (fl & (SEG_EXISTS_R | SEG_BROKEN_R)) == SEG_EXISTS_R;
+  if ((fl & (SEG_EXISTS_R | SEG_BROKEN_R)) != SEG_EXISTS_R) { return false; }
+  let L = R.layers[nodes[owner].ijl >> 24u].lattice;
+  return x[owner].w < 1.5 && x[owner + select(L.y, 1u, f == 0u)].w < 1.5;
 }
 
 fn segRest(owner: u32, f: u32) -> f32 { return bitcast<f32>(segw[2u * (2u * owner + f)].x); }
@@ -88,6 +90,46 @@ fn spanYarn(s: u32, q: u32, t: f32) -> YarnPoint {
   return o;
 }
 
+// Strand of bundled yarn q in span s.
+fn strandOf(s: u32, q: u32) -> u32 { return q / yarnsPerStrand(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u); }
+
+// Bundled yarn q of span s belongs to an absent or separated strand.
+fn yarnBroken(s: u32, q: u32) -> bool { return ((segw[2u * s + 1u].y >> (8u + strandOf(s, q))) & 1u) == 1u; }
+
+// Failure site of bundled yarn q of span s (fraction from the owning node): its strand's site,
+// staggered per yarn (the yarns of a strand part a little apart).
+fn yarnSite(s: u32, q: u32) -> f32 {
+  let site = f32((segw[2u * s + 1u].w >> (8u * strandOf(s, q))) & 0xFFu) / 255.0;
+  return clamp(site + 0.18 * (hashf(s * 7u + q * 131u + 3u) - 0.5), 0.1, 0.9);
+}
+
+// Point u in [0, 1] along half h (0: from the owning node, 1: from the far node) of bundled yarn q
+// of span s. An intact yarn's halves meet in the middle. A broken yarn is two frayed stubs ending
+// short of its failure site (the ends recoil and untwist): their free ends droop, curl, fan apart
+// and thin out. Render-only shape on the mechanical span.
+fn halfYarn(s: u32, q: u32, h: u32, u: f32) -> YarnPoint {
+  if (!yarnBroken(s, q)) { return spanYarn(s, q, select(0.5 * u, 1.0 - 0.5 * u, h == 1u)); }
+  let site = yarnSite(s, q);
+  let seed = hash11(s * 31u + q * 7u + h * 3u + 5u);
+  let recoil = 0.05 + 0.1 * hashf(seed + 9u);
+  let reach = max(select(site, 1.0 - site, h == 1u) - recoil, 0.06);
+  var o = spanYarn(s, q, select(reach * u, 1.0 - reach * u, h == 1u));
+  let n = s >> 1u;
+  let L = R.layers[nodes[n].ijl >> 24u].lattice;
+  let nb = n + select(L.y, 1u, (s & 1u) == 0u);
+  let len = reach * distance(x[n].xyz, x[nb].xyz);
+  let curl = vec3<f32>(hashf(seed + 1u) - 0.5, hashf(seed + 2u) - 0.5, hashf(seed + 3u) - 0.5);
+  let side = normalize(cross(o.n, o.t));
+  let lat = f32(q) - 0.5 * (f32(bundleOf(R.layers[o.layer], s & 1u)) - 1.0);
+  let bend = curl * (0.5 * len) + vec3<f32>(0.0, 0.0, -0.25 * len) + side * (lat * 0.35 * len);
+  o.p += bend * (u * u);
+  o.t = normalize(o.t * select(len, -len, h == 1u) + bend * (2.0 * u));
+  // the end untwists into loose fibres (fuzz pass): the core thins toward it, and a stub shorter
+  // than the yarn is wide is mostly fibre
+  o.radius *= (1.0 - 0.6 * u) * clamp(len / (3.0 * o.radius), 0.25, 1.0);
+  return o;
+}
+
 // Loose yarn end q of the tail at node side e = 4 n + side (side: 0 u-, 1 u+, 2 v-, 3 v+), t in [0, 1]
 // from the node to the free end. Render-only shape: it continues the yarn direction, sags under
 // gravity, curls and fans out toward the end; its length is the tail's material length.
@@ -140,5 +182,12 @@ fn tailYarn(e: u32, q: u32, t: f32) -> YarnPoint {
   return o;
 }
 
-fn spanEntry(k: u32) -> u32 { return lists[SPAN_BASE + k]; }
+fn spanEntry(k: u32) -> u32 { return lists[SPAN_BASE + k] & 0x3FFFFFFFu; }
+
+// Bundled yarn q of list entry k lies inside an intact neighbour cell, whose surface already shows it.
+fn yarnInSurface(k: u32, q: u32, b: u32) -> bool {
+  let e = lists[SPAN_BASE + k];
+  let lat = 2.0 * f32(q) - f32(b - 1u);
+  return (lat > 0.0 && (e & 0x40000000u) != 0u) || (lat < 0.0 && (e & 0x80000000u) != 0u);
+}
 fn tailEntry(k: u32) -> u32 { return lists[SPAN_BASE + MAX_SPANS + k]; }

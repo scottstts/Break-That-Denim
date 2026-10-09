@@ -1,6 +1,6 @@
 // Loose surface fibres on freed yarns and frayed tail ends (render-only, attached to their yarn).
-// Each fibre is a short curved strand rooted on its parent yarn's surface. Fibres are ~15 um wide:
-// far below a pixel, so they are drawn as >= 1 px ribbons whose alpha is the true pixel coverage,
+// Each drawn fibre is a short curved tuft rooted on its parent yarn's surface, tens of microns wide:
+// far below a pixel, so it is drawn as a >= 1 px ribbon whose alpha is the true pixel coverage,
 // resolved by alpha-to-coverage on the 4x MSAA target.
 
 @group(0) @binding(0) var<uniform> F: FrameU;
@@ -16,9 +16,10 @@
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 
 override FUZZ_PER_YARN: u32 = 10u;
-override FUZZ_PER_TAIL: u32 = 14u;
+override FUZZ_PER_TAIL: u32 = 24u;
 const FIBER_PTS: u32 = 5u;
-const FIBER_WIDTH: f32 = 15e-6;
+// a drawn fibre is a small tuft of a few fibres (single cotton fibres are ~15 um)
+const FIBER_WIDTH: f32 = 30e-6;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -42,7 +43,7 @@ fn fiber(y: YarnPoint, seed: u32, vi: u32, tailEnd: bool) -> VOut {
   let r = hashf(seed + 3u);
   var len = 0.12e-3 + 0.75e-3 * r * r;
   if (tailEnd) {
-    len *= 1.6;
+    len *= 3.2;
     dir = normalize(dir + y.t * 1.2);
   }
   let bend = vec3<f32>(hashf(seed + 4u) - 0.5, hashf(seed + 5u) - 0.5, hashf(seed + 6u) - 0.8) * (0.9 * len);
@@ -79,12 +80,18 @@ fn hidden() -> VOut {
 fn vsYarnFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
   let b = bundleMax(R.layers[0]);
   let yi = ii / FUZZ_PER_YARN;
-  let s = spanEntry(yi / b);
-  let q = yi % b;
-  if (q >= bundleOf(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u)) { return hidden(); }
-  let seed = hash11(s * 977u + q * 131u + (ii % FUZZ_PER_YARN) * 7919u);
-  let t = hashf(seed);
-  return fiber(spanYarn(s, q, t), seed, vi, false);
+  let k = yi / (2u * b);
+  let s = spanEntry(k);
+  let q = (yi % (2u * b)) >> 1u;
+  let h = yi & 1u;
+  let bs = bundleOf(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u);
+  if (q >= bs || yarnInSurface(k, q, bs)) { return hidden(); }
+  let seed = hash11(s * 977u + q * 131u + h * 53u + (ii % FUZZ_PER_YARN) * 7919u);
+  // on a broken yarn the fibres concentrate toward its frayed end
+  let broken = yarnBroken(s, q);
+  let r = hashf(seed);
+  let u = select(r, 1.0 - r * r * 0.85, broken);
+  return fiber(halfYarn(s, q, h, u), seed, vi, broken && u > 0.6);
 }
 
 @vertex

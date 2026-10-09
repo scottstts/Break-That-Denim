@@ -27,7 +27,7 @@ fn nodeAt(l: u32, i: i32, j: i32) -> i32 {
   return i32(L.x) + j * i32(L.y) + i;
 }
 
-fn pinned(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u; }
+fn pinned(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 0.5; }
 
 fn spanOn(owner: i32, f: u32) -> bool {
   if (owner < 0) { return false; }
@@ -50,7 +50,7 @@ fn lenChange(e0: vec3<f32>, de: vec3<f32>, a: f32, l0: f32) -> vec2<f32> {
 
 fn nodeDelta(n: u32) -> vec3<f32> {
   let st = nodes[n];
-  if ((st.flags & NODE_PINNED) != 0u) { return vec3<f32>(0.0); }
+  if (pinned(n)) { return vec3<f32>(0.0); }
   let i = i32(st.ijl & 0xFFFu);
   let j = i32((st.ijl >> 12u) & 0xFFFu);
   let l = st.ijl >> 24u;
@@ -100,12 +100,12 @@ fn nodeDelta(n: u32) -> vec3<f32> {
       let de = dir(b) - dn;
       let l0 = length(ec);
       let ln = length(en);
-      let T0 = damagedResponse(y, L, s, l0 / L - 1.0).x;
+      let T0 = bundleResponse(y, strandsOf(mat, f), L, s, l0 / L - 1.0).x;
       let c = y.axialVisc / (L * h);
       for (var k = 0u; k < 3u; k++) {
         let al = ALPHA;
         let r = lenChange(ec, de, al[k], l0);
-        let Ta = damagedResponse(y, L, s, r.y / L - 1.0).x;
+        let Ta = bundleResponse(y, strandsOf(mat, f), L, s, r.y / L - 1.0).x;
         acc[k] += 0.5 * (T0 + Ta) * r.x + 0.5 * c * r.x * (r.y + l0 - 2.0 * ln);
       }
     }
@@ -120,7 +120,16 @@ fn nodeDelta(n: u32) -> vec3<f32> {
       let rn = x[a].xyz - 2.0 * x[n].xyz + x[c].xyz;
       let r0 = rn + dx[a].xyz - 2.0 * d0 + dx[c].xyz;
       let dr = dir(a) - 2.0 * dn + dir(c);
-      acc += quad(ke * dot(r0, dr) + kd * dot(r0 - rn, dr), (ke + kd) * dot(dr, dr));
+      // elastic: exact change of the fold-stiffening energy; viscous: quadratic
+      acc += quad(kd * dot(r0 - rn, dr), kd * dot(dr, dr));
+      let q0 = dot(r0, r0);
+      let ab = 4.0 * Lm * Lm;
+      for (var k = 0u; k < 3u; k++) {
+        let alv = ALPHA;
+        let al = alv[k];
+        let dq = 2.0 * al * dot(r0, dr) + al * al * dot(dr, dr);
+        acc[k] += 0.5 * ke * bendPsiDelta(q0, q0 + dq, dq, ab);
+      }
     }
   }
   // shear diagonals of the cell with lower-left corner n
@@ -140,10 +149,12 @@ fn nodeDelta(n: u32) -> vec3<f32> {
       let ec = (x[o].xyz + dx[o].xyz) - (x[p].xyz + dx[p].xyz);
       let de = dir(o) - dir(p);
       let l0 = length(ec);
+      let f0 = shearLaw(ks, Ld, l0).x;
       for (var k = 0u; k < 3u; k++) {
         let al = ALPHA;
         let rr = lenChange(ec, de, al[k], l0);
-        acc[k] += 0.5 * ks * rr.x * (rr.y + l0 - 2.0 * Ld);
+        // trapezoid of the shear force law (exact on its linear branch)
+        acc[k] += 0.5 * (f0 + shearLaw(ks, Ld, rr.y).x) * rr.x;
       }
     }
   }
@@ -153,7 +164,11 @@ fn nodeDelta(n: u32) -> vec3<f32> {
 @compute @workgroup_size(256)
 fn energyDelta(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
   var acc = vec3<f32>(0.0);
-  for (var n = gid.x; n < P.counts.x; n += 256u * GROUPS) { acc += nodeDelta(n); }
+  for (var n = gid.x; n < P.counts.x; n += 256u * GROUPS) {
+    let e = nodeDelta(n);
+    // firewall: one non-finite node must not decide the global step length
+    if (finite3(e)) { acc += e; }
+  }
   red[lid] = vec4<f32>(acc, 0.0);
   workgroupBarrier();
   var s = 128u;

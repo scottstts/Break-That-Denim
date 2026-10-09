@@ -10,6 +10,7 @@ import yarnGeomWgsl from './wgsl/yarn_geom.wgsl?raw';
 import yarnWgsl from './wgsl/yarn.wgsl?raw';
 import fuzzWgsl from './wgsl/fuzz.wgsl?raw';
 import postWgsl from './wgsl/post.wgsl?raw';
+import weaveTileWgsl from './wgsl/weave_tile.wgsl?raw';
 
 export interface CameraState {
   target: Vec3;
@@ -21,19 +22,21 @@ export interface CameraState {
   fovY: number;
 }
 
-/** About 10 cm of cloth across the view height: the projected weave density of the reference. */
+/** About 35 cm of cloth across the view height: the projected weave density of the reference. */
 export const DEFAULT_CAMERA: CameraState = {
-  target: [0.0, 0.0, -0.002],
-  distance: 0.29,
+  target: [0.0, 0.0, -0.01],
+  distance: 0.98,
   pitch: 0.16,
   yaw: 0,
   fovY: (20 * Math.PI) / 180,
 };
 
 const SAMPLES = 4;
+/** Texels per side of the prefiltered weave tile (one twill repeat) at mip level 0. */
+const TILE_SIZE = 128;
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 const SHADOW_SIZE = 4096;
-const SHADOW_HALF = 0.11;
+const SHADOW_HALF = 0.34;
 /** Sub-quads per lattice cell edge of the bicubic surface. */
 const REFINE = 2;
 const MAX_SPANS = 65536;
@@ -56,7 +59,7 @@ export function cameraMatrices(c: CameraState, aspect: number): ViewMatrices {
   const eye: Vec3 = [c.target[0] + dir[0] * c.distance, c.target[1] + dir[1] * c.distance, c.target[2] + dir[2] * c.distance];
   const up: Vec3 = [-Math.sin(c.yaw), Math.cos(c.yaw), 0];
   const view = lookAt(eye, c.target, up);
-  const proj = perspective(c.fovY, aspect, 0.01, 1.0);
+  const proj = perspective(c.fovY, aspect, 0.05, 3.0);
   const viewProj = multiply(proj, view);
   return { eye, view, proj, viewProj, invViewProj: invert(viewProj) };
 }
@@ -71,10 +74,11 @@ export class Renderer {
   readonly solver: GpuSolver;
   readonly scene: CompiledScene;
   /** Key light position relative to the camera target, its intensity, and exposure. */
-  keyOffset: Vec3 = [-0.09, 0.14, 0.17];
+  keyOffset: Vec3 = [-0.3, 0.46, 0.56];
   keyIntensity = 4.2;
   exposure = 1.0;
-  ambient: Vec3 = [0.012, 0.015, 0.024];
+  /** Sky/bounce fill (hemisphere top): shadowed cloth stays a dark blue, as in the reference. */
+  ambient: Vec3 = [0.07, 0.08, 0.11];
 
   private readonly frameU: GPUBuffer;
   private readonly renderU: GPUBuffer;
@@ -94,6 +98,8 @@ export class Renderer {
   private readonly yarnLayout: GPUBindGroupLayout;
   private readonly postLayout: GPUBindGroupLayout;
   private readonly shadowTex: GPUTexture;
+  private readonly weaveTile: GPUTexture;
+  private readonly tileSampler: GPUSampler;
   private readonly shadowSampler: GPUSampler;
   private readonly dummyDepth: GPUTexture;
   private surfaceGroup: GPUBindGroup;
@@ -164,6 +170,8 @@ export class Renderer {
         ro(3),
         { binding: 4, visibility: F, texture: { sampleType: 'depth' } },
         { binding: 5, visibility: F, sampler: { type: 'comparison' } },
+        { binding: 6, visibility: F, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+        { binding: 7, visibility: F, sampler: { type: 'filtering' } },
       ],
     });
     this.yarnLayout = device.createBindGroupLayout({
@@ -256,6 +264,9 @@ export class Renderer {
     this.dummyDepth = device.createTexture({ size: [1, 1], format: 'depth32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
     this.shadowSampler = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
 
+    this.weaveTile = this.buildWeaveTile();
+    this.tileSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
+    const tileView = this.weaveTile.createView({ dimension: '2d-array' });
     const surfaceEntries = (shadow: GPUTextureView): GPUBindGroupEntry[] => [
       { binding: 0, resource: { buffer: this.frameU } },
       { binding: 1, resource: { buffer: this.renderU } },
@@ -263,6 +274,8 @@ export class Renderer {
       { binding: 3, resource: { buffer: this.cellFlags } },
       { binding: 4, resource: shadow },
       { binding: 5, resource: this.shadowSampler },
+      { binding: 6, resource: tileView },
+      { binding: 7, resource: this.tileSampler },
     ];
     const yarnEntries = (shadow: GPUTextureView): GPUBindGroupEntry[] => [
       { binding: 0, resource: { buffer: this.frameU } },
@@ -301,6 +314,51 @@ export class Renderer {
     });
   }
 
+  /** Prefiltered weave tile per layer: every mip level averaged analytically (weave_tile.wgsl). */
+  private buildWeaveTile(): GPUTexture {
+    const layers = this.scene.layers.length;
+    const levels = Math.log2(TILE_SIZE) + 1;
+    const tex = this.device.createTexture({
+      label: 'weaveTile',
+      size: [TILE_SIZE, TILE_SIZE, layers],
+      format: 'rgba16float',
+      mipLevelCount: levels,
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    const module = shaderModule(this.device, 'weaveTile', commonWgsl + weaveTileWgsl);
+    const layout = this.device.createBindGroupLayout({
+      label: 'weaveTile',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      ],
+    });
+    const pipe = this.device.createComputePipeline({
+      label: 'weaveTile.build',
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      compute: { module, entryPoint: 'build' },
+    });
+    const enc = this.device.createCommandEncoder({ label: 'weaveTile' });
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe);
+    const temps: GPUBuffer[] = [];
+    for (let l = 0; l < layers; l++) {
+      for (let k = 0; k < levels; k++) {
+        const size = TILE_SIZE >> k;
+        const u = createBufferWith(this.device, 'weaveTile.level', new Uint32Array([l, size, 0, 0]), UNIFORM);
+        temps.push(u);
+        const view = tex.createView({ dimension: '2d', baseMipLevel: k, mipLevelCount: 1, baseArrayLayer: l, arrayLayerCount: 1 });
+        pass.setBindGroup(0, this.device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: this.renderU } }, { binding: 1, resource: { buffer: u } }, { binding: 2, resource: view }] }));
+        pass.dispatchWorkgroups(Math.ceil(size / 8), Math.ceil(size / 8));
+      }
+    }
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    void this.device.queue.onSubmittedWorkDone().then(() => temps.forEach((b) => b.destroy()));
+    return tex;
+  }
+
   private renderParams(): ArrayBuffer {
     const buf = new ArrayBuffer(16 + 3 * 96);
     const u = new Uint32Array(buf);
@@ -318,10 +376,11 @@ export class Renderer {
       u[b] = L.nodeOffset;
       u[b + 1] = L.nx;
       u[b + 2] = L.ny;
-      u[b + 3] = L.bundle[0] | (L.bundle[1] << 16);
+      // yarns per span (warp column, pick row) and failure strands per span (warp, pick), one byte each
+      u[b + 3] = L.bundle[0] | (L.bundle[1] << 8) | ((L.material.yarns[1].strandsPerSpan ?? 1) << 16) | ((L.material.yarns[0].strandsPerSpan ?? 1) << 24);
       f[b + 4] = m.pitchU;
       f[b + 5] = m.pitchV;
-      f[b + 6] = -1; // twill direction: lines rise to the right in view, as in the reference
+      f[b + 6] = 1; // twill direction: wales rise to the right at ~57 degrees in view, as in the reference
       const warp = m.yarns[1];
       const weft = m.yarns[0];
       f.set([warp.width, warp.height, warp.crimpAmplitude, 0.42], b + 8);
@@ -357,9 +416,9 @@ export class Renderer {
   private lightMatrix(target: Vec3): Mat4 {
     const key: Vec3 = [target[0] + this.keyOffset[0], target[1] + this.keyOffset[1], target[2] + this.keyOffset[2]];
     const dir = normalize(sub(key, target));
-    const eye: Vec3 = [target[0] + dir[0] * 0.3, target[1] + dir[1] * 0.3, target[2] + dir[2] * 0.3];
+    const eye: Vec3 = [target[0] + dir[0] * 0.9, target[1] + dir[1] * 0.9, target[2] + dir[2] * 0.9];
     const view = lookAt(eye, target, Math.abs(dir[2]) > 0.95 ? [0, 1, 0] : [0, 0, 1]);
-    const proj = orthographic(-SHADOW_HALF, SHADOW_HALF, -SHADOW_HALF, SHADOW_HALF, 0.2, 0.4);
+    const proj = orthographic(-SHADOW_HALF, SHADOW_HALF, -SHADOW_HALF, SHADOW_HALF, 0.6, 1.2);
     return multiply(proj, view);
   }
 
@@ -373,7 +432,7 @@ export class Renderer {
     const m = cameraMatrices(camera, this.width / this.height);
     const key: Vec3 = [camera.target[0] + this.keyOffset[0], camera.target[1] + this.keyOffset[1], camera.target[2] + this.keyOffset[2]];
     // aim the key slightly above the frame centre so illumination falls off toward the bottom
-    const aim: Vec3 = [camera.target[0] + 0.01, camera.target[1] + 0.02, camera.target[2]];
+    const aim: Vec3 = [camera.target[0] + 0.03, camera.target[1] + 0.065, camera.target[2]];
     const axis = normalize(sub(aim, key));
     const fu = new Float32Array(64);
     fu.set(m.viewProj, 0);
@@ -381,7 +440,7 @@ export class Renderer {
     fu.set([...m.eye, camera.fovY / this.height], 32);
     // keyPos relative intensity normalisation uses |keyPos| (see keyLight); positions are in world space
     fu.set([...key, this.keyIntensity], 36);
-    fu.set([...axis, 0.86], 40);
+    fu.set([...axis, 0.93], 40);
     fu.set([...this.ambient, (2 * SHADOW_HALF) / SHADOW_SIZE], 44);
     fu.set([this.width, this.height, 1 / this.width, 1 / this.height], 48);
     const kd = Math.hypot(key[0] - camera.target[0], key[1] - camera.target[1], key[2] - camera.target[2]);

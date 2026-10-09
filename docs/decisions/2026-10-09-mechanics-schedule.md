@@ -1,6 +1,6 @@
 # Single denim layer, bundled lattice, solver schedule, rendering split
 
-Status: implemented for the first hands-on review. Evidence: `tools/studies/timestep.ts` (f64 reference), `tools/gpu/scripts/{grabstudy,accuracy,ringdown,profile}.ts` (Dawn/Metal, Apple M5).
+Status: implemented for the first hands-on review. Partly superseded by [feedback round 1](2026-10-09-feedback-round1.md) (no history gate, 9 x 6 bundles at reference scale, grip force). Evidence: `tools/studies/timestep.ts` (f64 reference), `tools/gpu/scripts/{grabstudy,accuracy,ringdown,profile}.ts` (Dawn/Metal, Apple M5).
 
 ## Scene
 

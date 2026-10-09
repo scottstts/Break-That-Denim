@@ -1,30 +1,24 @@
 /**
- * Headless frame capture of the product renderer (Node + Dawn): settles the default drape (cached
- * under artifacts/studies) and renders still frames to artifacts/captures.
+ * Headless frame capture of the product renderer (Node + Dawn) from the app's settled drape; still
+ * frames go to artifacts/captures.
  *   node tools/gpu/run.mjs tools/gpu/scripts/render.ts <name> [width height] [distance pitch]
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { readBuffer } from '../../../src/gpu/util';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
-import { settleDrape } from '../../../src/simulation/gpu/settle';
-import { GpuSolver, GPU_DEFAULTS } from '../../../src/simulation/gpu/solver';
+import { loadDrape } from '../../../src/simulation/gpu/settle';
+import { GpuSolver, GPU_DEFAULTS, type GpuSolverParams } from '../../../src/simulation/gpu/solver';
 import { compileScene, defaultSceneSpecs } from '../../../src/simulation/scene';
 import { gpuDevice, ROOT, saveTexture } from '../env';
 
-export async function settledSolver(device: GPUDevice): Promise<{ solver: GpuSolver; scene: ReturnType<typeof compileScene> }> {
+/** Solver on the app's validated settled drape (public/drape.bin; regenerate with npm run gpu:drape). */
+export async function settledSolver(device: GPUDevice, params: Partial<GpuSolverParams> = {}): Promise<{ solver: GpuSolver; scene: ReturnType<typeof compileScene> }> {
   const scene = compileScene(defaultSceneSpecs());
-  const solver = new GpuSolver(device, scene, GPU_DEFAULTS);
-  const dir = resolve(ROOT, 'artifacts/studies');
-  const file = resolve(dir, `drape-${scene.nodeCount}.bin`);
-  if (existsSync(file)) {
-    device.queue.writeBuffer(solver.x, 0, new Float32Array(readFileSync(file).buffer.slice(0)));
-  } else {
-    const t0 = performance.now();
-    await settleDrape(device, solver);
-    console.log(`settled in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, new Uint8Array(await readBuffer(device, solver.x)));
+  const solver = new GpuSolver(device, scene, { ...GPU_DEFAULTS, ...params });
+  const file = resolve(ROOT, 'public/drape.bin');
+  const data = existsSync(file) ? readFileSync(file) : null;
+  if (!data || !loadDrape(solver, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))) {
+    throw new Error('public/drape.bin is missing or stale: run npm run gpu:drape');
   }
   return { solver, scene };
 }

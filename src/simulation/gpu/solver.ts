@@ -1,4 +1,3 @@
-import { strainAtTension } from '../axial';
 import { levelLayers, lineTable, nodeCount, type LatticeLayer, type LineTable } from '../lattice';
 import type { CompiledScene } from '../scene';
 import { ComputeModule, createBuffer, createBufferWith, UNIFORM, type BindingResource } from '../../gpu/util';
@@ -27,8 +26,10 @@ export interface GpuSolverParams {
   /** Convergence threshold on the largest nodal Newton update, m. */
   newtonTolerance: number;
   /**
-   * A span (crossing) advances damage (slip) only if its nodes' last Newton update is below this, m:
-   * unconverged iterates must not commit irreversible history.
+   * A span (crossing) advances damage (slip) only if its nodes' last Newton update is below this, m.
+   * Off in production (see docs/decisions/2026-10-09-feedback-round1.md): with the production
+   * schedule nearly every moving node exceeds any useful tolerance, which suppressed tearing while
+   * pulling; ungated history tracks a converged solve closely and adds no spurious ruptures.
    */
   historyTolerance: number;
   pcgIterations: number;
@@ -49,7 +50,7 @@ export const GPU_DEFAULTS: GpuSolverParams = {
   newtonIterations: 2,
   newtonMax: 2,
   newtonTolerance: 1e-5,
-  historyTolerance: 2e-6,
+  historyTolerance: 1,
   pcgIterations: 1,
   coarseSweeps: 2,
   maxCoarsestNodes: 400,
@@ -121,6 +122,8 @@ function simParamsData(scene: CompiledScene, p: GpuSolverParams): ArrayBuffer {
     f[b + 23] = m.pitchU;
     f[b + 24] = m.pitchV;
     f[b + 25] = m.airDrag;
+    f[b + 26] = m.yarns[0].strandsPerSpan ?? 1;
+    f[b + 27] = m.yarns[1].strandsPerSpan ?? 1;
   });
   return buf;
 }
@@ -289,10 +292,11 @@ export class GpuSolver {
       f[8 * q] = restLength[q];
       f[8 * q + 1] = s.peakTension[q];
       f[8 * q + 2] = s.softening[q];
-      f[8 * q + 3] = yarn && s.peakTension[q] > 0 ? strainAtTension(yarn, s.peakTension[q]) : 0;
+      u[8 * q + 3] = yarn ? s.yarnPeaks[q] : 0;
       f[8 * q + 4] = maxExt[q];
       u[8 * q + 5] = segFlags[q];
       f[8 * q + 6] = s.failSite[q];
+      u[8 * q + 7] = s.yarnSites[q];
     }
     return buf;
   }

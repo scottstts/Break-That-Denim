@@ -80,7 +80,7 @@ function spec(): LayerSpec {
     compressV: 0.01,
     shear: 0.02,
     collarRows: 2,
-    wear: { center: [0, 0], axis: [1, -1], radii: [0.012, 0.009], amount: 0.9, cellSize: 0.009, defectThreshold: 0.85, defectDensity: 0.4 },
+    wear: { center: [0, 0], axis: [1, -1], radii: [0.012, 0.009], amount: 0.9, cellSize: 0.009, featureScale: 0.01, defectThreshold: 0.85, defectDensity: 0.4 },
     wearStrengthLoss: [0.55, 0.93],
     seed: 11,
     perturbation: 0.5e-3,

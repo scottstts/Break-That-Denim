@@ -7,11 +7,11 @@ import type { CompiledScene } from './scene';
  */
 export const GRIP = {
   /** Material radius of the gripped patch, m. */
-  radius: 0.0042,
+  radius: 0.014,
   /** Maximum total grip force, N. */
-  maxForce: 40,
+  maxForce: 150,
   /** Largest lead of the handle over the patch centroid, m. */
-  maxLead: 0.002,
+  maxLead: 0.006,
 };
 
 export interface GripPatch {

@@ -1,4 +1,4 @@
-import { damagedResponse } from '../axial';
+import { bendPsi, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
 import type { LayerInfo } from '../scene';
 import { bracket, coarsenLayers, shouldCoarsen, type LatticeLayer } from '../lattice';
@@ -190,7 +190,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
     for (let q = 0; q < 3; q++) e[q] /= l;
     const L = S.restLength[s];
     const yarn = S.layer(a).material.yarns[f];
-    const [T, K] = damagedResponse(yarn, L, S.scene.peakTension[s], S.scene.softening[s], S.maxExt[s], l / L - 1);
+    const [T, K] = S.response(s, l / L - 1);
     const ln = S.segLength(s);
     const c = yarn.axialViscosity / (L * h);
     const fs = T + c * (l - ln);
@@ -209,7 +209,15 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       const yarn = S.layer(b).material.yarns[f];
       const Lm = 0.5 * (S.restLength[s0] + S.restLength[s1]);
       const kb = yarn.bendRigidity / (Lm * Lm * Lm);
-      const k = kb * (1 + yarn.bendViscosity / h);
+      // fold-stiffening energy: the exact Hessian kb (Psi' I + 2 Psi'' r r^T) is majorized by the
+      // scalar kb (Psi' + 2 Psi'' |r|^2), which keeps the stencil's scalar-identity block form
+      let q2 = 0;
+      for (let z = 0; z < 3; z++) {
+        const rz = S.x[3 * a + z] + S.dx[3 * a + z] - 2 * (S.x[3 * b + z] + S.dx[3 * b + z]) + S.x[3 * c + z] + S.dx[3 * c + z];
+        q2 += rz * rz;
+      }
+      const ps = bendPsi(q2, 4 * Lm * Lm);
+      const k = kb * (ps[1] + 2 * ps[2] * q2) + (kb * yarn.bendViscosity) / h;
       const nodes = [a, b, c];
       const w = [1, -2, 1];
       for (let p = 0; p < 3; p++) {
@@ -245,7 +253,8 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       }
       l = Math.sqrt(l);
       for (let z = 0; z < 3; z++) pa[z] /= l;
-      axialBlock(ks, geomStiff(ks * (l - Ld)) / l, pa, H);
+      const [fsh, ksh] = shearLaw(ks, Ld, l);
+      axialBlock(ksh, geomStiff(fsh) / l, pa, H);
       scatterPair(A, p, q, H);
     }
   }
@@ -350,6 +359,22 @@ function inv3(a: ArrayLike<number>, out: Float64Array): void {
   out[8] = (a00 * a11 - a01 * a10) * id;
 }
 
+/**
+ * Inverse of a pivot block shifted by a small multiple of its scale. Mirrors pivotInverse in WGSL
+ * (common.wgsl): in f32 a Schur pivot can lose its inertia digits entirely next to stiff yarn terms,
+ * so the GPU smoother regularizes every pivot; the reference applies the same policy.
+ */
+export const PIVOT_SHIFT = 2e-6;
+const shifted = new Float64Array(9);
+function pivotInv3(a: ArrayLike<number>, out: Float64Array, shift: number): void {
+  const e = shift * Math.max(Math.abs(a[0]), Math.abs(a[4]), Math.abs(a[8]));
+  for (let q = 0; q < 9; q++) shifted[q] = a[q];
+  shifted[0] += e;
+  shifted[4] += e;
+  shifted[8] += e;
+  inv3(shifted, out);
+}
+
 function mul3(a: ArrayLike<number>, b: ArrayLike<number>, out: Float64Array): void {
   for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) out[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
 }
@@ -357,9 +382,10 @@ function mul3(a: ArrayLike<number>, b: ArrayLike<number>, out: Float64Array): vo
 /**
  * Solve the symmetric block-pentadiagonal system with diagonal blocks D_k, first upper blocks
  * E_k = A(k, k+1) and second upper blocks F_k = A(k, k+2) (lower blocks are their transposes) by
- * banded block Gaussian elimination without pivoting (valid for SPD systems).
+ * banded block Gaussian elimination without pivoting (valid for SPD systems). A nonzero `shift`
+ * regularizes every pivot relative to its scale (smoother use, see PIVOT_SHIFT); 0 solves exactly.
  */
-export function solvePenta(n: number, D: Float64Array, E: Float64Array, F: Float64Array, r: Float64Array, x: Float64Array): void {
+export function solvePenta(n: number, D: Float64Array, E: Float64Array, F: Float64Array, r: Float64Array, x: Float64Array, shift = 0): void {
   const Dk = Float64Array.from(D.subarray(0, 9 * n));
   const U1 = Float64Array.from(E.subarray(0, 9 * n));
   const L1 = new Float64Array(9 * n); // A(k, k-1)
@@ -370,7 +396,7 @@ export function solvePenta(n: number, D: Float64Array, E: Float64Array, F: Float
   const t = new Float64Array(9);
   const Amk = new Float64Array(9);
   for (let k = 0; k < n; k++) {
-    inv3(Dk.subarray(9 * k, 9 * k + 9), inv);
+    pivotInv3(Dk.subarray(9 * k, 9 * k + 9), inv, shift);
     for (let m = k + 1; m <= k + 2 && m < n; m++) {
       if (m === k + 1) Amk.set(L1.subarray(9 * m, 9 * m + 9));
       else for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) Amk[a * 3 + b] = F[9 * k + b * 3 + a];
@@ -394,7 +420,7 @@ export function solvePenta(n: number, D: Float64Array, E: Float64Array, F: Float
       if (k + 1 < n) b0[q] -= U1[9 * k + q * 3] * x[3 * (k + 1)] + U1[9 * k + q * 3 + 1] * x[3 * (k + 1) + 1] + U1[9 * k + q * 3 + 2] * x[3 * (k + 1) + 2];
       if (k + 2 < n) b0[q] -= F[9 * k + q * 3] * x[3 * (k + 2)] + F[9 * k + q * 3 + 1] * x[3 * (k + 2) + 1] + F[9 * k + q * 3 + 2] * x[3 * (k + 2) + 2];
     }
-    inv3(Dk.subarray(9 * k, 9 * k + 9), inv);
+    pivotInv3(Dk.subarray(9 * k, 9 * k + 9), inv, shift);
     for (let q = 0; q < 3; q++) x[3 * k + q] = inv[q * 3] * b0[0] + inv[q * 3 + 1] * b0[1] + inv[q * 3 + 2] * b0[2];
   }
 }
@@ -631,7 +657,7 @@ export function smoothLines(A: StencilOperator, x: Float64Array, b: Float64Array
           r[3 * k + 2] += maj * xOld[3 * n + 2];
         }
         F.fill(0, 0, 9 * len);
-        solvePenta(len, D, E, F, r, sol);
+        solvePenta(len, D, E, F, r, sol, PIVOT_SHIFT);
         for (let k = 0; k < len; k++) {
           const n = node(k);
           if (A.fixed[n]) continue;

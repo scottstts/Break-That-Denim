@@ -79,7 +79,10 @@ fn reduceFinal(@builtin(local_invocation_index) lid: u32) {
   if (lid == 0u) { scal[It.y] = red[0]; }
 }
 
-fn safeDiv(a: f32, b: f32) -> f32 { return select(0.0, a / b, b > 0.0); }
+fn safeDiv(a: f32, b: f32) -> f32 {
+  let q = a / b;
+  return select(0.0, q, b > 0.0 && finite1(q));
+}
 
 // va = delta, vb = p, vc = r, vd = Ap, ve = z:  delta += a p ; r -= a Ap ; z = 0
 @compute @workgroup_size(256)
