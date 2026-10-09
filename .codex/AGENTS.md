@@ -106,6 +106,7 @@ When quality and performance conflict, favor quality unless performance becomes 
 
 ## Rules
 
+- no live browser during build, use the existing headless setup if you need to see it
 - Do NOT use agent skills throughout
 - run lint and typecheck as basic checks, tests as well
 - When asked to write implementation documentations, do NOT include verbose and irrelevant things like broad project rules, what text was used, etc. The point of documentation for a specific session of implementation is to capture only design choices that were discussed or surfaced during coding beyond what code alone can tell that could potentially impact future implementations, not to repeat what the code or project rules already says
