@@ -6,10 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "typecheck": "tsc",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "check": "npm run lint && npm run typecheck && npm run test"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@webgpu/types": "^0.1.74",
+    "eslint": "^10.11.0",
+    "globals": "^17.13.0",
     "typescript": "~6.0.2",
-    "vite": "^8.3.0"
+    "typescript-eslint": "^8.71.0",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.3"
   }
 }

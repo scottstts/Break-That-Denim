@@ -24,6 +24,7 @@ dist-ssr
 *.sw?
 
 refs
+.claude/launch.json
 
 # Generated reference captures, numerical traces, and benchmark output
 artifacts/

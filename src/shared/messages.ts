@@ -1,0 +1,35 @@
+/** Main thread → engine worker. Small ordered messages only; no bulk state crosses this boundary. */
+export type ToEngine =
+  | { type: 'init'; canvas: OffscreenCanvas; width: number; height: number; cssWidth: number; cssHeight: number }
+  | { type: 'resize'; width: number; height: number; cssWidth: number; cssHeight: number }
+  | PointerCommand
+  | { type: 'wheel'; seq: number; deltaY: number; time: number }
+  | { type: 'reset' }
+  | { type: 'visibility'; visible: boolean };
+
+/** Pointer coordinates are in CSS pixels relative to the canvas, with the CSS size alongside. */
+export interface PointerCommand {
+  type: 'pointer';
+  phase: 'down' | 'move' | 'up' | 'cancel';
+  seq: number;
+  /** performance.now() at the event (main-thread clock). */
+  time: number;
+  x: number;
+  y: number;
+}
+
+/** Engine worker → main thread. */
+export type FromEngine =
+  | { type: 'ready' }
+  | { type: 'status'; state: 'loading' | 'running' | 'paused' | 'error'; message?: string }
+  | { type: 'cursor'; cursor: 'grab' | 'grabbing' | 'default' }
+  | { type: 'stats'; stats: EngineStats };
+
+export interface EngineStats {
+  frameMs: number;
+  substepsPerFrame: number;
+  simWallRatio: number;
+  gpuMsPerSubstep: number;
+  gpuRenderMs: number;
+  brokenSegments: number;
+}
