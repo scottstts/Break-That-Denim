@@ -6,6 +6,8 @@ Build an interactive web-based fabric tearing experience that reaches the visual
 
 The reference video is the primary quality target. Study it closely and use it as the benchmark for simulation behavior, tearing, material appearance, fine detail, lighting, and overall realism.
 
+Your stacks should go lower level where needed, custom webgpu stack and/or wasm
+
 ## Priorities
 
 1. **Visual quality is the highest priority.**
@@ -15,6 +17,10 @@ The reference video is the primary quality target. Study it closely and use it a
 5. Prefer correctness and realism over shortcuts intended only to improve frame rate.
 
 Real-time 60 FPS is not a requirement. Lower frame rates, variable frame rates, or heavier computation are acceptable if they materially improve the final result.
+
+## UI
+
+minimal UI, no panels, no descriptions, no additional elements, anything that is not strictly necessary should not be there
 
 ## Interaction
 
