@@ -7,7 +7,7 @@ import { readBuffer } from '../../src/gpu/util';
 import { DENIM } from '../../src/simulation/material';
 import { assembleFineOperator, buildHierarchy, offsetIndex, pcg, smoothLines, STENCIL, vcycle, type MGConfig } from '../../src/simulation/reference/newtonMultigrid';
 import { ReferenceSolver } from '../../src/simulation/reference/solver';
-import { compileScene, type LayerSpec } from '../../src/simulation/scene';
+import { compileScene, SEG_BROKEN, type LayerSpec } from '../../src/simulation/scene';
 import { COARSE_ROW, FINE_ROW, GpuSolver, GPU_DEFAULTS } from '../../src/simulation/gpu/solver';
 import { gpuDevice } from '../../tools/gpu/env';
 
@@ -19,6 +19,9 @@ function check(name: string, ok: boolean, detail: string): void {
 
 /** The reference schedule matching GPU_DEFAULTS. */
 const MG: MGConfig = { maxCoarsestNodes: GPU_DEFAULTS.maxCoarsestNodes, coarseSweeps: GPU_DEFAULTS.coarseSweeps, lineColors: 3, lagCoarse: true, lineSearch: true };
+
+/** Production schedule without self-contact (the f64 reference has no contact). */
+const PARAMS = { ...GPU_DEFAULTS, selfContact: false };
 
 function coupon(nu: number, nv: number, extra: Partial<LayerSpec> = {}): LayerSpec {
   return {
@@ -126,7 +129,7 @@ function copyState(cpu: ReferenceSolver, N: number): { xs: Float32Array; vs: Flo
 async function correctness(device: GPUDevice): Promise<void> {
   console.log('--- correctness: coupon vs f64 reference (production schedule)');
   const scene = compileScene([coupon(48, 40)]);
-  const params = GPU_DEFAULTS;
+  const params = PARAMS;
   const cpu = new ReferenceSolver(scene, { h: params.h, gravity: params.gravity, newtonIterations: params.newtonIterations, pcgIterations: params.pcgIterations, mg: MG });
   cpu.historyTolerance = params.historyTolerance;
   for (let k = 0; k < 12; k++) cpu.substep();
@@ -143,7 +146,9 @@ async function correctness(device: GPUDevice): Promise<void> {
   });
   const Acpu = assembleFineOperator(cpu);
   const Agpu = await readOperator(device, gpu.levels[0].op, N, true);
-  check('fine operator blocks', maxAbsRelToScale(Agpu, Acpu.A) < 2e-5, `maxAbs/scale=${maxAbsRelToScale(Agpu, Acpu.A).toExponential(2)}`);
+  // f32 positions shift strains by ~1e-5; on the steep decrimping ramp of the axial tangent that moves
+  // diagonal entries by a few 1e-5 of the operator scale (input rounding, not kernel error)
+  check('fine operator blocks', maxAbsRelToScale(Agpu, Acpu.A) < 5e-5, `maxAbs/scale=${maxAbsRelToScale(Agpu, Acpu.A).toExponential(2)}`);
   const g = new Float64Array(3);
   const bCpu = new Float64Array(3 * N);
   for (let n = 0; n < N; n++) {
@@ -220,12 +225,73 @@ async function dynamics(device: GPUDevice, scene: ReturnType<typeof compileScene
 async function convergedDynamics(device: GPUDevice): Promise<void> {
   console.log('--- converged schedule dynamics');
   const scene = compileScene([coupon(48, 40)]);
-  const params = { ...GPU_DEFAULTS, newtonIterations: 5, newtonMax: 5, pcgIterations: 3 };
+  const params = { ...PARAMS, newtonIterations: 5, newtonMax: 5, pcgIterations: 3 };
   const cpu = new ReferenceSolver(scene, { h: params.h, gravity: params.gravity, newtonIterations: 5, pcgIterations: 3, mg: MG });
   cpu.historyTolerance = params.historyTolerance;
   for (let k = 0; k < 12; k++) cpu.substep();
   const gpu = new GpuSolver(device, scene, params);
   await dynamics(device, scene, cpu, gpu, 'converged schedule', 0.03);
+}
+
+/**
+ * Torn topology: a flap cut on three sides plus a slit. Exercises the shear diagonals and air drag of
+ * hole-edge nodes and the connectivity-aware prolongation (Galerkin levels, V-cycle, PCG).
+ */
+async function torn(device: GPUDevice): Promise<void> {
+  console.log('--- torn coupon: flap and slit');
+  const scene = compileScene([coupon(48, 40)]);
+  const params = PARAMS;
+  const cpu = new ReferenceSolver(scene, { h: params.h, gravity: params.gravity, newtonIterations: params.newtonIterations, pcgIterations: params.pcgIterations, mg: MG });
+  cpu.historyTolerance = params.historyTolerance;
+  const nx = scene.layers[0].nx;
+  const cut = (i: number, j: number, f: number) => (cpu.segFlags[2 * (j * nx + i) + f] |= SEG_BROKEN);
+  for (let j = 12; j < 26; j++) {
+    cut(14, j, 0);
+    cut(31, j, 0);
+  }
+  for (let i = 15; i <= 31; i++) cut(i, 11, 1);
+  for (let i = 6; i < 13; i++) cut(i, 30, 1);
+  for (let k = 0; k < 12; k++) cpu.substep();
+  const gpu = new GpuSolver(device, scene, params);
+  const N = scene.nodeCount;
+  const { xs, vs } = copyState(cpu, N);
+  gpu.setState(xs, vs);
+  gpu.setSegments(cpu.restLength, cpu.maxExt, cpu.segFlags, cpu.tails);
+  cpu.predict();
+  await submit(device, (p) => {
+    gpu.encodePredict(p);
+    gpu.encodeAssemble(p);
+  });
+  const A = assembleFineOperator(cpu);
+  const Agpu = await readOperator(device, gpu.levels[0].op, N, true);
+  check('torn: fine operator', maxAbsRelToScale(Agpu, A.A) < 5e-5, `${maxAbsRelToScale(Agpu, A.A).toExponential(2)}`);
+  A.A.set(Agpu);
+  const levels = buildHierarchy(A, MG);
+  for (let k = 1; k < Math.min(levels.length, gpu.levels.length); k++) {
+    const Ak = await readOperator(device, gpu.levels[k].op, gpu.levels[k].N, false);
+    const e = maxAbsRelToScale(Ak, levels[k].A.A);
+    check(`torn: galerkin level ${k}`, e < 1e-5, `maxAbs/scale=${e.toExponential(2)}`);
+  }
+  const b = await readVec(device, gpu.levels[0].B, N);
+  const zc = new Float64Array(3 * N);
+  vcycle(levels, 0, zc, b, 1, 1, params.coarseSweeps, smoothLines, 3);
+  device.queue.writeBuffer(gpu.levels[0].X, 0, new Float32Array(4 * N));
+  await submit(device, (p) => gpu.encodeVCycle(p, 0));
+  const zg = await readVec(device, gpu.levels[0].X, N);
+  check('torn: V-cycle', maxAbsRelToScale(zg, zc) < 5e-3, `maxAbs/scale=${maxAbsRelToScale(zg, zc).toExponential(2)}`);
+  const dc = new Float64Array(3 * N);
+  pcg(levels, b, dc, params.pcgIterations, undefined, smoothLines, MG);
+  await submit(device, (p) => gpu.encodePCG(p));
+  const dg = await readVec(device, gpu.delta, N);
+  check('torn: PCG step', maxAbsRelToScale(dg, dc) < 2e-2, `maxAbs/scale=${maxAbsRelToScale(dg, dc).toExponential(2)}`);
+  const eCpu = cpu.energyChange(dg, [1, 0.5, 0.25]);
+  await submit(device, (p) => gpu.encodeLineSearch(p));
+  const part = new Float32Array(await readBuffer(device, gpu.partial4));
+  const eGpu = [0, 0, 0];
+  for (let k = 0; k < part.length / 4; k++) for (let q = 0; q < 3; q++) eGpu[q] += part[4 * k + q];
+  const eScale = Math.max(...eCpu.map(Math.abs));
+  const eErr = Math.max(...eGpu.map((v, q) => Math.abs(v - eCpu[q]))) / eScale;
+  check('torn: line-search energy changes', eErr < 1e-2, `gpu [${eGpu.map((v) => v.toExponential(3)).join(', ')}] cpu [${eCpu.map((v) => v.toExponential(3)).join(', ')}]`);
 }
 
 /** Long yarn lines (as in the full scene): GPU smoother and PCG against the f64 reference. */
@@ -236,7 +302,7 @@ async function longLines(device: GPUDevice): Promise<void> {
     [30, 164],
   ]) {
     const scene = compileScene([coupon(nu, nv)]);
-    const params = GPU_DEFAULTS;
+    const params = PARAMS;
     const cpu = new ReferenceSolver(scene, { h: params.h, gravity: params.gravity, newtonIterations: 1, pcgIterations: params.pcgIterations, mg: MG });
     const gpu = new GpuSolver(device, scene, params);
     const N = scene.nodeCount;
@@ -269,6 +335,7 @@ export default async function main(): Promise<void> {
   const device = await gpuDevice();
   await correctness(device);
   await convergedDynamics(device);
+  await torn(device);
   await longLines(device);
   device.destroy();
   const failed = results.filter((r) => !r.ok).length;

@@ -113,25 +113,48 @@ export class ReferenceSolver {
   }
 
   /**
-   * Implicit normal air drag of node n: coefficient c A / h and the unit normal of the accepted
-   * state from lattice neighbours (mirrors airNormal in assemble.wgsl). Energy 1/2 c (n . dx)^2.
+   * Implicit air drag block of node n (row-major 3x3, energy 1/2 dx^T D dx) from the accepted state
+   * and the node's connected spans: along the normal for a sheet node, across the strand for a node
+   * with spans in one family only, isotropic for an isolated node. Mirrors drag.wgsl.
    */
-  airDrag(n: number): [number, number[]] {
-    const L = this.layer(n);
-    const m = L.material;
-    if (!(m.airDrag > 0)) return [0, [0, 0, 0]];
-    const nb = this.nbr;
-    const a = nb[4 * n] >= 0 ? nb[4 * n] : n;
-    const b = nb[4 * n + 1] >= 0 ? nb[4 * n + 1] : n;
-    const d = nb[4 * n + 2] >= 0 ? nb[4 * n + 2] : n;
-    const e = nb[4 * n + 3] >= 0 ? nb[4 * n + 3] : n;
+  airDrag(n: number): Float64Array {
+    const D = new Float64Array(9);
+    const m = this.layer(n).material;
+    if (!(m.airDrag > 0)) return D;
+    const k = (m.airDrag * m.pitchU * m.pitchV) / this.params.h;
     const x = this.x;
-    const t1 = [x[3 * b] - x[3 * a], x[3 * b + 1] - x[3 * a + 1], x[3 * b + 2] - x[3 * a + 2]];
-    const t2 = [x[3 * e] - x[3 * d], x[3 * e + 1] - x[3 * d + 1], x[3 * e + 2] - x[3 * d + 2]];
-    const c = [t1[1] * t2[2] - t1[2] * t2[1], t1[2] * t2[0] - t1[0] * t2[2], t1[0] * t2[1] - t1[1] * t2[0]];
-    const len = Math.hypot(c[0], c[1], c[2]);
-    if (len <= 1e-12) return [0, [0, 0, 0]];
-    return [(m.airDrag * m.pitchU * m.pitchV) / this.params.h, [c[0] / len, c[1] / len, c[2] / len]];
+    const tangent = (f: number): number[] => {
+      let a = n;
+      let b = n;
+      const sp = this.seg(n, f, -1);
+      if (this.segActive(sp)) a = this.nbr[4 * n + 2 * f];
+      const sn = this.seg(n, f, 1);
+      if (this.segActive(sn)) b = this.nbr[4 * n + 2 * f + 1];
+      return [x[3 * b] - x[3 * a], x[3 * b + 1] - x[3 * a + 1], x[3 * b + 2] - x[3 * a + 2]];
+    };
+    const tu = tangent(0);
+    const tv = tangent(1);
+    const lu = Math.hypot(tu[0], tu[1], tu[2]);
+    const lv = Math.hypot(tv[0], tv[1], tv[2]);
+    const outer = (e: number[], kPar: number, kPerp: number) => {
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) D[3 * r + c] = (kPar - kPerp) * e[r] * e[c] + (r === c ? kPerp : 0);
+      return D;
+    };
+    if (lu > 0 && lv > 0) {
+      const c = [tu[1] * tv[2] - tu[2] * tv[1], tu[2] * tv[0] - tu[0] * tv[2], tu[0] * tv[1] - tu[1] * tv[0]];
+      const lc = Math.hypot(c[0], c[1], c[2]);
+      if (lc > 1e-3 * lu * lv) return outer([c[0] / lc, c[1] / lc, c[2] / lc], k, 0);
+    }
+    if (lu > 0 || lv > 0) {
+      const t = lu >= lv ? tu.map((q) => q / lu) : tv.map((q) => q / lv);
+      return outer(t, 0, k);
+    }
+    return outer([1, 0, 0], k, k);
+  }
+
+  /** Drag block D times v (3-vector). */
+  private dragMul(D: Float64Array, v: ArrayLike<number>): number[] {
+    return [D[0] * v[0] + D[1] * v[1] + D[2] * v[2], D[3] * v[0] + D[4] * v[1] + D[5] * v[2], D[6] * v[0] + D[7] * v[1] + D[8] * v[2]];
   }
 
   /** Grip gradient of node n added to g; returns its isotropic stiffness (0 when not gripped). */
@@ -190,12 +213,19 @@ export class ReferenceSolver {
     return this.nbr[4 * (s >> 1) + 2 * (s & 1) + 1];
   }
 
-  /** Whether the cell with lower-left node c has all four spans active. */
-  cellActive(c: number): boolean {
+  /**
+   * Whether shear diagonal d of the cell with lower-left node c acts (d = 0: c to rt, d = 1: r to t):
+   * while one of its two triangles is intact (mirrors diagActive in assemble.wgsl).
+   */
+  diagActive(c: number, d: number): boolean {
     const r = this.nbr[4 * c + 1];
     const t = this.nbr[4 * c + 3];
     if (r < 0 || t < 0) return false;
-    return this.segActive(2 * c) && this.segActive(2 * c + 1) && this.segActive(2 * r + 1) && this.segActive(2 * t + FAMILY_U);
+    const cu = this.segActive(2 * c);
+    const cv = this.segActive(2 * c + 1);
+    const rv = this.segActive(2 * r + 1);
+    const tu = this.segActive(2 * t + FAMILY_U);
+    return d === 0 ? (cu && rv) || (cv && tu) : (cu && cv) || (rv && tu);
   }
 
   private pos(n: number, out: Float64Array): void {
@@ -293,19 +323,19 @@ export class ReferenceSolver {
     }
   }
 
-  /** Shear diagonal partners of n as [cell lower-left, partner] pairs (cells must be active). */
+  /** Active shear diagonal partners of n as [cell lower-left, partner] pairs. */
   shearPartners(n: number): Array<[number, number]> {
     const nb = this.nbr;
     const left = nb[4 * n];
     const right = nb[4 * n + 1];
     const down = nb[4 * n + 2];
     const up = nb[4 * n + 3];
-    const out: Array<[number, number]> = [];
-    if (right >= 0 && up >= 0) out.push([n, nb[4 * up + 1]]);
-    if (left >= 0 && down >= 0) out.push([nb[4 * down], nb[4 * down]]);
-    if (left >= 0 && up >= 0) out.push([left, nb[4 * up]]);
-    if (right >= 0 && down >= 0) out.push([down, nb[4 * down + 1]]);
-    return out.filter(([cell, p]) => p >= 0 && this.cellActive(cell));
+    const out: Array<[number, number, number]> = [];
+    if (right >= 0 && up >= 0) out.push([n, nb[4 * up + 1], 0]);
+    if (left >= 0 && down >= 0) out.push([nb[4 * down], nb[4 * down], 0]);
+    if (left >= 0 && up >= 0) out.push([left, nb[4 * up], 1]);
+    if (right >= 0 && down >= 0) out.push([down, nb[4 * down + 1], 1]);
+    return out.filter(([cell, p, d]) => p >= 0 && this.diagActive(cell, d)).map(([cell, p]) => [cell, p]);
   }
 
   shearRest(cell: number): number {
@@ -320,11 +350,8 @@ export class ReferenceSolver {
     const w = this.scene.mass[n] / (h * h);
     for (let q = 0; q < 3; q++) g[q] += w * (this.dx[3 * n + q] - this.pred[3 * n + q]);
     this.gripTerm(n, g);
-    const [cd, nn] = this.airDrag(n);
-    if (cd > 0) {
-      const dn = nn[0] * this.dx[3 * n] + nn[1] * this.dx[3 * n + 1] + nn[2] * this.dx[3 * n + 2];
-      for (let q = 0; q < 3; q++) g[q] += cd * dn * nn[q];
-    }
+    const Dg = this.dragMul(this.airDrag(n), [this.dx[3 * n], this.dx[3 * n + 1], this.dx[3 * n + 2]]);
+    for (let q = 0; q < 3; q++) g[q] += Dg[q];
     for (let f = 0; f < 2; f++) {
       const sPrev = this.seg(n, f, -1);
       const sNext = this.seg(n, f, 1);
@@ -382,8 +409,8 @@ export class ReferenceSolver {
       g.fill(0);
       const kg = this.gripTerm(n, g);
       if (kg > 0) quad(g[0] * dn[0] + g[1] * dn[1] + g[2] * dn[2], kg * dot(dn, dn));
-      const [cd, nn] = this.airDrag(n);
-      if (cd > 0) quad(cd * dot(nn, d0) * dot(nn, dn), cd * dot(nn, dn) * dot(nn, dn));
+      const Dd = this.airDrag(n);
+      quad(dot(this.dragMul(Dd, d0), dn), dot(dn, this.dragMul(Dd, dn)));
       const mat = this.layer(n).material;
       for (let f = 0; f < 2; f++) {
         const yarn = mat.yarns[f];
@@ -421,16 +448,17 @@ export class ReferenceSolver {
           });
         }
       }
-      if (this.cellActive(n)) {
+      if (this.nbr[4 * n + 1] >= 0 && this.nbr[4 * n + 3] >= 0) {
         const r = this.nbr[4 * n + 1];
         const t = this.nbr[4 * n + 3];
         const rt = this.nbr[4 * r + 3];
         const Ld = this.shearRest(n);
         const ks = mat.shearStiffness;
-        for (const [p, q] of [
-          [n, rt],
-          [r, t],
+        for (const [p, q, d] of [
+          [n, rt, 0],
+          [r, t, 1],
         ]) {
+          if (!this.diagActive(n, d)) continue;
           const ec = [0, 1, 2].map((z) => x[3 * q + z] + dx[3 * q + z] - x[3 * p + z] - dx[3 * p + z]);
           const dq = dirOf(q);
           const dp = dirOf(p);
@@ -459,9 +487,9 @@ export class ReferenceSolver {
         E += w * d * d;
       }
       E += this.gripEnergy(n);
-      const [cd, nn] = this.airDrag(n);
-      const dn = nn[0] * this.dx[3 * n] + nn[1] * this.dx[3 * n + 1] + nn[2] * this.dx[3 * n + 2];
-      E += 0.5 * cd * dn * dn;
+      const dxn = [this.dx[3 * n], this.dx[3 * n + 1], this.dx[3 * n + 2]];
+      const Ddx = this.dragMul(this.airDrag(n), dxn);
+      E += 0.5 * (dxn[0] * Ddx[0] + dxn[1] * Ddx[1] + dxn[2] * Ddx[2]);
     }
     for (let s = 0; s < 2 * this.N; s++) {
       if (!this.segActive(s)) continue;
@@ -490,16 +518,17 @@ export class ReferenceSolver {
       }
     }
     for (let n = 0; n < this.N; n++) {
-      if (!this.cellActive(n)) continue;
+      if (this.nbr[4 * n + 1] < 0 || this.nbr[4 * n + 3] < 0) continue;
       const r = this.nbr[4 * n + 1];
       const t = this.nbr[4 * n + 3];
       const rt = this.nbr[4 * r + 3];
       const ks = this.layer(n).material.shearStiffness;
       const Ld = this.shearRest(n);
-      for (const [p, q] of [
-        [n, rt],
-        [r, t],
+      for (const [p, q, d] of [
+        [n, rt, 0],
+        [r, t, 1],
       ]) {
+        if (!this.diagActive(n, d)) continue;
         this.pos(p, this.pa);
         this.pos(q, this.pb);
         const l = Math.hypot(this.pb[0] - this.pa[0], this.pb[1] - this.pa[1], this.pb[2] - this.pa[2]);

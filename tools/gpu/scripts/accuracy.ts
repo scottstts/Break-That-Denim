@@ -13,10 +13,10 @@ import { settledSolver } from './render';
 
 function config(name: string): Partial<GpuSolverParams> {
   if (name === 'conv') return { newtonIterations: 6, newtonMax: 6, pcgIterations: 4, maxCoarsestNodes: 48, coarseSweeps: 6 };
-  const m = /^(\d)x(\d)(-lean)?(@240)?$/.exec(name);
+  const m = /^(\d)x(\d)(-lean)?(@240|@60|@80)?$/.exec(name);
   if (!m) throw new Error(`bad config ${name}`);
   const n = Number(m[1]);
-  return { newtonIterations: n, newtonMax: n, pcgIterations: Number(m[2]), ...(m[3] ? {} : { maxCoarsestNodes: 48, coarseSweeps: 6 }), ...(m[4] ? { h: 1 / 240 } : {}) };
+  return { newtonIterations: n, newtonMax: n, pcgIterations: Number(m[2]), ...(m[3] ? {} : { maxCoarsestNodes: 48, coarseSweeps: 6 }), ...(m[4] ? { h: 1 / Number(m[4].slice(1)) } : {}) };
 }
 
 export default async function main(args: string[]): Promise<void> {
@@ -82,6 +82,11 @@ export default async function main(args: string[]): Promise<void> {
       }
       report = `max err ${Math.max(...errs).toFixed(2)} mm; at 0.6/1.0/1.5/2.0/2.5 s: ${[12, 20, 30, 40, 49].map((q) => errs[Math.min(q, errs.length - 1)].toFixed(2)).join(' / ')}`;
     }
+    const rc = new Uint32Array(await readBuffer(device, solver.counters, 8));
+    let ke = 0;
+    const vv = new Float32Array(await readBuffer(device, solver.v));
+    for (let n = 0; n < scene.nodeCount; n++) ke += 0.5 * scene.mass[n] * (vv[4 * n] ** 2 + vv[4 * n + 1] ** 2 + vv[4 * n + 2] ** 2);
+    report += ` rupt ${rc[0]} KE(2.5s) ${(ke * 1e6).toFixed(2)} uJ`;
     console.log(`${name.padEnd(12)} ${(gpuMs / steps).toFixed(2)} ms/substep, ${((gpuMs / steps) / h / 1000).toFixed(2)} s GPU per sim s (wall)  ${report}`);
   }
   device.destroy();

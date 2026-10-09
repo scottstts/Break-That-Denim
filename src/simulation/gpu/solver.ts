@@ -2,6 +2,7 @@ import { levelLayers, lineTable, nodeCount, type LatticeLayer, type LineTable } 
 import type { CompiledScene } from '../scene';
 import { ComputeModule, createBuffer, createBufferWith, UNIFORM, type BindingResource } from '../../gpu/util';
 import { Contact } from './contact';
+import { SelfContact } from './selfcontact';
 import commonWgsl from './wgsl/common.wgsl?raw';
 import rowFineWgsl from './wgsl/rowfine.wgsl?raw';
 import rowCoarseWgsl from './wgsl/rowcoarse.wgsl?raw';
@@ -12,6 +13,7 @@ import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
+import dragWgsl from './wgsl/drag.wgsl?raw';
 
 export interface GpuSolverParams {
   h: number;
@@ -36,13 +38,17 @@ export interface GpuSolverParams {
   coarseSweeps: number;
   /** Coarsen while a level has more nodes than this. */
   maxCoarsestNodes: number;
+  /** Self-contact of a single-layer scene (selfcontact.wgsl); off where the f64 reference has none. */
+  selfContact: boolean;
   /** Development hook: rewrite a module's WGSL before compilation (experiments only). */
   patch?: (module: string, code: string) => string;
 }
 
 /**
- * Schedule selected in docs/decisions/2026-10-09-mechanics-schedule.md: under-converged steps
- * commit spurious ruptures, so convergence is adaptive rather than a fixed small iteration count.
+ * Production schedule (docs/decisions/2026-10-10-feedback-round2.md): 2 Newton x 2 PCG at h = 1/120.
+ * With a single PCG iteration the inexact solves inject energy (the sheet never settles after a
+ * release and the release itself bounces into spurious tears); the second iteration fits the
+ * natural-time budget since the line smoother solves its reduced systems by cyclic reduction.
  */
 export const GPU_DEFAULTS: GpuSolverParams = {
   h: 1 / 120,
@@ -51,9 +57,10 @@ export const GPU_DEFAULTS: GpuSolverParams = {
   newtonMax: 2,
   newtonTolerance: 1e-5,
   historyTolerance: 1,
-  pcgIterations: 1,
+  pcgIterations: 2,
   coarseSweeps: 2,
   maxCoarsestNodes: 400,
+  selfContact: true,
 };
 
 /** Upper bound on Newton iterations (size of the per-iteration convergence slots). */
@@ -83,6 +90,8 @@ interface Level {
   R: GPUBuffer;
   lines: GPUBuffer;
   table: LineTable;
+  /** Prolongation weights to the next coarser level (4 per node; none on the coarsest level). */
+  pw: GPUBuffer | null;
 }
 
 /** Packs SimParams (see common.wgsl). */
@@ -161,8 +170,8 @@ export class GpuSolver {
    * [4 + k] largest nodal update of Newton iteration k in the current substep (f32 bits).
    */
   readonly counters: GPUBuffer;
-  readonly contact: Contact;
-  /** Cross-layer contact runs only for multi-layer scenes. */
+  /** Cross-layer contact for multi-layer scenes, self-contact for a single layer. */
+  readonly contact: Contact | SelfContact;
   readonly contactEnabled: boolean;
   readonly gateArgs: GPUBuffer;
   private readonly gateSizes: GPUBuffer;
@@ -226,7 +235,7 @@ export class GpuSolver {
     this.tails = createBufferWith(device, 'tails', Float32Array.from(scene.tails));
     this.ext = createBuffer(device, 'ext', 48 * N);
     this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON);
-    this.contactEnabled = scene.layers.length > 1;
+    this.contactEnabled = scene.layers.length > 1 || this.params.selfContact;
 
     // ---- levels
     const fineLayers: LatticeLayer[] = scene.layers.map((L) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
@@ -247,6 +256,7 @@ export class GpuSolver {
         R: createBuffer(device, `level${k}.R`, 16 * Nl),
         lines: createBufferWith(device, `level${k}.lines`, table.lines),
         table,
+        pw: null as GPUBuffer | null,
       };
     });
     this.delta = createBuffer(device, 'pcg.delta', 16 * N);
@@ -260,7 +270,7 @@ export class GpuSolver {
     this.slots = createBuffer(device, 'slots', this.slotData.byteLength, UNIFORM);
 
     if (params.newtonMax > MAX_NEWTON || params.newtonIterations < 1 || params.newtonIterations > params.newtonMax) throw new Error('invalid Newton iteration bounds');
-    this.contact = new Contact(this, scene);
+    this.contact = scene.layers.length > 1 ? new Contact(this, scene) : new SelfContact(this);
     if (!this.contactEnabled) {
       // no displacement bound: the detection-time displacement is zero and the bound unlimited
       const meta = new Float32Array(4 * N);
@@ -316,7 +326,7 @@ export class GpuSolver {
   private createPipelines(): void {
     const d = this.device;
     const patch = this.params.patch ?? ((_: string, c: string) => c);
-    this.mod.assemble = new ComputeModule(d, 'assemble', patch('assemble', commonWgsl + assembleWgsl));
+    this.mod.assemble = new ComputeModule(d, 'assemble', patch('assemble', commonWgsl + dragWgsl + assembleWgsl));
     this.mod.mgFine = new ComputeModule(d, 'multigrid.fine', patch('multigrid', commonWgsl + multigridWgsl + rowFineWgsl));
     this.mod.mgCoarse = new ComputeModule(d, 'multigrid.coarse', patch('multigrid', commonWgsl + multigridWgsl + rowCoarseWgsl));
     this.mod.smoothFine = new ComputeModule(d, 'smooth.fine', patch('smooth', commonWgsl + smoothWgsl + rowFineWgsl));
@@ -330,12 +340,14 @@ export class GpuSolver {
       this.pl[`smooth${v}`] = this.mod[`smooth${v}`].pipeline('main');
     }
     this.pl.restrict = this.mod.mgCoarse.pipeline('restrictResidual');
+    this.pl.pwFine = this.mod.mgFine.pipeline('prolongWeights');
+    this.pl.pwCoarse = this.mod.mgCoarse.pipeline('prolongWeights');
     this.pl.prolong = this.mod.mgCoarse.pipeline('prolongAdd');
     for (const e of ['matvecDot', 'dotPartial', 'reduceFinal', 'updateXR', 'updateP', 'clear2']) this.pl[e] = this.mod.pcg.pipeline(e);
     for (const e of ['predict', 'newtonApply', 'commit', 'damage', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
     this.mod.gate = new ComputeModule(d, 'gate', gateWgsl);
     this.pl.gate = this.mod.gate.pipeline('gate');
-    this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + energyWgsl));
+    this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + dragWgsl + energyWgsl));
     this.pl.energyDelta = this.mod.energy.pipeline('energyDelta');
     this.pl.lineChoose = this.mod.energy.pipeline('lineChoose');
   }
@@ -354,9 +366,13 @@ export class GpuSolver {
       }
       const C = this.levels[k + 1];
       if (!C) return;
-      group(`mg${v}`, `rap${k}`, { 0: L.info, 1: C.info, 2: L.op, 3: L.fixed, 4: C.op, 5: C.fixed });
-      group('mgCoarse', `restrict${k}`, { 0: L.info, 1: C.info, 3: L.fixed, 5: C.fixed, 6: L.R, 8: C.B, 9: C.X });
-      group('mgCoarse', `prolong${k}`, { 0: L.info, 1: C.info, 3: L.fixed, 6: C.X, 8: L.X });
+      L.pw = createBuffer(this.device, `level${k}.pw`, 16 * L.N);
+      const pwEntries: Record<number, BindingResource> = { 0: L.info, 2: L.op, 3: L.fixed, 10: L.pw };
+      if (k === 0) pwEntries[11] = this.segs;
+      group(`mg${v}`, `pw${k}`, pwEntries);
+      group(`mg${v}`, `rap${k}`, { 0: L.info, 1: C.info, 2: L.op, 3: L.fixed, 4: C.op, 5: C.fixed, 10: L.pw });
+      group('mgCoarse', `restrict${k}`, { 0: L.info, 1: C.info, 3: L.fixed, 5: C.fixed, 6: L.R, 8: C.B, 9: C.X, 10: L.pw });
+      group('mgCoarse', `prolong${k}`, { 0: L.info, 1: C.info, 3: L.fixed, 6: C.X, 8: L.X, 10: L.pw });
     });
     const Fi = L0.info;
     group('pcg', 'clear', { 0: Fi, 4: this.delta, 5: L0.X });
@@ -471,7 +487,10 @@ export class GpuSolver {
   encodeAssemble(pass: GPUComputePassEncoder, coarse = true): void {
     this.dispatch(pass, 'assemble', 'assemble', this.nodeGroups(this.N));
     if (!coarse) return;
-    for (let k = 0; k + 1 < this.levels.length; k++) this.dispatch(pass, k === 0 ? 'rapFine' : 'rapCoarse', `rap${k}`, this.nodeGroups(this.levels[k + 1].N, 64));
+    for (let k = 0; k + 1 < this.levels.length; k++) {
+      this.dispatch(pass, k === 0 ? 'pwFine' : 'pwCoarse', `pw${k}`, this.nodeGroups(this.levels[k].N));
+      this.dispatch(pass, k === 0 ? 'rapFine' : 'rapCoarse', `rap${k}`, this.nodeGroups(this.levels[k + 1].N, 64));
+    }
   }
 
   /** PCG on the assembled fine system; the solution is left in `delta`. */

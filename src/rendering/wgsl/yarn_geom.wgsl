@@ -1,5 +1,5 @@
 // Explicit yarn geometry shared by the yarn, tail and fuzz passes. Requires module-scope bindings
-// R (RenderU), nodes, x, nrm, segw, tails, lists (u32 view) and the list layout constants.
+// R (RenderU), nodes, x, nrm, tframe, segw, tails, lists (u32 view) and the list layout constants.
 
 const SPAN_BASE: u32 = 4u;
 override MAX_SPANS: u32 = 65536u;
@@ -96,12 +96,9 @@ fn strandOf(s: u32, q: u32) -> u32 { return q / yarnsPerStrand(R.layers[nodes[s 
 // Bundled yarn q of span s belongs to an absent or separated strand.
 fn yarnBroken(s: u32, q: u32) -> bool { return ((segw[2u * s + 1u].y >> (8u + strandOf(s, q))) & 1u) == 1u; }
 
-// Failure site of bundled yarn q of span s (fraction from the owning node): its strand's site,
-// staggered per yarn (the yarns of a strand part a little apart).
-fn yarnSite(s: u32, q: u32) -> f32 {
-  let site = f32((segw[2u * s + 1u].w >> (8u * strandOf(s, q))) & 0xFFu) / 255.0;
-  return clamp(site + 0.18 * (hashf(s * 7u + q * 131u + 3u) - 0.5), 0.1, 0.9);
-}
+// Failure site of bundled yarn q of span s (fraction from the owning node), as the torn corner
+// patches clip it (yarnSiteOf in render_common.wgsl).
+fn yarnSite(s: u32, q: u32) -> f32 { return yarnSiteOf(segw[2u * s + 1u].w, s, strandOf(s, q), q); }
 
 // Point u in [0, 1] along half h (0: from the owning node, 1: from the far node) of bundled yarn q
 // of span s. An intact yarn's halves meet in the middle. A broken yarn is two frayed stubs ending
@@ -130,9 +127,33 @@ fn halfYarn(s: u32, q: u32, h: u32, u: f32) -> YarnPoint {
   return o;
 }
 
-// Loose yarn end q of the tail at node side e = 4 n + side (side: 0 u-, 1 u+, 2 v-, 3 v+), t in [0, 1]
-// from the node to the free end. Render-only shape: it continues the yarn direction, sags under
-// gravity, curls and fans out toward the end; its length is the tail's material length.
+// Span separated on tail side e = 4 n + side (side: 0 u-, 1 u+, 2 v-, 3 v+) of node n.
+fn tailSpan(e: u32) -> u32 {
+  let n = e >> 2u;
+  let side = e & 3u;
+  let f = side >> 1u;
+  let L = R.layers[nodes[n].ijl >> 24u].lattice;
+  let stride = select(L.y, 1u, f == 0u);
+  return 2u * select(n - stride, n, (side & 1u) == 1u) + f;
+}
+
+// Length of loose yarn q of tail e beyond the node's own quarter of the torn cell (the torn corner
+// patch draws the woven part up to there): the yarn's remnant to its own failure site plus any length
+// pulled out through the crossing, less half the span. <= 0: the yarn ends inside the quarter.
+fn tailLength(e: u32, q: u32) -> f32 {
+  let s = tailSpan(e);
+  let plus = (e & 1u) == 1u;
+  let Lr = segRest(s >> 1u, s & 1u);
+  let failSite = bitcast<f32>(segw[2u * s + 1u].z);
+  let own = select(1.0 - yarnSite(s, q), yarnSite(s, q), plus);
+  let spanOwn = select(1.0 - failSite, failSite, plus);
+  let extra = max(tails[e] - spanOwn * Lr, 0.0);
+  return min(own * Lr + extra - 0.5 * Lr, 0.008);
+}
+
+// Loose yarn end q of tail e, t in [0, 1] from the edge of the node's quarter to the free end.
+// Render-only shape: it leaves along the node's frame (as the torn corner patch it continues), sags
+// under gravity, curls and fans out toward the end.
 fn tailYarn(e: u32, q: u32, t: f32) -> YarnPoint {
   let n = e >> 2u;
   let sideIdx = e & 3u;
@@ -141,41 +162,35 @@ fn tailYarn(e: u32, q: u32, t: f32) -> YarnPoint {
   let ijl = nodes[n].ijl;
   let layer = ijl >> 24u;
   let LR = R.layers[layer];
-  let L = LR.lattice;
   let i = ijl & 0xFFFu;
   let j = (ijl >> 12u) & 0xFFFu;
-  let stride = select(L.y, 1u, f == 0u);
   let a = select(j, i, f == 0u);
-  let amax = select(L.z, L.y, f == 0u);
   let N = nrm[n].xyz;
-  // continuation of the yarn through the node
-  var d0 = vec3<f32>(0.0);
-  if (dirSign > 0.0 && a > 0u && segOkR(n - stride, f)) { d0 = x[n].xyz - x[n - stride].xyz; }
-  if (dirSign < 0.0 && a + 1u < amax && segOkR(n, f)) { d0 = x[n].xyz - x[n + stride].xyz; }
-  if (dot(d0, d0) < 1e-14) {
-    let ref_ = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), f == 0u);
-    d0 = dirSign * (ref_ - dot(ref_, N) * N);
-  }
-  d0 = normalize(d0);
+  let tu = tframe[2u * n].xyz;
+  let tv = tframe[2u * n + 1u].xyz;
+  let d0 = dirSign * select(tv, tu, f == 0u);
+  // bundle yarns lie across the yarn direction: picks along +v, warps along +u
+  let sideV = select(tu, tv, f == 0u);
+  let s = tailSpan(e);
+  let Lr = segRest(s >> 1u, f);
   let b = bundleOf(LR, f);
-  let bf = f32(b);
-  let lat = f32(q) - 0.5 * (bf - 1.0);
+  let lat = f32(q) - 0.5 * (f32(b) - 1.0);
   let seed = hash11(e * 7u + q * 131u + 17u);
-  let len = min(tails[e], 0.006) * (0.75 + 0.4 * hashf(seed));
-  let side = normalize(cross(N, d0));
+  let len = max(tailLength(e, q), 0.0);
   let pitchLat = select(LR.pitch.y, LR.pitch.x, f == 1u);
   let curl = vec3<f32>(hashf(seed + 1u) - 0.5, hashf(seed + 2u) - 0.5, hashf(seed + 3u) - 0.5);
   var o: YarnPoint;
-  let fan = side * (lat * pitchLat * (1.0 + 1.8 * t)) + curl * (0.6 * len * t * t);
+  let p0 = x[n].xyz + d0 * (0.5 * Lr) + sideV * (lat * pitchLat);
+  let fan = sideV * (lat * pitchLat * 1.2 * t) + curl * (0.6 * len * t * t);
   let sag = vec3<f32>(0.0, 0.0, -0.35 * len * t * t) + N * (0.15 * len * t * (1.0 - t));
-  o.p = x[n].xyz + d0 * (len * t) + fan + sag;
-  let dp = d0 * len + side * (lat * pitchLat * 1.8) + curl * (1.2 * len * t) + vec3<f32>(0.0, 0.0, -0.7 * len * t) + N * (0.15 * len * (1.0 - 2.0 * t));
-  o.t = normalize(dp);
+  o.p = p0 + d0 * (len * t) + fan + sag;
+  let dp = d0 * len + sideV * (lat * pitchLat * 1.2) + curl * (1.2 * len * t) + vec3<f32>(0.0, 0.0, -0.7 * len * t) + N * (0.15 * len * (1.0 - 2.0 * t));
+  o.t = normalize(dp + d0 * 1e-6);
   o.n = N;
   o.fam = select(0u, 1u, f == 1u);
   o.yarn = i32(select(j, i, f == 1u) * b + q);
   let ba = f32(bundleOf(LR, 1u - f));
-  o.c = f32(a) * ba + 0.5 * (ba - 1.0) + dirSign * t * len / select(LR.pitch.x, LR.pitch.y, f == 1u);
+  o.c = f32(a) * ba + 0.5 * (ba - 1.0) + dirSign * (0.5 * Lr + t * len) / select(LR.pitch.x, LR.pitch.y, f == 1u);
   o.layer = layer;
   o.wear = wearR[n];
   o.radius = 0.4 * select(LR.weft.x, LR.warp.x, f == 1u) * (1.0 - 0.55 * t);

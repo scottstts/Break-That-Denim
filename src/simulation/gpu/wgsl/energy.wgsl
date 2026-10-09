@@ -67,24 +67,9 @@ fn nodeDelta(n: u32) -> vec3<f32> {
   let e2 = ext[3u * n + 2u];
   let He = Sym(vec3<f32>(e1.x, e1.w, e2.y), vec3<f32>(e1.y, e1.z, e2.x));
   acc += quad(dot(e0.xyz, dn), dot(dn, symMul(He, dn)));
-  // normal air drag (normal of the accepted state, see assemble.wgsl)
-  if (mat.b.y > 0.0) {
-    let a = nodeAt(l, i - 1, j);
-    let b = nodeAt(l, i + 1, j);
-    let c = nodeAt(l, i, j - 1);
-    let e = nodeAt(l, i, j + 1);
-    let pa = x[u32(select(a, i32(n), a < 0))].xyz;
-    let pb = x[u32(select(b, i32(n), b < 0))].xyz;
-    let pc = x[u32(select(c, i32(n), c < 0))].xyz;
-    let pe = x[u32(select(e, i32(n), e < 0))].xyz;
-    let nn = cross(pb - pa, pe - pc);
-    let len = length(nn);
-    if (len > 1e-12) {
-      let nu = nn / len;
-      let cd = mat.b.y * mat.a.w * mat.b.x / h;
-      acc += quad(cd * dot(nu, d0) * dot(nu, dn), cd * dot(nu, dn) * dot(nu, dn));
-    }
-  }
+  // air drag (drag.wgsl): quadratic with a fixed block
+  let Dd = airDragBlock(n);
+  acc += quad(dot(symMul(Dd, d0), dn), dot(dn, symMul(Dd, dn)));
   for (var f = 0u; f < 2u; f++) {
     let du = select(0, 1, f == 0u);
     let dv = select(0, 1, f == 1u);
@@ -136,7 +121,13 @@ fn nodeDelta(n: u32) -> vec3<f32> {
   let r = nodeAt(l, i + 1, j);
   let t = nodeAt(l, i, j + 1);
   let rt = nodeAt(l, i + 1, j + 1);
-  if (r >= 0 && t >= 0 && spanOn(i32(n), 0u) && spanOn(i32(n), 1u) && spanOn(r, 1u) && spanOn(t, 0u)) {
+  if (r >= 0 && t >= 0) {
+    // a diagonal acts while one of its triangles is intact (diagActive in assemble.wgsl)
+    let cu = spanOn(i32(n), 0u);
+    let cv = spanOn(i32(n), 1u);
+    let rv = spanOn(r, 1u);
+    let tu = spanOn(t, 0u);
+    let on = array<bool, 2>((cu && rv) || (cv && tu), (cu && cv) || (rv && tu));
     let s0 = segs[2u * n].rest;
     let s1 = segs[2u * n + 1u].rest;
     let Ld = sqrt(s0 * s0 + s1 * s1);
@@ -144,6 +135,7 @@ fn nodeDelta(n: u32) -> vec3<f32> {
     var pa = array<u32, 2>(n, u32(r));
     var pb = array<u32, 2>(u32(rt), u32(t));
     for (var q = 0; q < 2; q++) {
+      if (!on[q]) { continue; }
       let p = pa[q];
       let o = pb[q];
       let ec = (x[o].xyz + dx[o].xyz) - (x[p].xyz + dx[p].xyz);

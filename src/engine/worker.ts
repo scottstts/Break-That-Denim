@@ -19,11 +19,11 @@ const send = (m: FromEngine) => scope.postMessage(m);
 
 const H = GPU_DEFAULTS.h;
 /** Upper bound on substeps per presented frame; a larger backlog is dropped, never replayed. */
-const MAX_SUBSTEPS_PER_FRAME = 4;
+const MAX_SUBSTEPS_PER_FRAME = 5;
 /** Presentation interval while simulating (s): physics runs in natural time, frames at <= 30/s. */
 const SIM_FRAME_INTERVAL = 1 / 30 - 0.002;
 /** Grip handle: maximum speed (m/s) and engagement lift toward the camera (m). */
-const HANDLE_MAX_SPEED = 0.8;
+const HANDLE_MAX_SPEED = 2.5;
 const ENGAGE_LIFT = 0.002;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
 const REST_SPEED = 0.003;

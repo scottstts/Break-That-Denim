@@ -14,9 +14,10 @@
 @group(0) @binding(8) var<storage, read> wearR: array<f32>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
+@group(0) @binding(11) var<storage, read> tframe: array<vec4<f32>>;
 
 override FUZZ_PER_YARN: u32 = 10u;
-override FUZZ_PER_TAIL: u32 = 24u;
+override FUZZ_PER_TAIL: u32 = 12u;
 const FIBER_PTS: u32 = 5u;
 // a drawn fibre is a small tuft of a few fibres (single cotton fibres are ~15 um)
 const FIBER_WIDTH: f32 = 30e-6;
@@ -43,8 +44,9 @@ fn fiber(y: YarnPoint, seed: u32, vi: u32, tailEnd: bool) -> VOut {
   let r = hashf(seed + 3u);
   var len = 0.12e-3 + 0.75e-3 * r * r;
   if (tailEnd) {
-    len *= 3.2;
-    dir = normalize(dir + y.t * 1.2);
+    // untwisted end fibres: longer, splaying mostly along the yarn
+    len *= 1.8;
+    dir = normalize(dir + y.t * 2.2);
   }
   let bend = vec3<f32>(hashf(seed + 4u) - 0.5, hashf(seed + 5u) - 0.5, hashf(seed + 6u) - 0.8) * (0.9 * len);
   let k = vi >> 1u;
@@ -100,7 +102,7 @@ fn vsTailFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let yi = ii / FUZZ_PER_TAIL;
   let e = tailEntry(yi / b);
   let q = yi % b;
-  if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u)) { return hidden(); }
+  if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u) || tailLength(e, q) <= 0.0) { return hidden(); }
   let seed = hash11(e * 613u + q * 137u + (ii % FUZZ_PER_TAIL) * 6007u + 3u);
   // fibres concentrate toward the untwisted free end
   let r = hashf(seed);
@@ -116,8 +118,8 @@ fn fsFuzz(in: VOut) -> @location(0) vec4<f32> {
   let N = normalize(V - dot(V, T) * T);
   // loose fibres are mostly the pale core and abraded surface fibres
   let pale = hashf(in.id.w + 9u) < 0.7;
-  var albedo = vec3<f32>(0.46, 0.5, 0.58);
-  if (in.id.y == 0u) { albedo = vec3<f32>(0.55, 0.52, 0.46); }
+  var albedo = vec3<f32>(0.34, 0.38, 0.47);
+  if (in.id.y == 0u) { albedo = vec3<f32>(0.4, 0.39, 0.36); }
   if (!pale && in.id.y == 1u) { albedo = vec3<f32>(0.06, 0.1, 0.24); }
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, N);

@@ -18,7 +18,7 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rep = f32(L.twill.x);
   let texel = rep / f32(size);
   let hTop = L.warp.z + 0.5 * L.warp.y;
-  let none = CellYarns(0, 0, 1, 1, 1, 1, 0u);
+  let none = CellYarns(0, 0, 1, 1, 1, 1, 0u, noTorn());
   var wf = 0.0;
   var aoc = 0.0;
   var slope = vec2<f32>(0.0);

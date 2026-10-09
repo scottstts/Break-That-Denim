@@ -189,6 +189,32 @@ fn weftHit(L: LayerR, m: i32, U: f32, V: f32, su: f32, sv: f32) -> Hit {
   return o;
 }
 
+// One corner's share of a torn cell (a cell with a separated span): the corner node owns the quarter
+// of the cell its own warp and pick bundles occupy. Its yarns end at their failure sites when their
+// span (or strand) has separated, and authored worn-through strands are absent.
+struct TornInfo {
+  // 0 for surface cells; else 1 + corner (a | b << 1: a = 1 for the right column, b = 1 for the top row)
+  mode: u32,
+  // bits 0-3: strands of the corner's warp span separated, 4-7: absent; 8-11 / 12-15: same for its pick
+  // span; bit 16: the warp span separated entirely, bit 17: the pick span
+  flags: u32,
+  // packed per-strand failure sites (u8, fraction from the span's owning node) of the warp / pick span
+  sitesV: u32,
+  sitesU: u32,
+  // span indices (2 * owner + family) of the corner's warp and pick spans
+  spanV: u32,
+  spanU: u32,
+};
+
+fn noTorn() -> TornInfo { return TornInfo(0u, 0u, 0u, 0u, 0u, 0u); }
+
+// Failure site of bundled yarn q (strand st) of span s from its packed strand sites: the strand's
+// site, staggered per yarn (the yarns of a strand part a little apart). Shared with the tail pass.
+fn yarnSiteOf(sites: u32, s: u32, st: u32, q: u32) -> f32 {
+  let site = f32((sites >> (8u * st)) & 0xFFu) / 255.0;
+  return clamp(site + 0.18 * (hashf(s * 7u + q * 131u + 3u) - 0.5), 0.1, 0.9);
+}
+
 // Yarns missing from one lattice cell (strands absent or separated), from the strand masks of its
 // four spans. Fine warp k sits at U = k; the cell's left warp bundle holds warps warpBase ..
 // warpBase + bu - 1, its right bundle the next bu; picks likewise from pickBase (bottom, then top).
@@ -202,6 +228,7 @@ struct CellYarns {
   sv: i32,
   // strand bits 0-3 left warp bundle, 4-7 right, 8-11 bottom pick bundle, 12-15 top
   masks: u32,
+  tr: TornInfo,
 };
 
 fn bundleYarnGone(base: i32, b: i32, ys: i32, k: i32, masks: u32, shift: u32) -> bool {
@@ -213,6 +240,61 @@ fn bundleYarnGone(base: i32, b: i32, ys: i32, k: i32, masks: u32, shift: u32) ->
 }
 fn warpGone(c: CellYarns, k: i32) -> bool { return bundleYarnGone(c.warpBase, c.bu, c.su, k, c.masks, 0u); }
 fn pickGone(c: CellYarns, m: i32) -> bool { return bundleYarnGone(c.pickBase, c.bv, c.sv, m, c.masks, 8u); }
+
+// A torn corner's yarn of one family at bundle offset d from the cell's first bundle, at parameter p
+// along the yarn's span (0 at the span's owning node): present only if it belongs to the corner's own
+// bundle (side) and, when its strand or span has separated, only up to its failure site less a short
+// recoil (the broken ends spring back and untwist).
+fn tornGone(tr: TornInfo, fam: u32, d: i32, b: i32, ys: i32, side: u32, p: f32) -> bool {
+  if (d < 0 || d >= 2 * b) { return true; }
+  let own = select(0u, 1u, d >= b);
+  if (own != side) { return true; }
+  let q = d - i32(own) * b;
+  let st = u32(q / ys);
+  let sh = select(8u, 0u, fam == 1u);
+  if (((tr.flags >> (sh + 4u + st)) & 1u) == 1u) { return true; }
+  let spanBroken = ((tr.flags >> select(17u, 16u, fam == 1u)) & 1u) == 1u;
+  if (!spanBroken && ((tr.flags >> (sh + st)) & 1u) == 0u) { return false; }
+  let span = select(tr.spanU, tr.spanV, fam == 1u);
+  let site = yarnSiteOf(select(tr.sitesU, tr.sitesV, fam == 1u), span, st, u32(q));
+  let recoil = 0.02 + 0.05 * hashf(span * 13u + u32(q) * 29u + 1u);
+  // the corner sits at the span's owning end (p = 0) or at its far end (p = 1)
+  let atOwner = select(((tr.mode - 1u) >> 1u) == 0u, ((tr.mode - 1u) & 1u) == 0u, fam == 0u);
+  return select((p < site + recoil), (p > site - recoil), atOwner);
+}
+
+// Warp k at pick coordinate V (and pick m at warp coordinate U) is missing from this cell or corner.
+// At a torn edge a yarn is also lost where none of the nearest crossing yarns still reaches it: with
+// its crossings gone it slips out, so the edge frays back irregularly pick by pick (warp by warp)
+// instead of ending on the lattice line.
+fn warpGoneAt(c: CellYarns, k: i32, V: f32) -> bool {
+  if (c.tr.mode == 0u) { return warpGone(c, k); }
+  let a = (c.tr.mode - 1u) & 1u;
+  let b = (c.tr.mode - 1u) >> 1u;
+  let t = (V - (f32(c.pickBase) + 0.5 * f32(c.bv - 1))) / f32(c.bv);
+  if (tornGone(c.tr, 1u, k - c.warpBase, c.bu, c.su, a, t)) { return true; }
+  if (((c.tr.flags >> 17u) & 1u) == 0u) { return false; }
+  let s = (f32(k) - (f32(c.warpBase) + 0.5 * f32(c.bu - 1))) / f32(c.bu);
+  let m0 = i32(round(V));
+  for (var dm = -1; dm <= 1; dm++) {
+    if (!tornGone(c.tr, 0u, m0 + dm - c.pickBase, c.bv, c.sv, b, s)) { return false; }
+  }
+  return true;
+}
+fn pickGoneAt(c: CellYarns, m: i32, U: f32) -> bool {
+  if (c.tr.mode == 0u) { return pickGone(c, m); }
+  let a = (c.tr.mode - 1u) & 1u;
+  let b = (c.tr.mode - 1u) >> 1u;
+  let s = (U - (f32(c.warpBase) + 0.5 * f32(c.bu - 1))) / f32(c.bu);
+  if (tornGone(c.tr, 0u, m - c.pickBase, c.bv, c.sv, b, s)) { return true; }
+  if (((c.tr.flags >> 16u) & 1u) == 0u) { return false; }
+  let t = (f32(m) - (f32(c.pickBase) + 0.5 * f32(c.bv - 1))) / f32(c.bv);
+  let k0 = i32(round(U));
+  for (var dk = -1; dk <= 1; dk++) {
+    if (!tornGone(c.tr, 1u, k0 + dk - c.warpBase, c.bu, c.su, a, t)) { return false; }
+  }
+  return true;
+}
 
 // The two highest yarns at a point and the soft visibility weight of the second: real yarn surfaces
 // are hairy, so the boundary between overlapping yarns is a soft transition over ~tau of height.
@@ -230,7 +312,7 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32, cy
   let aw = 0.5 * L.warp.x;
   let af = 0.5 * L.weft.x;
   // warps overlap their neighbours (width > pitch): three candidates; picks only when stretched apart
-  let wefts = select(1, 3, af > 0.5 * L.pitch.y * sv || (cy.masks & 0xFF00u) != 0u);
+  let wefts = select(1, 3, af > 0.5 * L.pitch.y * sv || (cy.masks & 0xFF00u) != 0u || cy.tr.mode != 0u);
   var ha = -1.0;
   var hb = -1.0;
   var ia = -1;
@@ -240,12 +322,12 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32, cy
     var hh: f32;
     if (q < 3) {
       x = (U - f32(k0 + q - 1)) * L.pitch.x * su / aw;
-      if (abs(x) >= 1.0 || warpGone(cy, k0 + q - 1)) { continue; }
+      if (abs(x) >= 1.0 || warpGoneAt(cy, k0 + q - 1, V)) { continue; }
       hh = L.warp.z * crimpProfile(warpUnderDist(L, k0 + q - 1, V)).x + 0.5 * L.warp.y * sqrt(1.0 - x * x);
     } else {
       let m = m0 + select(0, q - 4, wefts == 3);
       x = (V - f32(m)) * L.pitch.y * sv / af;
-      if (abs(x) >= 1.0 || pickGone(cy, m)) { continue; }
+      if (abs(x) >= 1.0 || pickGoneAt(cy, m, U)) { continue; }
       hh = -L.weft.z * crimpProfile(weftOverDist(L, m, U)).x + 0.5 * L.weft.y * sqrt(1.0 - x * x);
     }
     hh *= sgn;

@@ -14,7 +14,9 @@
 // [0] ruptures, [1] pulled out, [2] max speed (f32 bits), [3] line-search step length (f32 bits),
 // [4 + k] largest update of Newton iteration k
 @group(0) @binding(10) var<storage, read_write> counters: array<atomic<u32>>;
-@group(0) @binding(11) var<storage, read> cmeta: array<vec4<f32>>; // dx at contact detection, displacement bound
+// contact bound per node: unit normal away from its nearest face (or foreign node) at the start of the
+// substep, and the largest step displacement allowed toward it (zero normal: unbounded)
+@group(0) @binding(11) var<storage, read> cmeta: array<vec4<f32>>;
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
 
@@ -71,17 +73,17 @@ fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   if (pinnedN(n)) { return; }
-  // OGC-style feasibility: the iterate stays within the bound around the detection-time displacement
   let m = cmeta[n];
   let old = dx[n].xyz;
   // step length chosen by the line search (energy.wgsl)
   let alpha = bitcast<f32>(atomicLoad(&counters[3]));
   // firewall: a non-finite direction never enters the state
   let dn = select(vec3<f32>(0.0), delta[n].xyz, finite3(delta[n].xyz) && finite1(alpha));
-  var d = old + alpha * dn - m.xyz;
-  let l = length(d);
-  if (l > m.w) { d = d * (m.w / l); }
-  let nd = m.xyz + d;
+  var nd = old + alpha * dn;
+  // OGC-style feasibility, directional: the step may approach the nearest face only by the allowed
+  // share of its clearance (it can never pass through it); motion along the face stays free
+  let approach = -dot(nd, m.xyz);
+  if (approach > m.w) { nd += (approach - m.w) * m.xyz; }
   // w keeps the size of this node's latest Newton update (local convergence for history updates)
   dx[n] = vec4<f32>(nd, length(nd - old));
   // non-negative f32 bit patterns order like their values

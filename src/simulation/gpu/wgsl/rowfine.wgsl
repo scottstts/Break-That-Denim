@@ -5,6 +5,16 @@
 
 const ROW_VEC4: u32 = 18u;
 const ROW_COUPLINGS: u32 = 12u;
+// Fine lattice rows: material connectivity comes from the spans (prolongation masking).
+const FINE_ROWS: bool = true;
+
+// Coupling index of a unit offset (+u, -u, +v, -v).
+fn couplingIndex(off: vec2<i32>) -> u32 {
+  if (off.x == 1) { return 0u; }
+  if (off.x == -1) { return 1u; }
+  if (off.y == 1) { return 2u; }
+  return 3u;
+}
 
 fn rowOffset(k: u32) -> vec2<i32> {
   var offs = array<vec2<i32>, 12>(

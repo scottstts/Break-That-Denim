@@ -22,8 +22,8 @@ export function loadDrape(solver: GpuSolver, data: ArrayBuffer): boolean {
 }
 
 /** Drape settling: converged, damage-free steps with kinetic damping, then free steps. */
-const SETTLE_STEPS = 220;
-const SETTLE_DAMPED = 180;
+const SETTLE_STEPS = 420;
+const SETTLE_DAMPED = 360;
 
 /**
  * Settle the authored drape before interaction. Converged Newton solves (an unconverged solve leaves

@@ -1,6 +1,7 @@
 // Per-frame geometry preparation from the accepted mechanical state:
-//  - nodeFrame: per-node unit normal from connected yarn neighbours (holes never bridge),
-//  - classify: per-cell intact flag, compact lists of explicitly drawn spans and yarn tails,
+//  - nodeFrame: per-node unit normal and +u / +v tangents from connected yarn neighbours (holes never
+//    bridge; a missing direction completes the frame and an isolated node keeps its last frame),
+//  - classify: per-cell intact flag, compact lists of torn cells, explicitly drawn spans and yarn tails,
 //  - refine: bicubic (Catmull-Rom) surface samples on an S x S grid per cell with exact derivatives,
 //  - args: indirect draw arguments from the list counters.
 
@@ -14,17 +15,20 @@
 @group(0) @binding(7) var<storage, read_write> lists: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> rsurf: array<vec4<f32>>; // 3 per refined vertex
 @group(0) @binding(9) var<storage, read_write> drawArgs: array<u32>;
-@group(0) @binding(10) var<storage, read> wear: array<f32>;
+// per node: +u unit tangent with the node's wear in w (static), +v unit tangent
+@group(0) @binding(10) var<storage, read_write> tframe: array<vec4<f32>>;
 
-// lists layout: [0] span count, [1] tail count, [2..3] unused, then spans at SPAN_BASE, tails at TAIL_BASE
+// lists layout: [0] span count, [1] tail count, [2] torn cell count, [3] unused, then spans at
+// SPAN_BASE, tails after MAX_SPANS entries, torn cells after MAX_TAILS more
 const SPAN_BASE: u32 = 4u;
 override MAX_SPANS: u32 = 65536u;
 override MAX_TAILS: u32 = 65536u;
-override YARN_VERTS: u32 = 18u;
+override MAX_TORN: u32 = 32768u;
+override TORN_VERTS: u32 = 24u;
 override TAIL_VERTS: u32 = 14u;
 override FUZZ_VERTS: u32 = 10u;
 override FUZZ_PER_YARN: u32 = 10u;
-override FUZZ_PER_TAIL: u32 = 24u;
+override FUZZ_PER_TAIL: u32 = 12u;
 
 // Node still in the scene (retired debris, x.w = 2, is not drawn).
 fn live(n: u32) -> bool { return x[n].w < 1.5; }
@@ -66,6 +70,8 @@ fn nodeFrame(@builtin(global_invocation_id) gid: vec3<u32>) {
   let l = length(nn);
   if (l > 1e-14) {
     nn = nn / l;
+    tframe[2u * n] = vec4<f32>(normalize(tu), tframe[2u * n].w);
+    tframe[2u * n + 1u] = vec4<f32>(normalize(tv), 0.0);
   } else {
     // one family missing: perpendicular to the remaining tangent, closest to the previous normal
     let t = select(tv, tu, dot(tu, tu) > dot(tv, tv));
@@ -76,6 +82,18 @@ fn nodeFrame(@builtin(global_invocation_id) gid: vec3<u32>) {
       p = p - dot(p, td) * td;
     }
     nn = normalize(p + vec3<f32>(0.0, 0.0, 1e-6));
+    // complete the tangent frame (+u x +v = normal) from the remaining family, else keep the last one
+    var eu = tframe[2u * n].xyz;
+    var ev = tframe[2u * n + 1u].xyz;
+    if (dot(tu, tu) > 1e-20) {
+      eu = normalize(tu);
+      ev = normalize(cross(nn, eu));
+    } else if (dot(tv, tv) > 1e-20) {
+      ev = normalize(tv);
+      eu = normalize(cross(ev, nn));
+    }
+    tframe[2u * n] = vec4<f32>(eu, tframe[2u * n].w);
+    tframe[2u * n + 1u] = vec4<f32>(ev, 0.0);
   }
   nrm[n] = vec4<f32>(nn, 0.0);
 }
@@ -98,10 +116,15 @@ fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   // bit 0: the cell is drawn as surface (all four spans carry material); bits 8..23: yarn masks of
   // its left / right warp spans and bottom / top pick spans (yarns gone from the woven surface)
   var flags = 0u;
+  let cell = cellOf(l, i, j);
   if (segOk(n, 0u) && segOk(n, 1u) && segOk(n + 1u, 1u) && segOk(n + L.y, 0u)) {
     flags = 1u | (yarnMask(n, 1u) << 8u) | (yarnMask(n + 1u, 1u) << 12u) | (yarnMask(n, 0u) << 16u) | (yarnMask(n + L.y, 0u) << 20u);
+  } else if (live(n) || live(n + 1u) || live(n + L.y) || live(n + L.y + 1u)) {
+    // torn: each live corner draws its own quarter of the cell (surface.wgsl vsTorn)
+    let k = atomicAdd(&lists[2], 1u);
+    if (k < MAX_TORN) { atomicStore(&lists[SPAN_BASE + MAX_SPANS + MAX_TAILS + k], cell); }
   }
-  cellFlags[cellOf(l, i, j)] = flags;
+  cellFlags[cell] = flags;
 }
 
 fn cellOk(l: u32, ci: i32, cj: i32) -> bool {
@@ -147,16 +170,16 @@ fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-// Indirect draw arguments: [yarns, tails, yarn fuzz, tail fuzz] x (vertexCount, instanceCount, 0, 0).
-// Each bundled yarn of an explicit span is drawn in two halves (a broken yarn: two stubs).
+// Indirect draw arguments: [unused, tails, yarn fuzz, tail fuzz, torn corners] x (vertexCount,
+// instanceCount, 0, 0). Fuzz on a listed span's yarns is drawn per half yarn.
 @compute @workgroup_size(1)
 fn args() {
   let spans = min(atomicLoad(&lists[0]), MAX_SPANS);
   let tl = min(atomicLoad(&lists[1]), MAX_TAILS);
   // instances per span / tail: the larger bundle (extra instances of the smaller family are empty)
   let b = bundleMax(R.layers[0]);
-  drawArgs[0] = YARN_VERTS;
-  drawArgs[1] = spans * b * 2u;
+  drawArgs[0] = 0u;
+  drawArgs[1] = 0u;
   drawArgs[2] = 0u;
   drawArgs[3] = 0u;
   drawArgs[4] = TAIL_VERTS;
@@ -171,6 +194,10 @@ fn args() {
   drawArgs[13] = tl * b * FUZZ_PER_TAIL;
   drawArgs[14] = 0u;
   drawArgs[15] = 0u;
+  drawArgs[16] = TORN_VERTS;
+  drawArgs[17] = min(atomicLoad(&lists[2]), MAX_TORN) * 4u;
+  drawArgs[18] = 0u;
+  drawArgs[19] = 0u;
 }
 
 // ---------------------------------------------------------------- bicubic surface samples
@@ -254,7 +281,7 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dPs = cr(drows[0], drows[1], drows[2], drows[3], t);
   let dPt = crd(rows[0], rows[1], rows[2], rows[3], t);
   let n00 = L.x + cj * L.y + ci;
-  let w = mix(mix(wear[n00], wear[n00 + 1u], s), mix(wear[n00 + L.y], wear[n00 + L.y + 1u], s), t);
+  let w = mix(mix(tframe[2u * n00].w, tframe[2u * (n00 + 1u)].w, s), mix(tframe[2u * (n00 + L.y)].w, tframe[2u * (n00 + L.y + 1u)].w, s), t);
   rsurf[3u * r] = vec4<f32>(P, w);
   rsurf[3u * r + 1u] = vec4<f32>(dPs, 0.0);
   rsurf[3u * r + 2u] = vec4<f32>(dPt, 0.0);

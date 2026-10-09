@@ -41,8 +41,11 @@ const SHADOW_HALF = 0.34;
 const REFINE = 2;
 const MAX_SPANS = 65536;
 const MAX_TAILS = 65536;
+/** Torn cells drawn per corner (refine.wgsl list layout; surface.wgsl TORN_BASE). */
+const MAX_TORN = 32768;
+/** Vertices of one torn corner's quarter: 2 x 2 sub-quads (surface.wgsl TQ). */
+const TORN_VERTS = 24;
 /** Vertices per explicit-yarn ribbon (2 per centreline sample), tails, and fibres; see the WGSL. */
-const SPAN_VERTS = 18;
 const TAIL_VERTS = 14;
 const FUZZ_VERTS = 10;
 
@@ -83,6 +86,11 @@ export class Renderer {
   private readonly frameU: GPUBuffer;
   private readonly renderU: GPUBuffer;
   private readonly nrm: GPUBuffer;
+  /**
+   * Per node: unit +u tangent with the node's wear in w, unit +v tangent (torn corners rebuild
+   * disconnected neighbours from them).
+   */
+  private readonly tframe: GPUBuffer;
   private readonly wear: GPUBuffer;
   private readonly cellFlags: GPUBuffer;
   private readonly lists: GPUBuffer;
@@ -135,10 +143,17 @@ export class Renderer {
     const nInit = new Float32Array(4 * N);
     for (let n = 0; n < N; n++) nInit[4 * n + 2] = 1;
     this.nrm = createBufferWith(device, 'nrm', nInit);
+    const fInit = new Float32Array(8 * N);
+    for (let n = 0; n < N; n++) {
+      fInit[8 * n] = 1;
+      fInit[8 * n + 3] = scene.wear[n];
+      fInit[8 * n + 5] = 1;
+    }
+    this.tframe = createBufferWith(device, 'tframe', fInit);
     this.wear = createBufferWith(device, 'wear', Float32Array.from(scene.wear));
     this.cellFlags = createBuffer(device, 'cellFlags', 4 * cells);
-    this.lists = createBuffer(device, 'lists', 4 * (4 + MAX_SPANS + MAX_TAILS));
-    this.drawArgs = createBuffer(device, 'drawArgs', 64, STORAGE | GPUBufferUsage.INDIRECT);
+    this.lists = createBuffer(device, 'lists', 4 * (4 + MAX_SPANS + MAX_TAILS + MAX_TORN));
+    this.drawArgs = createBuffer(device, 'drawArgs', 80, STORAGE | GPUBufferUsage.INDIRECT);
     this.rsurf = createBuffer(device, 'rsurf', 48 * refined);
 
     this.refine = new ComputeModule(device, 'refine', commonWgsl + refineWgsl);
@@ -154,7 +169,7 @@ export class Renderer {
       7: this.lists,
       8: this.rsurf,
       9: this.drawArgs,
-      10: this.wear,
+      10: this.tframe,
     });
 
     const V = GPUShaderStage.VERTEX;
@@ -172,6 +187,10 @@ export class Renderer {
         { binding: 5, visibility: F, sampler: { type: 'comparison' } },
         { binding: 6, visibility: F, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 7, visibility: F, sampler: { type: 'filtering' } },
+        ro(8),
+        ro(9),
+        ro(10),
+        ro(11),
       ],
     });
     this.yarnLayout = device.createBindGroupLayout({
@@ -188,6 +207,7 @@ export class Renderer {
         ro(8),
         { binding: 9, visibility: F, texture: { sampleType: 'depth' } },
         { binding: 10, visibility: F, sampler: { type: 'comparison' } },
+        ro(11),
       ],
     });
 
@@ -215,13 +235,26 @@ export class Renderer {
       primitive: list,
       depthStencil: shadowDepth,
     });
+    this.pipes.torn = device.createRenderPipeline({
+      label: 'torn',
+      layout: surfacePL,
+      vertex: { module: surfaceModule, entryPoint: 'vsTorn' },
+      fragment: { module: surfaceModule, entryPoint: 'fsMain', targets: [{ format: HDR_FORMAT }] },
+      primitive: list,
+      depthStencil: depth,
+      multisample: ms,
+    });
+    this.pipes.tornShadow = device.createRenderPipeline({
+      label: 'torn.shadow',
+      layout: surfacePL,
+      vertex: { module: surfaceModule, entryPoint: 'vsTornShadow' },
+      primitive: list,
+      depthStencil: shadowDepth,
+    });
 
     const yarnPL = device.createPipelineLayout({ bindGroupLayouts: [this.yarnLayout] });
     const yarnModule = shaderModule(device, 'yarn', commonWgsl + lightWgsl + yarnGeomWgsl + yarnWgsl);
-    for (const [name, vs] of [
-      ['span', 'vsSpan'],
-      ['tail', 'vsTail'],
-    ]) {
+    for (const [name, vs] of [['tail', 'vsTail']]) {
       this.pipes[name] = device.createRenderPipeline({
         label: name,
         layout: yarnPL,
@@ -276,6 +309,10 @@ export class Renderer {
       { binding: 5, resource: this.shadowSampler },
       { binding: 6, resource: tileView },
       { binding: 7, resource: this.tileSampler },
+      { binding: 8, resource: { buffer: solver.x } },
+      { binding: 9, resource: { buffer: solver.segs } },
+      { binding: 10, resource: { buffer: this.tframe } },
+      { binding: 11, resource: { buffer: this.lists } },
     ];
     const yarnEntries = (shadow: GPUTextureView): GPUBindGroupEntry[] => [
       { binding: 0, resource: { buffer: this.frameU } },
@@ -289,6 +326,7 @@ export class Renderer {
       { binding: 8, resource: { buffer: this.wear } },
       { binding: 9, resource: shadow },
       { binding: 10, resource: this.shadowSampler },
+      { binding: 11, resource: { buffer: this.tframe } },
     ];
     const shadowView = this.shadowTex.createView();
     const dummyView = this.dummyDepth.createView();
@@ -472,9 +510,9 @@ export class Renderer {
     sp.setPipeline(this.pipes.surfaceShadow);
     sp.setBindGroup(0, this.surfaceShadowGroup);
     sp.draw(surfaceVerts, this.cellCount);
+    sp.setPipeline(this.pipes.tornShadow);
+    sp.drawIndirect(this.drawArgs, 64);
     sp.setBindGroup(0, this.yarnShadowGroup);
-    sp.setPipeline(this.pipes.spanShadow);
-    sp.drawIndirect(this.drawArgs, 0);
     sp.setPipeline(this.pipes.tailShadow);
     sp.drawIndirect(this.drawArgs, 16);
     sp.end();
@@ -488,9 +526,9 @@ export class Renderer {
     mp.setPipeline(this.pipes.surface);
     mp.setBindGroup(0, this.surfaceGroup);
     mp.draw(surfaceVerts, this.cellCount);
+    mp.setPipeline(this.pipes.torn);
+    mp.drawIndirect(this.drawArgs, 64);
     mp.setBindGroup(0, this.yarnGroup);
-    mp.setPipeline(this.pipes.span);
-    mp.drawIndirect(this.drawArgs, 0);
     mp.setPipeline(this.pipes.tail);
     mp.drawIndirect(this.drawArgs, 16);
     mp.setPipeline(this.pipes.yarnFuzz);
@@ -511,4 +549,4 @@ export class Renderer {
   }
 }
 
-export { SPAN_VERTS, TAIL_VERTS, FUZZ_VERTS };
+export { TAIL_VERTS, FUZZ_VERTS, TORN_VERTS };

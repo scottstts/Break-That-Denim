@@ -1,7 +1,7 @@
 import { bendPsi, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
 import type { LayerInfo } from '../scene';
-import { bracket, coarsenLayers, shouldCoarsen, type LatticeLayer } from '../lattice';
+import { bracket, coarsenLayers, coarseToFine, shouldCoarsen, type LatticeLayer } from '../lattice';
 import type { ReferenceSolver } from './solver';
 
 /**
@@ -50,6 +50,11 @@ export class StencilOperator {
   readonly fixed: Uint8Array;
   /** Per node: (i, j, layer). */
   readonly ij: Int32Array;
+  /**
+   * Material connectivity of node n to its unit-offset neighbour (di, dj), if known (the fine
+   * lattice: an intact span). Without it, prolongation masking infers connectivity from the operator.
+   */
+  link?: (n: number, di: number, dj: number) => boolean;
 
   constructor(layers: LatticeLayer[]) {
     this.layers = layers;
@@ -155,6 +160,7 @@ function geomStiff(f: number): number {
 export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
   const layers: LatticeLayer[] = S.scene.layers.map((L: LayerInfo) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
   const A = new StencilOperator(layers);
+  A.link = (n, di, dj) => S.segActive(S.seg(n, di !== 0 ? 0 : 1, di + dj > 0 ? 1 : -1));
   const h = S.params.h;
   for (let n = 0; n < S.N; n++) {
     if (S.scene.pinned[n]) {
@@ -166,12 +172,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
   for (let n = 0; n < S.N; n++) {
     if (A.fixed[n]) continue;
     A.addBlock(n, CENTER, S.scene.mass[n] / (h * h) + S.gripTerm(n, gTmp), I3);
-    const [cd, nn] = S.airDrag(n);
-    if (cd > 0) {
-      const B = new Float64Array(9);
-      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) B[3 * r + c] = cd * nn[r] * nn[c];
-      A.addBlock(n, CENTER, 1, B);
-    }
+    A.addBlock(n, CENTER, 1, S.airDrag(n));
   }
   const H = new Float64Array(9);
   const e = new Float64Array(3);
@@ -238,14 +239,14 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
     const r = S.nbr[4 * n + 1];
     const t = S.nbr[4 * n + 3];
     if (r < 0 || t < 0) continue;
-    if (!(S.segActive(2 * n) && S.segActive(2 * n + 1) && S.segActive(2 * r + 1) && S.segActive(2 * t + FAMILY_U))) continue;
     const rt = S.nbr[4 * r + 3];
     const ks = S.layer(n).material.shearStiffness;
     const Ld = Math.hypot(S.restLength[2 * n], S.restLength[2 * n + 1]);
-    for (const [p, q] of [
-      [n, rt],
-      [r, t],
+    for (const [p, q, d] of [
+      [n, rt, 0],
+      [r, t, 1],
     ]) {
+      if (!S.diagActive(n, d)) continue;
       let l = 0;
       for (let z = 0; z < 3; z++) {
         pa[z] = S.x[3 * q + z] + S.dx[3 * q + z] - S.x[3 * p + z] - S.dx[3 * p + z];
@@ -267,7 +268,29 @@ export interface Prolongation {
   w: Float64Array;
 }
 
-/** Coarse lattice layout and bilinear prolongation for one coarsening of `fine`. */
+/**
+ * Whether node a of A and its unit-offset neighbour (di, dj) are connected for prolongation: an intact
+ * span on the fine lattice (A.link); on coarse levels a nonzero Galerkin coupling (pieces separated by
+ * a tear have none) or a fixed neighbour (mount boundaries keep their bilinear weights).
+ */
+function linked(A: StencilOperator, a: number, di: number, dj: number): boolean {
+  const b = A.nbr(a, di, dj);
+  if (b < 0) return false;
+  if (A.link) return A.link(a, di, dj);
+  if (A.fixed[b]) return true;
+  const base = (a * STENCIL + offsetIndex(di, dj)) * 9;
+  for (let q = 0; q < 9; q++) if (A.A[base + q] !== 0) return true;
+  return false;
+}
+
+/**
+ * Coarse lattice layout and connectivity-aware bilinear prolongation for one coarsening of `fine`.
+ * A fine node interpolates only from coarse nodes it reaches through connected edges inside their
+ * shared cell, with the weights renormalized: across a tear, bilinear interpolation would tie both
+ * sides to the same coarse unknowns, and a torn flap's own rigid motion would have no coarse
+ * representation (its swing then converged poorly and kept ringing). Mirrors prolongWeights in
+ * multigrid.wgsl.
+ */
 export function buildProlongation(fine: StencilOperator): { coarse: LatticeLayer[]; P: Prolongation } {
   const coarse = coarsenLayers(fine.layers);
   const P: Prolongation = { idx: new Int32Array(4 * fine.N).fill(-1), w: new Float64Array(4 * fine.N) };
@@ -281,13 +304,26 @@ export function buildProlongation(fine: StencilOperator): { coarse: LatticeLayer
         if (fine.fixed[f]) continue;
         const bi = bracket(i, L.nx);
         let k = 0;
+        let sum = 0;
         for (const [J, wj] of bj) {
+          const dj = coarseToFine(J, L.ny) - j;
           for (const [I, wi] of bi) {
+            const di = coarseToFine(I, L.nx) - i;
+            let ok = true;
+            if (di !== 0 && dj !== 0) {
+              const m1 = fine.nbr(f, di, 0);
+              const m2 = fine.nbr(f, 0, dj);
+              ok = (linked(fine, f, di, 0) && linked(fine, m1, 0, dj)) || (linked(fine, f, 0, dj) && linked(fine, m2, di, 0));
+            } else if (di !== 0 || dj !== 0) {
+              ok = linked(fine, f, di, dj);
+            }
             P.idx[4 * f + k] = C.offset + J * C.nx + I;
-            P.w[4 * f + k] = wi * wj;
+            P.w[4 * f + k] = ok ? wi * wj : 0;
+            sum += P.w[4 * f + k];
             k++;
           }
         }
+        for (let q = 0; q < k; q++) P.w[4 * f + q] = sum > 0 ? P.w[4 * f + q] / sum : 0;
       }
     }
   }

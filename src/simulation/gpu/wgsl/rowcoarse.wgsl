@@ -4,6 +4,13 @@
 
 const ROW_VEC4: u32 = 50u;
 const ROW_COUPLINGS: u32 = 24u;
+const FINE_ROWS: bool = false;
+
+// Coupling index of an offset within the radius-2 stencil.
+fn couplingIndex(off: vec2<i32>) -> u32 {
+  let o = u32((off.y + 2) * 5 + (off.x + 2));
+  return select(o, o - 1u, o > 12u);
+}
 
 fn rowOffset(k: u32) -> vec2<i32> {
   let o = select(k, k + 1u, k >= 12u);

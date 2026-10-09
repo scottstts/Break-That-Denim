@@ -114,7 +114,7 @@ export interface CompiledScene {
  * Version of the mechanical model (laws and their constants outside the material assets). Bump it
  * whenever equilibrium shapes change, so stale precomputed drapes are rejected.
  */
-export const MECHANICS_VERSION = 2;
+export const MECHANICS_VERSION = 3;
 
 /** Content hash of a compiled scene's initial state and mechanics (validates precomputed drapes). */
 export function sceneHash(s: CompiledScene): number {
@@ -294,7 +294,12 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
         const yarnVar = 0.12 * noise1(seed + 31 * (f + 1) + yarnIndex * 7, along / 0.004);
         const loss = spec.wearStrengthLoss[f];
         const wf = f === FAMILY_U ? Math.pow(w, 1.6) : Math.pow(w, 1.25);
-        const factor = Math.max(0.04, (1 - loss * wf) * (1 + yarnVar));
+        // Span-to-span scatter (log-normal, uncorrelated between neighbours): abrasion and yarn
+        // irregularity vary over millimetres, more so in worn cloth. Without it a crack tip always
+        // breaks the next span in line and every tear runs dead straight along the lattice.
+        const z = (rand01(seed + 503, sIdx, f) + rand01(seed + 617, sIdx, f) - 1) * 2.45;
+        const scatter = Math.exp((0.25 + 0.2 * w) * z);
+        const factor = Math.max(0.04, (1 - loss * wf) * (1 + yarnVar) * scatter);
         scene.segFlags[sIdx] = SEG_EXISTS;
         scene.restLength[sIdx] = f === FAMILY_U ? m.pitchU : m.pitchV;
         scene.peakTension[sIdx] = yarn.strength * factor;

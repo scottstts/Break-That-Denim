@@ -30,7 +30,11 @@ export interface YarnFamily {
   axialViscosity: number;
   /** Bending rigidity per yarn, N·m² (denim: Peirce bending length ~3 cm, i.e. ~1e-4 N m per unit width). */
   bendRigidity: number;
-  /** Fraction of bending stiffness acting viscously over one step (dimensionless rate factor, s). */
+  /**
+   * Bending viscosity as a time constant, s (viscous moment = rigidity x this x curvature rate). Fabric
+   * bending is strongly damped by yarn friction: 2e-2 s gives a damping ratio near 0.3 for 5-10 Hz
+   * fold motion.
+   */
   bendViscosity: number;
   /** Intact peak tension, N. */
   strength: number;
@@ -98,7 +102,7 @@ export const DENIM: WeaveMaterial = {
       eaCompress: 3,
       axialViscosity: 2e-4,
       bendRigidity: 4e-8, // ~7e-5 N m per unit width (1724 picks/m)
-      bendViscosity: 2e-3,
+      bendViscosity: 2e-2,
       strength: 8.5,
       softeningOpening: 0.12e-3,
       // in-fabric (flattened) cross-section; the weft lies low under the warp floats
@@ -115,7 +119,7 @@ export const DENIM: WeaveMaterial = {
       eaCompress: 5,
       axialViscosity: 2e-4,
       bendRigidity: 4.5e-8, // ~1.2e-4 N m per unit width (2632 ends/m)
-      bendViscosity: 2e-3,
+      bendViscosity: 2e-2,
       strength: 11,
       softeningOpening: 0.12e-3,
       // flattened in the fabric: warps overlap their neighbours (cover factor above one)
@@ -150,7 +154,7 @@ export const BACKING: WeaveMaterial = {
       eaCompress: 0.3,
       axialViscosity: 2e-4,
       bendRigidity: 6e-9,
-      bendViscosity: 2e-3,
+      bendViscosity: 2e-2,
       strength: 6,
       softeningOpening: 0.25e-3,
       width: 0.52e-3,
@@ -165,7 +169,7 @@ export const BACKING: WeaveMaterial = {
       eaCompress: 0.3,
       axialViscosity: 2e-4,
       bendRigidity: 6e-9,
-      bendViscosity: 2e-3,
+      bendViscosity: 2e-2,
       strength: 6,
       softeningOpening: 0.25e-3,
       width: 0.52e-3,

@@ -6,10 +6,13 @@ import type { CompiledScene } from './scene';
  * material: |handle - patch centroid| <= maxLead, so the total force stays below maxForce.
  */
 export const GRIP = {
-  /** Material radius of the gripped patch, m. */
-  radius: 0.014,
-  /** Maximum total grip force, N. */
-  maxForce: 150,
+  /**
+   * Material radius of the gripped patch, m: a fingertip pinch. A wider patch spreads the pull so
+   * thinly that weak material far along the load path failed first, away from the hand.
+   */
+  radius: 0.008,
+  /** Maximum total grip force, N (a hard two-finger pull; tears worn and intact denim at the pinch). */
+  maxForce: 300,
   /** Largest lead of the handle over the patch centroid, m. */
   maxLead: 0.006,
 };

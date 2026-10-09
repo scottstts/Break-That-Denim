@@ -1,4 +1,4 @@
-// Explicit yarns: surviving spans next to damaged cells and loose tails of broken/pulled-out ends.
+// Explicit yarns: loose tails of broken/pulled-out ends beyond the torn corner patches.
 // Each yarn is a camera-facing ribbon around its centreline shaded as a round fibrous cylinder with
 // the same material identity as the intact surface.
 
@@ -13,6 +13,7 @@
 @group(0) @binding(8) var<storage, read> wearR: array<f32>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
+@group(0) @binding(11) var<storage, read> tframe: array<vec4<f32>>;
 
 override SEGS: u32 = 8u;
 
@@ -60,29 +61,18 @@ fn degenerate() -> VOut {
   return o;
 }
 
-fn spanVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
-  let b = bundleMax(R.layers[0]);
-  let k = ii / (2u * b);
-  let s = spanEntry(k);
-  let q = (ii % (2u * b)) >> 1u;
-  let bs = bundleOf(R.layers[nodes[s >> 1u].ijl >> 24u], s & 1u);
-  if (q >= bs || yarnInSurface(k, q, bs)) { return degenerate(); }
-  let u = f32(vi >> 1u) / f32(SEGS);
-  return ribbon(halfYarn(s, q, ii & 1u, u), vi, fromLight);
-}
-
 fn tailVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
   let b = bundleMax(R.layers[0]);
   let e = tailEntry(ii / b);
   let q = ii % b;
   if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u)) { return degenerate(); }
+  // yarns ending inside the node's quarter of the torn cell are drawn by its corner patch alone
+  if (tailLength(e, q) <= 0.0) { return degenerate(); }
   let t = f32(vi >> 1u) / f32(SEGS - 2u);
   return ribbon(tailYarn(e, q, t), vi, fromLight);
 }
 
-@vertex fn vsSpan(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut { return spanVertex(vi, ii, false); }
 @vertex fn vsTail(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut { return tailVertex(vi, ii, false); }
-@vertex fn vsSpanShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> { return spanVertex(vi, ii, true).pos; }
 @vertex fn vsTailShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> { return tailVertex(vi, ii, true).pos; }
 
 @fragment

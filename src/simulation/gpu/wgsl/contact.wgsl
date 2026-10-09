@@ -78,6 +78,7 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
     bestD[k] = 1e9;
   }
   var dmin = 1e9;
+  var nmin = vec3<f32>(0.0);
   let c = cellOf(p);
   for (var lo = 0u; lo < P.counts.y; lo++) {
     if (lo == ln) { continue; }
@@ -92,7 +93,10 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
             let m = cellItems[start + q];
             if (layerOf(m) != lo) { continue; }
             let d = distance(p, cur(m));
-            dmin = min(dmin, d - r);
+            if (d - r < dmin && d > 1e-9) {
+              dmin = d - r;
+              nmin = (p - cur(m)) / d;
+            }
             if (d >= r + 0.25 * CU.grid.x) { continue; }
             var cand = m;
             var cd = d - r;
@@ -112,13 +116,13 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   for (var k = 0u; k < K; k++) { pairs[K * n + k] = best[k]; }
-  // Displacement bound: a node may move at most a fraction of its clearance beyond the nearest
-  // foreign node's contact distance plus the penalty band, so a substep cannot tunnel through a layer.
-  // Provisional: an isotropic clearance bound would also throttle tangential sliding of resting layers,
-  // so it only caps implausible jumps here; a directional (approach-only) bound is pending.
-  let clearance = max(0.0, dmin) + 0.5 * CU.dist.x;
-  let bound = max(CU.law.w * clearance, 0.002);
-  cmeta[n] = vec4<f32>(dx[n].xyz, bound);
+  // Directional bound (step.wgsl newtonApply): the step may approach the nearest foreign node only by
+  // a share of its clearance plus half the contact distance, so it cannot tunnel through a layer.
+  if (dmin < 1e8) {
+    cmeta[n] = vec4<f32>(nmin, CU.law.w * (max(0.0, dmin) + 0.5 * CU.dist.x));
+  } else {
+    cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+  }
 }
 
 @compute @workgroup_size(128)

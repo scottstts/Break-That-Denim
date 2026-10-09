@@ -74,29 +74,21 @@ fn triple(a: u32, b: u32, c: u32, f: u32, mat: LayerMat) -> Triple {
 
 fn tripleGrad(t: Triple) -> vec3<f32> { return t.ke * t.r + t.kd * (t.r - t.rn); }
 
-// Unit normal at node (i, j) from its lattice neighbours at the accepted positions (central where
-// available); zero at a degenerate configuration.
-fn airNormal(lv: LevelInfo, l: u32, i: i32, j: i32) -> vec3<f32> {
-  let c = levelNode(lv, l, i, j);
-  var a = levelNode(lv, l, i - 1, j);
-  var b = levelNode(lv, l, i + 1, j);
-  var d = levelNode(lv, l, i, j - 1);
-  var e = levelNode(lv, l, i, j + 1);
-  if (a < 0) { a = c; }
-  if (b < 0) { b = c; }
-  if (d < 0) { d = c; }
-  if (e < 0) { e = c; }
-  let nn = cross(x[u32(b)].xyz - x[u32(a)].xyz, x[u32(e)].xyz - x[u32(d)].xyz);
-  let len = length(nn);
-  return select(vec3<f32>(0.0), nn / len, len > 1e-12);
-}
-
-fn cellActive(lv: LevelInfo, l: u32, ci: i32, cj: i32) -> bool {
+// Shear diagonal d of the cell with lower-left corner (ci, cj): d = 0 joins c and rt, d = 1 joins r
+// and t. A diagonal acts while one of its two triangles is intact (the crossings there still lock
+// the yarn angle), so a cell keeps its shear stiffness when a single span breaks and hole edges do
+// not turn into free hinges.
+fn diagActive(lv: LevelInfo, l: u32, ci: i32, cj: i32, d: u32) -> bool {
   let c = levelNode(lv, l, ci, cj);
   let r = levelNode(lv, l, ci + 1, cj);
   let t = levelNode(lv, l, ci, cj + 1);
   if (c < 0 || r < 0 || t < 0) { return false; }
-  return activeSeg(c, 0u) && activeSeg(c, 1u) && activeSeg(r, 1u) && activeSeg(t, 0u);
+  let cu = activeSeg(c, 0u);
+  let cv = activeSeg(c, 1u);
+  let rv = activeSeg(r, 1u);
+  let tu = activeSeg(t, 0u);
+  if (d == 0u) { return (cu && rv) || (cv && tu); }
+  return (cu && cv) || (rv && tu);
 }
 
 fn shearRest(lv: LevelInfo, l: u32, ci: i32, cj: i32) -> f32 {
@@ -137,13 +129,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w = st.mass / (h * h);
   var D = symId(w);
   var g = w * (dx[n].xyz - pred[n].xyz);
-  // implicit normal air drag: 1/2 (c A / h) (n . dx)^2 with the normal of the accepted state
-  let nd = airNormal(lv, l, i, j);
-  if (mat.b.y > 0.0 && dot(nd, nd) > 0.0) {
-    let cd = mat.b.y * mat.a.w * mat.b.x / h;
-    g += cd * dot(nd, dx[n].xyz) * nd;
-    D = symAdd(D, axialBlock(cd, 0.0, nd));
-  }
+  // implicit air drag (drag.wgsl): 1/2 dx^T Dd dx from the accepted state
+  let Dd = airDragBlock(n);
+  g += symMul(Dd, dx[n].xyz);
+  D = symAdd(D, Dd);
   // External node terms (contact, friction, grip): gradient and symmetric Hessian
   let e0 = ext[3u * n];
   let e1 = ext[3u * n + 1u];
@@ -228,7 +217,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (c == 2) { ci = i - 1; cj = j; pi = i - 1; pj = j + 1; }
     if (c == 3) { ci = i; cj = j - 1; pi = i + 1; pj = j - 1; }
     let p = levelNode(lv, l, pi, pj);
-    if (p < 0 || !cellActive(lv, l, ci, cj)) { continue; }
+    if (p < 0 || !diagActive(lv, l, ci, cj, select(1u, 0u, c < 2))) { continue; }
     let d = (x[p].xyz - x[n].xyz) + (dx[p].xyz - dx[n].xyz);
     let len = length(d);
     let e = d / len;

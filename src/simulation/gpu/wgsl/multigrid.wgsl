@@ -12,6 +12,9 @@
 @group(0) @binding(7) var<storage, read> vecIn2: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> vecOut: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> vecOut2: array<vec4<f32>>;
+// Prolongation weights of each level-F node to its bracketing coarse nodes, slot ki + 2 kj (lo = 0).
+@group(0) @binding(10) var<storage, read_write> pw: array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read> segsF: array<Seg>;
 
 // Coarse row writer (layout of rowcoarse.wgsl): offset index o = (dj + 2) * 5 + (di + 2).
 fn storeC(n: u32, o: u32, b: Sym) {
@@ -28,6 +31,79 @@ fn weightOf(i: u32, I: u32, n: u32) -> f32 {
   if (b.lo == I) { return b.wlo; }
   if (b.hi == I && b.whi > 0.0) { return b.whi; }
   return 0.0;
+}
+
+// ---------------------------------------------------------------- connectivity-aware prolongation
+
+// Whether the level-F node at (i, j) and its unit-offset neighbour are connected: an intact span on
+// the fine lattice; on coarse levels a nonzero Galerkin coupling (pieces separated by a tear have
+// none) or a fixed neighbour (mount boundaries keep their bilinear weights).
+fn linked(l: u32, i: i32, j: i32, di: i32, dj: i32) -> bool {
+  let a = levelNode(F, l, i, j);
+  let b = levelNode(F, l, i + di, j + dj);
+  if (a < 0 || b < 0) { return false; }
+  if (FINE_ROWS) {
+    let f = select(1u, 0u, di != 0);
+    let owner = select(b, a, di + dj > 0);
+    return segActive(segsF[2u * u32(owner) + f]);
+  }
+  if (fixedF[u32(b)] != 0u) { return true; }
+  return !symIsZero(rowCoupling(u32(a), couplingIndex(vec2<i32>(di, dj))));
+}
+
+// Bilinear weights masked to the coarse nodes a node reaches through connected edges inside their
+// shared cell, renormalized. Across a tear, plain bilinear interpolation ties both sides to the same
+// coarse unknowns, so a torn flap's own rigid motion has no coarse representation and its swing
+// converges poorly. Mirrors buildProlongation (reference/newtonMultigrid.ts).
+@compute @workgroup_size(128)
+fn prolongWeights(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let a = gid.x;
+  if (a >= F.counts.x) { return; }
+  if (fixedF[a] != 0u) {
+    pw[a] = vec4<f32>(0.0);
+    return;
+  }
+  let fc = levelCoords(F, a);
+  let l = fc.z;
+  let Lf = F.layers[l];
+  let i = i32(fc.x);
+  let j = i32(fc.y);
+  let bi = bracketOf(fc.x, Lf.y);
+  let bj = bracketOf(fc.y, Lf.z);
+  var w = vec4<f32>(0.0);
+  var sum = 0.0;
+  for (var kj = 0u; kj < 2u; kj++) {
+    let J = select(bj.lo, bj.hi, kj == 1u);
+    let wj = select(bj.wlo, bj.whi, kj == 1u);
+    if (wj == 0.0) { continue; }
+    let dj = i32(coarseToFine(J, Lf.z)) - j;
+    for (var ki = 0u; ki < 2u; ki++) {
+      let I = select(bi.lo, bi.hi, ki == 1u);
+      let wi = select(bi.wlo, bi.whi, ki == 1u);
+      if (wi == 0.0) { continue; }
+      let di = i32(coarseToFine(I, Lf.y)) - i;
+      var ok = true;
+      if (di != 0 && dj != 0) {
+        ok = (linked(l, i, j, di, 0) && linked(l, i + di, j, 0, dj)) || (linked(l, i, j, 0, dj) && linked(l, i, j + dj, di, 0));
+      } else if (di != 0 || dj != 0) {
+        ok = linked(l, i, j, di, dj);
+      }
+      if (ok) {
+        w[ki + 2u * kj] = wi * wj;
+        sum += wi * wj;
+      }
+    }
+  }
+  pw[a] = select(vec4<f32>(0.0), w / sum, sum > 0.0);
+}
+
+// Prolongation weight of level-F node a (at fine coordinates fi, fj) for coarse node (I, J).
+fn weightAt(a: u32, fi: u32, fj: u32, I: u32, J: u32, nxf: u32, nyf: u32) -> f32 {
+  let bi = bracketOf(fi, nxf);
+  let bj = bracketOf(fj, nyf);
+  let ki = select(1u, 0u, bi.lo == I);
+  let kj = select(1u, 0u, bj.lo == J);
+  return pw[a][ki + 2u * kj];
 }
 
 // ---------------------------------------------------------------- Galerkin coarse operator P^T A P
@@ -55,7 +131,8 @@ fn rap(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wi == 0.0) { continue; }
       let a = u32(levelNode(F, l, ai, aj));
       if (fixedF[a] != 0u) { continue; }
-      let wa = wi * wj;
+      let wa = weightAt(a, u32(ai), u32(aj), cc.x, cc.y, nxf, nyf);
+      if (wa == 0.0) { continue; }
       for (var k = 0u; k <= ROW_COUPLINGS; k++) {
         var off = vec2<i32>(0, 0);
         var A: Sym;
@@ -71,16 +148,15 @@ fn rap(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (bi < 0 || bj < 0 || bi >= i32(nxf) || bj >= i32(nyf)) { continue; }
         let bri = bracketOf(u32(bi), nxf);
         let brj = bracketOf(u32(bj), nyf);
+        let wb = pw[u32(levelNode(F, l, bi, bj))];
         for (var kj = 0u; kj < 2u; kj++) {
           let J = select(brj.lo, brj.hi, kj == 1u);
-          let wJj = select(brj.wlo, brj.whi, kj == 1u);
-          if (wJj == 0.0) { continue; }
           for (var ki = 0u; ki < 2u; ki++) {
             let Ii = select(bri.lo, bri.hi, ki == 1u);
-            let wJi = select(bri.wlo, bri.whi, ki == 1u);
-            if (wJi == 0.0) { continue; }
+            let wJ = wb[ki + 2u * kj];
+            if (wJ == 0.0) { continue; }
             let o = u32((i32(J) - i32(cc.y) + 2) * 5 + (i32(Ii) - i32(cc.x) + 2));
-            acc[o] = symAdd(acc[o], symScale(A, wa * wJi * wJj));
+            acc[o] = symAdd(acc[o], symScale(A, wa * wJ));
           }
         }
       }
@@ -145,7 +221,7 @@ fn restrictResidual(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (wi == 0.0) { continue; }
       let a = u32(levelNode(F, l, ai, aj));
       if (fixedF[a] != 0u) { continue; }
-      s += wi * wj * vecIn[a].xyz;
+      s += weightAt(a, u32(ai), u32(aj), cc.x, cc.y, Lf.y, Lf.z) * vecIn[a].xyz;
     }
   }
   vecOut[I] = vec4<f32>(s, 0.0);
@@ -162,17 +238,16 @@ fn prolongAdd(@builtin(global_invocation_id) gid: vec3<u32>) {
   let Lf = F.layers[fc.z];
   let bi = bracketOf(fc.x, Lf.y);
   let bj = bracketOf(fc.y, Lf.z);
+  let w = pw[a];
   var s = vec3<f32>(0.0);
   for (var kj = 0u; kj < 2u; kj++) {
     let J = select(bj.lo, bj.hi, kj == 1u);
-    let wj = select(bj.wlo, bj.whi, kj == 1u);
-    if (wj == 0.0) { continue; }
     for (var ki = 0u; ki < 2u; ki++) {
       let Ii = select(bi.lo, bi.hi, ki == 1u);
-      let wi = select(bi.wlo, bi.whi, ki == 1u);
-      if (wi == 0.0) { continue; }
+      let wk = w[ki + 2u * kj];
+      if (wk == 0.0) { continue; }
       let c = u32(levelNode(C, fc.z, i32(Ii), i32(J)));
-      s += wi * wj * vecIn[c].xyz;
+      s += wk * vecIn[c].xyz;
     }
   }
   vecOut[a] = vec4<f32>(vecOut[a].xyz + s, 0.0);
