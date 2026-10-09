@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 
 refs
+
+# Generated reference captures, numerical traces, and benchmark output
+artifacts/

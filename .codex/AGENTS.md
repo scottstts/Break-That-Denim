@@ -83,6 +83,17 @@ renderer.setDrawingBufferSize(
 );
 ```
 
+## Decision Resolution
+
+I laid the ground for the build out, that include docs, the reference material, and any other useful artifacts and materials:
+
+- docs/design.md is the central design of the project. It is not beyond reproach, but it is very robust. so unless you have clear and concrete evidence that suggests otherwise, you should follow it
+- others in docs/. useful to understand how the decisions were made, what study has been done for this project, details of the project (will have these docs during implementaton)
+- refs/. This is the direct outcome i expect from this project
+- others such as tools or other artifacts
+
+When you have genuinely difficult decisions during implementation, you should consult these in this order: 1. reference clip. 2. design docs and other docs. Do not rush into decisions, make sure eveything you do is solid and concrete
+
 ## General Expectations
 
 Make substantial changes when needed rather than protecting weak existing work.
