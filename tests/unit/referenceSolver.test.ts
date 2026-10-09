@@ -122,16 +122,16 @@ describe('reference solver dynamics', () => {
     const s = new ReferenceSolver(scene, { h: 1 / 240, gravity: [0, 0, -9.81], newtonIterations: 2, pcgIterations: 4 });
     for (let k = 0; k < 240; k++) s.substep();
     let maxV = 0;
-    let minZ = 0;
+    let maxAbsZ = 0;
     for (let n = 0; n < s.N; n++) {
       maxV = Math.max(maxV, Math.hypot(s.v[3 * n], s.v[3 * n + 1], s.v[3 * n + 2]));
-      minZ = Math.min(minZ, s.x[3 * n + 2]);
+      maxAbsZ = Math.max(maxAbsZ, Math.abs(s.x[3 * n + 2]));
       expect(Number.isFinite(s.x[3 * n + 2])).toBe(true);
     }
-    expect(maxV).toBeLessThan(0.2);
-    // A 20x16 denim coupon sags by at most a few mm, and does fall below the mount plane.
-    expect(minZ).toBeLessThan(0);
-    expect(minZ).toBeGreaterThan(-0.01);
+    // A 20x16 denim coupon is stiff at this scale: it comes to rest within a few mm of the mounts.
+    expect(maxV).toBeLessThan(0.02);
+    expect(maxAbsZ).toBeLessThan(0.005);
+    expect(s.brokenCount).toBe(0);
   });
 
   it('pulling a coupon apart ruptures spans and conserves yarn material length', () => {

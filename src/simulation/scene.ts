@@ -1,4 +1,4 @@
-import { BACKING, DENIM, FAMILY_U, FAMILY_V, crossingMass, type WeaveMaterial } from './material';
+import { DENIM, FAMILY_U, FAMILY_V, bundleWeave, crossingMass, type WeaveMaterial } from './material';
 import { fbm, noise1, rand01, smoothstep } from '../shared/noise';
 
 /**
@@ -9,6 +9,9 @@ import { fbm, noise1, rand01, smoothstep } from '../shared/noise';
  * Global node index = layer.nodeOffset + n. Each node owns segment 2*n + 0 (to (i+1, j), u-family)
  * and 2*n + 1 (to (i, j+1), v-family). Tails are per node and side: [u-, u+, v-, v+].
  */
+
+/** Seed of the shared initial drape perturbation field. */
+const DRAPE_SEED = 101;
 
 export const SEG_EXISTS = 1;
 export const SEG_BROKEN = 2;
@@ -33,7 +36,10 @@ export interface WearSpec {
 }
 
 export interface LayerSpec {
+  /** Woven material of the individual yarns. */
   material: WeaveMaterial;
+  /** Yarns per mechanical lattice span: [warps per column (u), picks per row (v)]; default [1, 1]. */
+  bundle?: [number, number];
   /** Material extent (m). */
   sizeU: number;
   sizeV: number;
@@ -56,7 +62,12 @@ export interface LayerSpec {
 
 export interface LayerInfo {
   index: number;
+  /** Mechanical (bundled) material of the lattice spans. */
   material: WeaveMaterial;
+  /** Individual-yarn material (rendering, yarn identities). */
+  weave: WeaveMaterial;
+  /** Yarns per lattice span: [warps per column (u), picks per row (v)]. */
+  bundle: [number, number];
   nx: number;
   ny: number;
   nodeOffset: number;
@@ -88,6 +99,16 @@ export interface CompiledScene {
   /** Per-node crossing normal force at zero tension (wear-reduced), N. */
   crossingNormal0: Float64Array;
   tails: Float64Array;
+}
+
+/** Content hash of a compiled scene's initial state (validates precomputed drape assets). */
+export function sceneHash(s: CompiledScene): number {
+  let h = 0x811c9dc5;
+  const f = new Float32Array(s.position);
+  const u = new Uint32Array(f.buffer);
+  for (let i = 0; i < u.length; i++) h = Math.imul(h ^ u[i], 0x01000193) >>> 0;
+  for (let i = 0; i < s.segFlags.length; i++) h = Math.imul(h ^ s.segFlags[i], 0x01000193) >>> 0;
+  return h >>> 0;
 }
 
 /** Worley F1/F2 distances for a jittered grid (cell units). */
@@ -141,7 +162,8 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): numb
 }
 
 export function compileLayer(spec: LayerSpec, index: number, nodeOffset: number): { info: LayerInfo } {
-  const m = spec.material;
+  const bundle = spec.bundle ?? [1, 1];
+  const m = bundleWeave(spec.material, bundle[0], bundle[1]);
   const nx = Math.floor(spec.sizeU / m.pitchU) + 1;
   const ny = Math.floor(spec.sizeV / m.pitchV) + 1;
   const c = Math.cos(spec.angle);
@@ -154,7 +176,7 @@ export function compileLayer(spec: LayerSpec, index: number, nodeOffset: number)
   const restCenter: [number, number] = [((nx - 1) * m.pitchU) / 2, ((ny - 1) * m.pitchV) / 2];
   const mapOrigin: [number, number, number] = [0, 0, spec.z];
   return {
-    info: { index, material: m, nx, ny, nodeOffset, nodeCount: nx * ny, mapA, mapOrigin, restCenter },
+    info: { index, material: m, weave: spec.material, bundle, nx, ny, nodeOffset, nodeCount: nx * ny, mapA, mapOrigin, restCenter },
   };
 }
 
@@ -202,7 +224,7 @@ export function restPlanePoint(spec: LayerSpec, info: LayerInfo, u: number, v: n
 }
 
 function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void {
-  const m = spec.material;
+  const m = info.material;
   const { nx, ny, nodeOffset, mapA, mapOrigin, restCenter } = info;
   const mass = crossingMass(m);
   const seed = spec.seed;
@@ -222,10 +244,10 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
       const px = mapOrigin[0] + mapA[0] * du + mapA[1] * dv;
       const py = mapOrigin[1] + mapA[2] * du + mapA[3] * dv;
       const pinned = i < cr || j < cr || i >= nx - cr || j >= ny - cr;
-      // Smooth perturbation seeds buckling; it vanishes at the collar.
-      const edge = Math.min(i, j, nx - 1 - i, ny - 1 - j) - cr;
-      const fadeIn = smoothstep(0, 24, edge);
-      const pz = pinned ? 0 : spec.perturbation * fadeIn * fbm(seed + 101, px / 0.012, py / 0.012, 3);
+      // Smooth out-of-plane seed for buckling. It is one world-space field shared by every layer (same
+      // seed, radial fade) so the stacked plies start parallel at their contact separation.
+      const fadeIn = 1 - smoothstep(0.05, 0.075, Math.hypot(px, py));
+      const pz = pinned ? 0 : spec.perturbation * fadeIn * fbm(DRAPE_SEED, px / 0.012, py / 0.012, 3);
       scene.position[3 * n] = px;
       scene.position[3 * n + 1] = py;
       scene.position[3 * n + 2] = mapOrigin[2] + pz;
@@ -278,78 +300,37 @@ function breakSegmentInitial(scene: CompiledScene, info: LayerInfo, n: number, f
   scene.tails[4 * other + 2 * f] += L * (1 - phi);
 }
 
-/** The authored three-layer coupon (provisional G0 framing). */
+/**
+ * The authored coupon: one warp-faced denim layer mounted at its border. Mechanical spans bundle
+ * 3 warps x 2 picks (near-square 1.14 x 1.16 mm cells). Warps run close to horizontal in view, which
+ * puts the twill lines at ~33 degrees as in the reference. The coupon extends beyond the supported
+ * framing on every side so no mount is ever visible.
+ */
 export function defaultSceneSpecs(): LayerSpec[] {
-  const frontWear: WearSpec = {
-    center: [0.003, -0.002],
-    axis: [1, -1.15],
-    radii: [0.03, 0.019],
-    amount: 1,
-    cellSize: 0.0135,
-    defectThreshold: 0.8,
-    defectDensity: 0.55,
-  };
   return [
     {
       material: DENIM,
-      sizeU: 0.11,
-      sizeV: 0.1,
+      bundle: [3, 2],
+      sizeU: 0.13,
+      sizeV: 0.19,
       z: 0,
-      angle: -0.49,
-      compressU: 0.022,
-      compressV: 0.012,
-      shear: 0.03,
+      angle: Math.PI / 2 + 0.06,
+      compressU: 0.05,
+      compressV: 0.025,
+      shear: 0.06,
       collarRows: 2,
-      wear: frontWear,
+      wear: {
+        center: [0.003, -0.002],
+        axis: [1, -1.15],
+        radii: [0.03, 0.019],
+        amount: 1,
+        cellSize: 0.0135,
+        defectThreshold: 0.8,
+        defectDensity: 0.55,
+      },
       wearStrengthLoss: [0.55, 0.93],
       seed: 1001,
-      perturbation: 0.6e-3,
-    },
-    {
-      material: BACKING,
-      sizeU: 0.11,
-      sizeV: 0.1,
-      z: -0.85e-3,
-      angle: 0.3,
-      compressU: 0.02,
-      compressV: 0.016,
-      shear: 0.02,
-      collarRows: 2,
-      wear: {
-        center: [0.006, -0.004],
-        axis: [1, -0.6],
-        radii: [0.02, 0.014],
-        amount: 0.75,
-        cellSize: 0,
-        defectThreshold: 2,
-        defectDensity: 0,
-      },
-      wearStrengthLoss: [0.65, 0.65],
-      seed: 2002,
-      perturbation: 0.5e-3,
-    },
-    {
-      material: DENIM,
-      sizeU: 0.11,
-      sizeV: 0.1,
-      z: -1.7e-3,
-      angle: -0.62,
-      compressU: 0.018,
-      compressV: 0.018,
-      shear: 0.01,
-      collarRows: 2,
-      wear: {
-        center: [0.008, -0.006],
-        axis: [1, 0.3],
-        radii: [0.016, 0.012],
-        amount: 0.45,
-        cellSize: 0,
-        defectThreshold: 2,
-        defectDensity: 0,
-      },
-      wearStrengthLoss: [0.4, 0.7],
-      seed: 3003,
-      perturbation: 0.5e-3,
+      perturbation: 0.8e-3,
     },
   ];
 }

@@ -1,7 +1,7 @@
 import { axialEnergyDensity, damagedResponse, isSeparated } from '../axial';
 import { FAMILY_U } from '../material';
 import { SEG_BROKEN, SEG_EXISTS, type CompiledScene, type LayerInfo } from '../scene';
-import { newtonStepPCG } from './newtonMultigrid';
+import { newtonStepPCG, resetLaggedLevels, type MGConfig } from './newtonMultigrid';
 
 /**
  * Double-precision reference mechanics: the incremental potential, its gradient, the projected
@@ -16,6 +16,22 @@ export interface SolverParams {
   gravity: [number, number, number];
   newtonIterations: number;
   pcgIterations: number;
+  /** Multigrid schedule (defaults to MG_DEFAULTS). */
+  mg?: MGConfig;
+}
+
+/**
+ * Finite-patch grip mirroring interact.wgsl: each node is pulled toward goal + offset by a quadratic
+ * spring of stiffness k * w (the caller bounds the force by limiting the goal's lead, see GRIP).
+ */
+export interface ReferenceGrip {
+  nodes: Int32Array;
+  w: Float64Array;
+  /** Per entry rest offset from the goal (3 per entry). */
+  offset: Float64Array;
+  goal: [number, number, number];
+  /** Stiffness per unit weight, N/m. */
+  k: number;
 }
 
 export const DEFAULT_PARAMS: SolverParams = { h: 1 / 240, gravity: [0, 0, -9.81], newtonIterations: 2, pcgIterations: 4 };
@@ -35,6 +51,18 @@ export class ReferenceSolver {
   readonly maxExt: Float64Array;
   readonly segFlags: Uint8Array;
   readonly tails: Float64Array;
+  /** History updates (cohesive damage, crossing slip). Off only while settling an authored drape. */
+  historyEnabled = true;
+  /**
+   * Largest Newton update (m) at either end of a span above which its history is not advanced this
+   * substep: unconverged iterates must not commit damage (Infinity disables the gate).
+   */
+  historyTolerance = Infinity;
+  /** Norm of each node's last Newton update in the current substep. */
+  readonly lastUpdate: Float64Array;
+  /** Active grip, if any (see setGrip). */
+  grip: ReferenceGrip | null = null;
+  private gripIndex: Int32Array;
   /** Spans separated by cohesive failure since construction. */
   brokenCount = 0;
   /** Spans released because a yarn slid out of a crossing. */
@@ -61,6 +89,8 @@ export class ReferenceSolver {
     this.tails = Float64Array.from(scene.tails);
     this.nbr = new Int32Array(4 * N).fill(-1);
     this.layerOf = new Uint8Array(N);
+    this.gripIndex = new Int32Array(N).fill(-1);
+    this.lastUpdate = new Float64Array(N);
     for (const L of scene.layers) {
       for (let j = 0; j < L.ny; j++) {
         for (let i = 0; i < L.nx; i++) {
@@ -73,6 +103,70 @@ export class ReferenceSolver {
         }
       }
     }
+  }
+
+  setGrip(grip: ReferenceGrip | null): void {
+    if (this.grip) for (const n of this.grip.nodes) this.gripIndex[n] = -1;
+    this.grip = grip;
+    if (grip) grip.nodes.forEach((n, k) => (this.gripIndex[n] = k));
+  }
+
+  /**
+   * Implicit normal air drag of node n: coefficient c A / h and the unit normal of the accepted
+   * state from lattice neighbours (mirrors airNormal in assemble.wgsl). Energy 1/2 c (n . dx)^2.
+   */
+  airDrag(n: number): [number, number[]] {
+    const L = this.layer(n);
+    const m = L.material;
+    if (!(m.airDrag > 0)) return [0, [0, 0, 0]];
+    const nb = this.nbr;
+    const a = nb[4 * n] >= 0 ? nb[4 * n] : n;
+    const b = nb[4 * n + 1] >= 0 ? nb[4 * n + 1] : n;
+    const d = nb[4 * n + 2] >= 0 ? nb[4 * n + 2] : n;
+    const e = nb[4 * n + 3] >= 0 ? nb[4 * n + 3] : n;
+    const x = this.x;
+    const t1 = [x[3 * b] - x[3 * a], x[3 * b + 1] - x[3 * a + 1], x[3 * b + 2] - x[3 * a + 2]];
+    const t2 = [x[3 * e] - x[3 * d], x[3 * e + 1] - x[3 * d + 1], x[3 * e + 2] - x[3 * d + 2]];
+    const c = [t1[1] * t2[2] - t1[2] * t2[1], t1[2] * t2[0] - t1[0] * t2[2], t1[0] * t2[1] - t1[1] * t2[0]];
+    const len = Math.hypot(c[0], c[1], c[2]);
+    if (len <= 1e-12) return [0, [0, 0, 0]];
+    return [(m.airDrag * m.pitchU * m.pitchV) / this.params.h, [c[0] / len, c[1] / len, c[2] / len]];
+  }
+
+  /** Grip gradient of node n added to g; returns its isotropic stiffness (0 when not gripped). */
+  gripTerm(n: number, g: Float64Array): number {
+    const k = this.gripIndex[n];
+    const G = this.grip;
+    if (k < 0 || !G) return 0;
+    const kg = G.k * G.w[k];
+    for (let q = 0; q < 3; q++) g[q] += kg * (this.x[3 * n + q] + this.dx[3 * n + q] - (G.goal[q] + G.offset[3 * k + q]));
+    return kg;
+  }
+
+  /** Grip energy of node n at the current iterate. */
+  gripEnergy(n: number): number {
+    const k = this.gripIndex[n];
+    const G = this.grip;
+    if (k < 0 || !G) return 0;
+    let l2 = 0;
+    for (let q = 0; q < 3; q++) {
+      const d = this.x[3 * n + q] + this.dx[3 * n + q] - (G.goal[q] + G.offset[3 * k + q]);
+      l2 += d * d;
+    }
+    return 0.5 * G.k * G.w[k] * l2;
+  }
+
+  /** Weighted centroid of the gripped material minus the goal offsets (where the handle "is"). */
+  gripCentroid(): [number, number, number] | null {
+    const G = this.grip;
+    if (!G) return null;
+    const c: [number, number, number] = [0, 0, 0];
+    let W = 0;
+    G.nodes.forEach((n, k) => {
+      for (let q = 0; q < 3; q++) c[q] += G.w[k] * (this.x[3 * n + q] - G.offset[3 * k + q]);
+      W += G.w[k];
+    });
+    return [c[0] / W, c[1] / W, c[2] / W];
   }
 
   layer(n: number): LayerInfo {
@@ -212,6 +306,12 @@ export class ReferenceSolver {
     const h = this.params.h;
     const w = this.scene.mass[n] / (h * h);
     for (let q = 0; q < 3; q++) g[q] += w * (this.dx[3 * n + q] - this.pred[3 * n + q]);
+    this.gripTerm(n, g);
+    const [cd, nn] = this.airDrag(n);
+    if (cd > 0) {
+      const dn = nn[0] * this.dx[3 * n] + nn[1] * this.dx[3 * n + 1] + nn[2] * this.dx[3 * n + 2];
+      for (let q = 0; q < 3; q++) g[q] += cd * dn * nn[q];
+    }
     for (let f = 0; f < 2; f++) {
       const sPrev = this.seg(n, f, -1);
       const sNext = this.seg(n, f, 1);
@@ -240,6 +340,94 @@ export class ReferenceSolver {
     }
   }
 
+  /**
+   * Change of the incremental potential along direction d for each step length in `alphas`, as a sum
+   * of per-term differences (mirrors energy.wgsl, including its trapezoid rule for the damaged axial
+   * force law and the quadratic models of the grip and drag terms).
+   */
+  energyChange(d: Float64Array, alphas: number[]): number[] {
+    const out = alphas.map(() => 0);
+    const h = this.params.h;
+    const x = this.x;
+    const dx = this.dx;
+    const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const vec = (arr: Float64Array, n: number) => [arr[3 * n], arr[3 * n + 1], arr[3 * n + 2]];
+    const dirOf = (n: number) => (this.scene.pinned[n] ? [0, 0, 0] : vec(d, n));
+    const quad = (gd: number, q: number) => alphas.forEach((a, k) => (out[k] += a * gd + 0.5 * a * a * q));
+    const lenChange = (e0: number[], de: number[], a: number, l0: number): [number, number] => {
+      const ea = [e0[0] + a * de[0], e0[1] + a * de[1], e0[2] + a * de[2]];
+      const la = Math.hypot(ea[0], ea[1], ea[2]);
+      return [(2 * a * dot(e0, de) + a * a * dot(de, de)) / Math.max(la + l0, 1e-12), la];
+    };
+    const g = new Float64Array(3);
+    for (let n = 0; n < this.N; n++) {
+      if (this.scene.pinned[n]) continue;
+      const dn = vec(d, n);
+      const d0 = vec(dx, n);
+      const w = this.scene.mass[n] / (h * h);
+      quad(w * (dn[0] * (d0[0] - this.pred[3 * n]) + dn[1] * (d0[1] - this.pred[3 * n + 1]) + dn[2] * (d0[2] - this.pred[3 * n + 2])), w * dot(dn, dn));
+      g.fill(0);
+      const kg = this.gripTerm(n, g);
+      if (kg > 0) quad(g[0] * dn[0] + g[1] * dn[1] + g[2] * dn[2], kg * dot(dn, dn));
+      const [cd, nn] = this.airDrag(n);
+      if (cd > 0) quad(cd * dot(nn, d0) * dot(nn, dn), cd * dot(nn, dn) * dot(nn, dn));
+      const mat = this.layer(n).material;
+      for (let f = 0; f < 2; f++) {
+        const yarn = mat.yarns[f];
+        const next = this.nbr[4 * n + 2 * f + 1];
+        const s = 2 * n + f;
+        if (next >= 0 && this.segActive(s)) {
+          const L = this.restLength[s];
+          const en = [x[3 * next] - x[3 * n], x[3 * next + 1] - x[3 * n + 1], x[3 * next + 2] - x[3 * n + 2]];
+          const ec = [en[0] + dx[3 * next] - d0[0], en[1] + dx[3 * next + 1] - d0[1], en[2] + dx[3 * next + 2] - d0[2]];
+          const db = dirOf(next);
+          const de = [db[0] - dn[0], db[1] - dn[1], db[2] - dn[2]];
+          const l0 = Math.hypot(ec[0], ec[1], ec[2]);
+          const ln = Math.hypot(en[0], en[1], en[2]);
+          const T0 = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], l0 / L - 1)[0];
+          const c = yarn.axialViscosity / (L * h);
+          alphas.forEach((a, k) => {
+            const [dl, la] = lenChange(ec, de, a, l0);
+            const Ta = damagedResponse(yarn, L, this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], la / L - 1)[0];
+            out[k] += 0.5 * (T0 + Ta) * dl + 0.5 * c * dl * (la + l0 - 2 * ln);
+          });
+        }
+        const prev = this.nbr[4 * n + 2 * f];
+        if (prev >= 0 && next >= 0 && this.segActive(2 * prev + f) && this.segActive(s)) {
+          const [ke, kd] = this.bendCoeffs(n, f, 2 * prev + f, s);
+          const rn = [0, 1, 2].map((q) => x[3 * prev + q] - 2 * x[3 * n + q] + x[3 * next + q]);
+          const r0 = [0, 1, 2].map((q) => rn[q] + dx[3 * prev + q] - 2 * d0[q] + dx[3 * next + q]);
+          const dp = dirOf(prev);
+          const dq = dirOf(next);
+          const dr = [0, 1, 2].map((q) => dp[q] - 2 * dn[q] + dq[q]);
+          quad(ke * dot(r0, dr) + kd * dot([r0[0] - rn[0], r0[1] - rn[1], r0[2] - rn[2]], dr), (ke + kd) * dot(dr, dr));
+        }
+      }
+      if (this.cellActive(n)) {
+        const r = this.nbr[4 * n + 1];
+        const t = this.nbr[4 * n + 3];
+        const rt = this.nbr[4 * r + 3];
+        const Ld = this.shearRest(n);
+        const ks = mat.shearStiffness;
+        for (const [p, q] of [
+          [n, rt],
+          [r, t],
+        ]) {
+          const ec = [0, 1, 2].map((z) => x[3 * q + z] + dx[3 * q + z] - x[3 * p + z] - dx[3 * p + z]);
+          const dq = dirOf(q);
+          const dp = dirOf(p);
+          const de = [dq[0] - dp[0], dq[1] - dp[1], dq[2] - dp[2]];
+          const l0 = Math.hypot(ec[0], ec[1], ec[2]);
+          alphas.forEach((a, k) => {
+            const [dl, la] = lenChange(ec, de, a, l0);
+            out[k] += 0.5 * ks * dl * (la + l0 - 2 * Ld);
+          });
+        }
+      }
+    }
+    return out;
+  }
+
   /** Total incremental potential at the current dx (history-free material assumed), for verification. */
   potential(): number {
     const h = this.params.h;
@@ -251,6 +439,10 @@ export class ReferenceSolver {
         const d = this.dx[3 * n + q] - this.pred[3 * n + q];
         E += w * d * d;
       }
+      E += this.gripEnergy(n);
+      const [cd, nn] = this.airDrag(n);
+      const dn = nn[0] * this.dx[3 * n] + nn[1] * this.dx[3 * n + 1] + nn[2] * this.dx[3 * n + 2];
+      E += 0.5 * cd * dn * dn;
     }
     for (let s = 0; s < 2 * this.N; s++) {
       if (!this.segActive(s)) continue;
@@ -303,6 +495,7 @@ export class ReferenceSolver {
    * boundary layer whose geometric stiffness Newton recovers only slowly.
    */
   predict(): void {
+    resetLaggedLevels(this);
     const { h, gravity } = this.params;
     for (let n = 0; n < this.N; n++) {
       const pinned = this.scene.pinned[n];
@@ -316,7 +509,7 @@ export class ReferenceSolver {
 
   substep(): void {
     this.predict();
-    for (let it = 0; it < this.params.newtonIterations; it++) newtonStepPCG(this, this.params.pcgIterations);
+    for (let it = 0; it < this.params.newtonIterations; it++) newtonStepPCG(this, this.params.pcgIterations, this.params.mg);
     this.finalize();
   }
 
@@ -328,6 +521,7 @@ export class ReferenceSolver {
       this.x[q] += this.dx[q];
       this.dx[q] = 0;
     }
+    if (!this.historyEnabled) return;
     this.updateDamage();
     this.updateSlip();
   }
@@ -352,6 +546,7 @@ export class ReferenceSolver {
   updateDamage(): void {
     for (let s = 0; s < 2 * this.N; s++) {
       if (!this.segActive(s)) continue;
+      if (Math.max(this.lastUpdate[s >> 1], this.lastUpdate[this.segOther(s)]) > this.historyTolerance) continue;
       const ext = this.segLength(s) - this.restLength[s];
       if (ext > this.maxExt[s]) this.maxExt[s] = ext;
       const yarn = this.layer(s >> 1).material.yarns[s & 1];
@@ -415,7 +610,7 @@ export class ReferenceSolver {
     if (cnt === 0) return; // no crossing yarn holds this one here
     tc /= cnt;
     const mat = this.layer(n).material;
-    const Fc = mat.crossingFriction * (this.scene.crossingNormal0[n] + mat.crossingWrap * tc);
+    const Fc = mat.crossingFriction * (this.scene.crossingNormal0[n] + mat.crossingWrap * (mat.yarns[f].yarnsPerSpan ?? 1) * tc);
     const dT = Math.max(TR, 0) - Math.max(TL, 0);
     if (Math.abs(dT) <= Fc) return;
     const highR = dT > 0;

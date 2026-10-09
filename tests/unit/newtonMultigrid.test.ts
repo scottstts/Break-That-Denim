@@ -6,7 +6,7 @@ import {
   buildProlongation,
   galerkin,
   offsetIndex,
-  smoothZebra,
+  smoothLines,
   solvePenta,
   STENCIL,
   vcycle,
@@ -167,7 +167,7 @@ describe('Newton multigrid building blocks', () => {
     };
     const x = new Float64Array(3 * A.N);
     const r0 = norm(x);
-    smoothZebra(A, x, b);
+    smoothLines(A, x, b);
     expect(norm(x)).toBeLessThan(r0);
     const levels = buildHierarchy(A);
     expect(levels.length).toBeGreaterThan(2);

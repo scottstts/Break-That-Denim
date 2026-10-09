@@ -1,6 +1,7 @@
 import { damagedResponse } from '../axial';
 import { FAMILY_U } from '../material';
 import type { LayerInfo } from '../scene';
+import { bracket, coarsenLayers, shouldCoarsen, type LatticeLayer } from '../lattice';
 import type { ReferenceSolver } from './solver';
 
 /**
@@ -15,16 +16,29 @@ import type { ReferenceSolver } from './solver';
  * leave for the 4th-order bending operator.
  */
 
+/** Multigrid schedule (mirrored by the GPU solver). */
+export interface MGConfig {
+  /** Coarsen while a level has more nodes than this (the coarsest level is the first at or below it). */
+  maxCoarsestNodes: number;
+  /** Line-smoothing sweeps on the coarsest level. */
+  coarseSweeps: number;
+  /** Line colors per family: 3 (no same-color coupling) or 2 (+-2 cross-line couplings majorized). */
+  lineColors: 2 | 3;
+  /**
+   * Reuse the coarse Galerkin levels built at a substep's first Newton iteration for its later
+   * iterations (only the fine operator is reassembled). The preconditioner stays SPD.
+   */
+  lagCoarse?: boolean;
+  /** Choose the step length among {1, 1/2, 1/4} by the incremental potential (descent safeguard). */
+  lineSearch?: boolean;
+}
+
+export const MG_DEFAULTS: MGConfig = { maxCoarsestNodes: 48, coarseSweeps: 6, lineColors: 3 };
+
 export const STENCIL = 25;
 export const CENTER = 12;
 export function offsetIndex(di: number, dj: number): number {
   return (dj + 2) * 5 + (di + 2);
-}
-
-export interface LatticeLayer {
-  nx: number;
-  ny: number;
-  offset: number;
 }
 
 export class StencilOperator {
@@ -128,6 +142,15 @@ function scatterPair(A: StencilOperator, a: number, b: number, H: Float64Array):
 
 const I3 = new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 
+/**
+ * Transverse (geometric) stiffness magnitude kept in the solver Hessian for a two-node term with
+ * tension f: clamp (max(f, 0)) or absolute-value projection (|f|). Development switch for studies.
+ */
+export const HESSIAN = { absProjection: false };
+function geomStiff(f: number): number {
+  return HESSIAN.absProjection ? Math.abs(f) : Math.max(f, 0);
+}
+
 /** Assemble the projected Hessian of the reference solver's incremental potential at its current dx. */
 export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
   const layers: LatticeLayer[] = S.scene.layers.map((L: LayerInfo) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
@@ -139,8 +162,16 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       A.addBlock(n, CENTER, 1, I3);
     }
   }
+  const gTmp = new Float64Array(3);
   for (let n = 0; n < S.N; n++) {
-    if (!A.fixed[n]) A.addBlock(n, CENTER, S.scene.mass[n] / (h * h), I3);
+    if (A.fixed[n]) continue;
+    A.addBlock(n, CENTER, S.scene.mass[n] / (h * h) + S.gripTerm(n, gTmp), I3);
+    const [cd, nn] = S.airDrag(n);
+    if (cd > 0) {
+      const B = new Float64Array(9);
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) B[3 * r + c] = cd * nn[r] * nn[c];
+      A.addBlock(n, CENTER, 1, B);
+    }
   }
   const H = new Float64Array(9);
   const e = new Float64Array(3);
@@ -163,7 +194,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
     const ln = S.segLength(s);
     const c = yarn.axialViscosity / (L * h);
     const fs = T + c * (l - ln);
-    axialBlock(Math.max(K, 0) / L + c, Math.max(fs, 0) / l, e, H);
+    axialBlock(Math.max(K, 0) / L + c, geomStiff(fs) / l, e, H);
     scatterPair(A, a, b, H);
   }
   // bending triples (a, b, c) along each family: block coefficients k * [1,-2,1]^T [1,-2,1]
@@ -214,7 +245,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       }
       l = Math.sqrt(l);
       for (let z = 0; z < 3; z++) pa[z] /= l;
-      axialBlock(ks, Math.max(ks * (l - Ld), 0) / l, pa, H);
+      axialBlock(ks, geomStiff(ks * (l - Ld)) / l, pa, H);
       scatterPair(A, p, q, H);
     }
   }
@@ -227,49 +258,19 @@ export interface Prolongation {
   w: Float64Array;
 }
 
-function coarseList(n: number): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < n - 1; i += 2) out.push(i);
-  out.push(n - 1);
-  return out;
-}
-
-function bracket(ci: number[], i: number): Array<[number, number]> {
-  let lo = Math.min(ci.length - 1, Math.floor(i / 2));
-  while (lo > 0 && ci[lo] > i) lo--;
-  while (lo + 1 < ci.length && ci[lo + 1] <= i) lo++;
-  if (ci[lo] === i) return [[lo, 1]];
-  const a = ci[lo];
-  const b = ci[lo + 1];
-  return [
-    [lo, (b - i) / (b - a)],
-    [lo + 1, (i - a) / (b - a)],
-  ];
-}
-
 /** Coarse lattice layout and bilinear prolongation for one coarsening of `fine`. */
 export function buildProlongation(fine: StencilOperator): { coarse: LatticeLayer[]; P: Prolongation } {
-  const coarse: LatticeLayer[] = [];
-  let off = 0;
-  const lists: Array<[number[], number[]]> = [];
-  for (const L of fine.layers) {
-    const ci = coarseList(L.nx);
-    const cj = coarseList(L.ny);
-    lists.push([ci, cj]);
-    coarse.push({ nx: ci.length, ny: cj.length, offset: off });
-    off += ci.length * cj.length;
-  }
+  const coarse = coarsenLayers(fine.layers);
   const P: Prolongation = { idx: new Int32Array(4 * fine.N).fill(-1), w: new Float64Array(4 * fine.N) };
   for (let l = 0; l < fine.layers.length; l++) {
     const L = fine.layers[l];
     const C = coarse[l];
-    const [ci, cj] = lists[l];
     for (let j = 0; j < L.ny; j++) {
-      const bj = bracket(cj, j);
+      const bj = bracket(j, L.ny);
       for (let i = 0; i < L.nx; i++) {
         const f = L.offset + j * L.nx + i;
         if (fine.fixed[f]) continue;
-        const bi = bracket(ci, i);
+        const bi = bracket(i, L.nx);
         let k = 0;
         for (const [J, wj] of bj) {
           for (const [I, wi] of bi) {
@@ -403,10 +404,10 @@ export interface MGLevel {
   P?: Prolongation;
 }
 
-export function buildHierarchy(fine: StencilOperator, minNodes = 48): MGLevel[] {
+export function buildHierarchy(fine: StencilOperator, cfg: MGConfig = MG_DEFAULTS): MGLevel[] {
   const levels: MGLevel[] = [{ A: fine }];
   let cur = fine;
-  while (cur.layers.every((L) => L.nx * L.ny > minNodes && L.nx >= 5 && L.ny >= 5)) {
+  while (cur.N > cfg.maxCoarsestNodes && shouldCoarsen(cur.layers)) {
     const { coarse, P } = buildProlongation(cur);
     const C = galerkin(cur, coarse, P);
     levels[levels.length - 1].P = P;
@@ -416,15 +417,15 @@ export function buildHierarchy(fine: StencilOperator, minNodes = 48): MGLevel[] 
   return levels;
 }
 
-export type Smoother = (A: StencilOperator, x: Float64Array, b: Float64Array, reverse?: boolean) => void;
+export type Smoother = (A: StencilOperator, x: Float64Array, b: Float64Array, reverse?: boolean, colors?: 2 | 3) => void;
 
-export function vcycle(levels: MGLevel[], k: number, x: Float64Array, b: Float64Array, pre = 1, post = 1, coarseSweeps = 6, sm: Smoother = smoothZebra): void {
+export function vcycle(levels: MGLevel[], k: number, x: Float64Array, b: Float64Array, pre = 1, post = 1, coarseSweeps = 6, sm: Smoother = smoothLines, colors: 2 | 3 = 3): void {
   const { A, P } = levels[k];
   if (!P) {
-    for (let s = 0; s < coarseSweeps; s++) sm(A, x, b, (s & 1) === 1);
+    for (let s = 0; s < coarseSweeps; s++) sm(A, x, b, (s & 1) === 1, colors);
     return;
   }
-  for (let s = 0; s < pre; s++) sm(A, x, b);
+  for (let s = 0; s < pre; s++) sm(A, x, b, false, colors);
   const Ax = new Float64Array(3 * A.N);
   A.apply(x, Ax);
   const C = levels[k + 1].A;
@@ -440,7 +441,7 @@ export function vcycle(levels: MGLevel[], k: number, x: Float64Array, b: Float64
   }
   for (let c = 0; c < C.N; c++) if (C.fixed[c]) rc[3 * c] = rc[3 * c + 1] = rc[3 * c + 2] = 0;
   const xc = new Float64Array(3 * C.N);
-  vcycle(levels, k + 1, xc, rc, pre, post, coarseSweeps, sm);
+  vcycle(levels, k + 1, xc, rc, pre, post, coarseSweeps, sm, colors);
   for (let f = 0; f < A.N; f++) {
     if (A.fixed[f]) continue;
     for (let kk = 0; kk < 4; kk++) {
@@ -450,7 +451,7 @@ export function vcycle(levels: MGLevel[], k: number, x: Float64Array, b: Float64
       for (let q = 0; q < 3; q++) x[3 * f + q] += w * xc[3 * c + q];
     }
   }
-  for (let s = 0; s < post; s++) sm(A, x, b, true);
+  for (let s = 0; s < post; s++) sm(A, x, b, true, colors);
 }
 
 function dot(a: Float64Array, b: Float64Array): number {
@@ -460,7 +461,15 @@ function dot(a: Float64Array, b: Float64Array): number {
 }
 
 /** Preconditioned CG on A x = b with one symmetric V-cycle as preconditioner. */
-export function pcg(levels: MGLevel[], b: Float64Array, x: Float64Array, iterations: number, onIter?: (x: Float64Array) => void, sm: Smoother = smoothZebra): void {
+export function pcg(
+  levels: MGLevel[],
+  b: Float64Array,
+  x: Float64Array,
+  iterations: number,
+  onIter?: (x: Float64Array) => void,
+  sm: Smoother = smoothLines,
+  cfg: MGConfig = MG_DEFAULTS,
+): void {
   const A = levels[0].A;
   const n = b.length;
   const r = new Float64Array(n);
@@ -469,7 +478,7 @@ export function pcg(levels: MGLevel[], b: Float64Array, x: Float64Array, iterati
   for (let q = 0; q < n; q++) r[q] = b[q] - Ap[q];
   for (let m = 0; m < A.N; m++) if (A.fixed[m]) r[3 * m] = r[3 * m + 1] = r[3 * m + 2] = 0;
   const z = new Float64Array(n);
-  vcycle(levels, 0, z, r, 1, 1, 6, sm);
+  vcycle(levels, 0, z, r, 1, 1, cfg.coarseSweeps, sm, cfg.lineColors);
   const p = Float64Array.from(z);
   let rz = dot(r, z);
   for (let it = 0; it < iterations; it++) {
@@ -485,7 +494,7 @@ export function pcg(levels: MGLevel[], b: Float64Array, x: Float64Array, iterati
     onIter?.(x);
     if (it + 1 === iterations) break;
     z.fill(0);
-    vcycle(levels, 0, z, r, 1, 1, 6, sm);
+    vcycle(levels, 0, z, r, 1, 1, cfg.coarseSweeps, sm, cfg.lineColors);
     const rz2 = dot(r, z);
     const beta = rz2 / rz;
     rz = rz2;
@@ -494,7 +503,14 @@ export function pcg(levels: MGLevel[], b: Float64Array, x: Float64Array, iterati
 }
 
 /** One projected-Newton iteration solved by PCG with a V-cycle preconditioner. Returns max |step|. */
-export function newtonStepPCG(S: ReferenceSolver, pcgIterations: number): number {
+const lagged = new WeakMap<ReferenceSolver, MGLevel[]>();
+
+/** Forget lagged coarse levels (call at the start of each substep). */
+export function resetLaggedLevels(S: ReferenceSolver): void {
+  lagged.delete(S);
+}
+
+export function newtonStepPCG(S: ReferenceSolver, pcgIterations: number, cfg: MGConfig = MG_DEFAULTS): number {
   const A = assembleFineOperator(S);
   const b = new Float64Array(3 * S.N);
   const g = new Float64Array(3);
@@ -505,14 +521,38 @@ export function newtonStepPCG(S: ReferenceSolver, pcgIterations: number): number
     b[3 * n + 1] = -g[1];
     b[3 * n + 2] = -g[2];
   }
-  const levels = buildHierarchy(A);
+  let levels: MGLevel[];
+  const prev = cfg.lagCoarse ? lagged.get(S) : undefined;
+  if (prev) {
+    levels = [{ A, P: prev[0].P }, ...prev.slice(1)];
+  } else {
+    levels = buildHierarchy(A, cfg);
+    if (cfg.lagCoarse) lagged.set(S, levels);
+  }
   const d = new Float64Array(3 * S.N);
-  pcg(levels, b, d, pcgIterations);
+  pcg(levels, b, d, pcgIterations, undefined, smoothLines, cfg);
+  let alpha = 1;
+  if (cfg.lineSearch) {
+    // step length with the lowest potential among {1, 1/2, 1/4}; 1/8 if none decreases it (energy.wgsl)
+    const e = S.energyChange(d, [1, 0.5, 0.25]);
+    let best = e[0];
+    if (e[1] < best) {
+      alpha = 0.5;
+      best = e[1];
+    }
+    if (e[2] < best) {
+      alpha = 0.25;
+      best = e[2];
+    }
+    if (best > 0) alpha = 0.125;
+  }
   let m = 0;
   for (let q = 0; q < d.length; q++) {
+    d[q] *= alpha;
     S.dx[q] += d[q];
     m = Math.max(m, Math.abs(d[q]));
   }
+  for (let n = 0; n < S.N; n++) S.lastUpdate[n] = Math.hypot(d[3 * n], d[3 * n + 1], d[3 * n + 2]);
   return m;
 }
 
@@ -523,32 +563,27 @@ function frob(B: ArrayLike<number>, o: number): number {
 }
 
 /**
- * Cheaper smoother mirrored by the GPU: zebra coloring (2 colors per family) with exact block
- * tridiagonal line solves. Couplings that are not solved exactly but connect nodes updated in the
- * same pass (+-2 along the line, and lines two apart) are majorized onto the diagonal with
- * ||B||_F I, which keeps every pass a descent step for the SPD system. Couplings to frozen lines
- * are lagged.
+ * Smoother mirrored by the GPU: yarn lines colored modulo 3 per family (lines updated together never
+ * share a stencil coupling), each line solved exactly as a block-tridiagonal system. The +-2 coupling
+ * along the line is majorized onto the diagonal with ||B||_F I (lagged at the old iterate), which keeps
+ * the pass a descent step for the SPD system. Forward/reverse color order gives a symmetric V-cycle.
  */
-export function smoothZebra(A: StencilOperator, x: Float64Array, b: Float64Array, reverse = false): void {
+export function smoothLines(A: StencilOperator, x: Float64Array, b: Float64Array, reverse = false, colors: 2 | 3 = 3): void {
   const maxLen = Math.max(...A.layers.map((L) => Math.max(L.nx, L.ny)));
   const D = new Float64Array(9 * maxLen);
   const E = new Float64Array(9 * maxLen);
   const F = new Float64Array(9 * maxLen);
   const r = new Float64Array(3 * maxLen);
   const sol = new Float64Array(3 * maxLen);
-  const order: Array<[number, number]> = [
-    [1, 0],
-    [1, 1],
-    [0, 0],
-    [0, 1],
-  ];
+  const order: Array<[number, number]> = [];
+  for (const family of [1, 0]) for (let c = 0; c < colors; c++) order.push([family, c]);
   if (reverse) order.reverse();
   for (const [family, color] of order) {
     const xOld = Float64Array.from(x);
     for (const L of A.layers) {
       const lines = family === FAMILY_U ? L.ny : L.nx;
       const len = family === FAMILY_U ? L.nx : L.ny;
-      for (let line = color; line < lines; line += 2) {
+      for (let line = color; line < lines; line += colors) {
         const node = (k: number) => (family === FAMILY_U ? L.offset + line * L.nx + k : L.offset + k * L.nx + line);
         D.fill(0, 0, 9 * len);
         E.fill(0, 0, 9 * len);
@@ -571,37 +606,15 @@ export function smoothZebra(A: StencilOperator, x: Float64Array, b: Float64Array
               const across = family === FAMILY_U ? dj : di;
               if (across === 0 && along === 0) {
                 for (let q = 0; q < 9; q++) D[9 * k + q] += A.A[base + q];
-              } else if (across === 0 && along === 1) {
-                for (let q = 0; q < 9; q++) E[9 * k + q] = A.A[base + q];
-              } else if (across === 0 && along === -1) {
-                // symmetric counterpart of the previous row's E
-              } else if (across === 0 || (across & 1) === 0) {
-                // +-2 along the line, or a line of the same parity: updated simultaneously -> majorize
-                maj += frob(A.A, base);
-              } else {
-                const x0 = xOld[3 * m];
-                const x1 = xOld[3 * m + 1];
-                const x2 = xOld[3 * m + 2];
-                r[3 * k] -= A.A[base] * x0 + A.A[base + 1] * x1 + A.A[base + 2] * x2;
-                r[3 * k + 1] -= A.A[base + 3] * x0 + A.A[base + 4] * x1 + A.A[base + 5] * x2;
-                r[3 * k + 2] -= A.A[base + 6] * x0 + A.A[base + 7] * x1 + A.A[base + 8] * x2;
+                continue;
               }
-            }
-          }
-          // Majorized couplings: the lagged part of a same-pass coupling is (S - B) x_old style;
-          // for a stationary splitting with diagonal S, use x_new*(S) on the left and S*x_old on the right.
-          D[9 * k] += maj;
-          D[9 * k + 4] += maj;
-          D[9 * k + 8] += maj;
-          // contribution of the majorized couplings evaluated at the old iterate: S x_old - B x_old
-          for (let dj = -2; dj <= 2; dj++) {
-            for (let di = -2; di <= 2; di++) {
-              const along = family === FAMILY_U ? di : dj;
-              const across = family === FAMILY_U ? dj : di;
-              if (!((across === 0 && Math.abs(along) === 2) || (across !== 0 && (across & 1) === 0))) continue;
-              const m = A.nbr(n, di, dj);
-              if (m < 0 || A.fixed[m]) continue;
-              const base = (n * STENCIL + offsetIndex(di, dj)) * 9;
+              if (across === 0 && along === 1) {
+                for (let q = 0; q < 9; q++) E[9 * k + q] = A.A[base + q];
+                continue;
+              }
+              if (across === 0 && along === -1) continue;
+              // +-2 along the line, and +-2 across it when those lines share a color, are majorized
+              if (across === 0 || Math.abs(across) === colors) maj += frob(A.A, base);
               const x0 = xOld[3 * m];
               const x1 = xOld[3 * m + 1];
               const x2 = xOld[3 * m + 2];
@@ -610,6 +623,9 @@ export function smoothZebra(A: StencilOperator, x: Float64Array, b: Float64Array
               r[3 * k + 2] -= A.A[base + 6] * x0 + A.A[base + 7] * x1 + A.A[base + 8] * x2;
             }
           }
+          D[9 * k] += maj;
+          D[9 * k + 4] += maj;
+          D[9 * k + 8] += maj;
           r[3 * k] += maj * xOld[3 * n];
           r[3 * k + 1] += maj * xOld[3 * n + 1];
           r[3 * k + 2] += maj * xOld[3 * n + 2];

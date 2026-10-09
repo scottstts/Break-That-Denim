@@ -28,3 +28,37 @@ A rediscretized nonlinear multigrid (FAS/MG-OPT, coarse yarn = 2 fine yarns) gav
 Contact is planned as two-sided node-to-segment penalty terms treated diagonally in the Newton operator (the opposite side detects its own contacts), with OGC-style per-node displacement bounds. This is a simplification of design §10 (no exact reaction coupling in the linear system) and must be revisited in the contact fixtures.
 
 The IPC/ACCD versus AVBD/OGC race (U2) was not run; this structure is candidate A's Newton/PCG with a yarn-aware preconditioner and coarse correction, combined with OGC-style bounds instead of ACCD line-search filtering.
+
+## GPU port: correctness and measured cost
+
+The WGSL port is checked against the f64 reference in `gpu-tests.html` (assembly 5e-6, Galerkin levels <1e-6, V-cycle 2e-5, PCG step 4e-5 relative; 60 coupled substeps drift 1 µm over 2.7 mm of motion).
+
+Measured on the Apple M5 (10 GPU cores), Chrome 152, full three-layer scene (144,761 nodes):
+
+| Item | Cost |
+| --- | --- |
+| Fine residual / matvec (one pass over the operator) | 0.42–0.45 ms (~160 GB/s, i.e. bandwidth-bound) |
+| Assembly + Galerkin hierarchy | ~3.4 ms |
+| Fine line-smoother sweep (6 color passes) | ~2.4 ms |
+| One V-cycle | ~9.6 ms |
+| Substep, 2 Newton × 3 PCG | ~72 ms |
+
+Chrome quantizes timestamp queries to 65.5 µs; per-kernel numbers above are means over repeated dispatches. Kernels are now bandwidth-bound: cost scales with bytes per node per V-cycle (~2.4 KB), not arithmetic. Dispatch overhead is negligible (~1 µs). Layout changes that mattered: self-contained operator rows instead of upper-half storage with scattered lower lookups (assembly+RAP 11.3 → 3.4 ms), and no per-neighbor fixed-flag loads (couplings to fixed nodes are zero by construction).
+
+## Timestep and iteration sweep (U10, provisional)
+
+Scenario: 56×40 denim coupon, a 6×6-node patch lifted 2 mm over 0.15 s, held, released; trajectory error against h = 1/480 s with 3 Newton × 8 PCG.
+
+| h | Newton × PCG | max position error | after release |
+| --- | --- | --- | --- |
+| 1/240 | 2 × 3 | 0.63 mm | matches |
+| 1/240 | 1 × 2 | 3.4 mm | spurious bounce |
+| 1/120 | 2 × 3 | 1.2 mm | close; one spurious rupture |
+| 1/120 | 1 × 2–3 | 3.5 mm | spurious bounce, ruptures |
+| 1/60 | 1–2 × 2–3 | 3.1–3.4 mm | wrong; 4–6 spurious ruptures |
+
+One Newton iteration leaves enough nonlinear residual to inject energy (visible bounce). Damage commits on transient strain, so under-resolved steps also create spurious ruptures. Quality requires two Newton iterations and h ≤ 1/120 s.
+
+## Consequence: full-yarn mechanics everywhere fails the G1 capacity gate
+
+At h = 1/120 the full scene needs ~8.6 s of GPU time per simulated second. Even an optimistic 3× kernel gain leaves it ~3× from natural time, before rendering. Design §3 makes yarn-level everywhere conditional on its cost passing; it does not. The next mechanics step is the design's hybrid: yarn lattice where damage and visible yarn motion occur, a homogenized coarser lattice elsewhere, coupled by linear (prolongation-style) constraints. On this lattice the multigrid hierarchy already provides the homogenized coarse lattice and the bilinear transfer, which makes this a composite-grid problem rather than a separate shell solver.

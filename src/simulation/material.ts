@@ -39,6 +39,8 @@ export interface YarnFamily {
   height: number;
   /** Crimp amplitude: centerline offset from the crossing midplane, m. */
   crimpAmplitude: number;
+  /** Parallel yarns carried by one lattice span of this family (1 for a yarn-level lattice). */
+  yarnsPerSpan?: number;
 }
 
 export interface WeaveMaterial {
@@ -65,6 +67,11 @@ export interface WeaveMaterial {
   thickness: number;
   /** Cloth/cloth kinetic friction coefficient. */
   clothFriction: number;
+  /**
+   * Aerodynamic drag on motion normal to the cloth, N s / m^3 (force per area per normal speed).
+   * Calibrated so a released, sagging coupon settles within about a second.
+   */
+  airDrag: number;
 }
 
 /** Warp-faced 3/1 twill denim. Warp: ring-dyed indigo (optics in the renderer); weft: undyed. */
@@ -86,9 +93,10 @@ export const DENIM: WeaveMaterial = {
       bendViscosity: 2e-3,
       strength: 8.5,
       softeningOpening: 0.12e-3,
-      width: 0.5e-3,
-      height: 0.26e-3,
-      crimpAmplitude: 0.075e-3,
+      // in-fabric (flattened) cross-section; the weft lies low under the warp floats
+      width: 0.4e-3,
+      height: 0.16e-3,
+      crimpAmplitude: 0.0,
     },
     {
       // warp (v-family), ~Ne 7 (84 tex)
@@ -102,9 +110,10 @@ export const DENIM: WeaveMaterial = {
       bendViscosity: 2e-3,
       strength: 11,
       softeningOpening: 0.12e-3,
-      width: 0.4e-3,
-      height: 0.3e-3,
-      crimpAmplitude: 0.07e-3,
+      // flattened in the fabric: warps overlap their neighbours (cover factor above one)
+      width: 0.7e-3,
+      height: 0.26e-3,
+      crimpAmplitude: 0.05e-3,
     },
   ],
   twillRepeat: 4,
@@ -115,6 +124,7 @@ export const DENIM: WeaveMaterial = {
   crossingWrap: 0.3,
   thickness: 0.7e-3,
   clothFriction: 0.45,
+  airDrag: 1.5,
 };
 
 /** Brushed woven backing: denser, thicker, softer, with heavy fibrillation (optics in the renderer). */
@@ -163,9 +173,47 @@ export const BACKING: WeaveMaterial = {
   crossingWrap: 0.3,
   thickness: 1.0e-3,
   clothFriction: 0.55,
+  airDrag: 1.5,
 };
 
 export const MATERIALS: readonly WeaveMaterial[] = [DENIM, BACKING];
+
+/**
+ * Mechanical material of a lattice whose spans are bundles of parallel yarns: `bu` warp yarns per
+ * lattice column (along u) and `bv` picks per lattice row (along v), i.e. bu x bv real crossings
+ * per node. Per-span quantities sum over the bundled yarns; per-yarn intensive quantities (strain
+ * law shape, softening opening, crimp, friction coefficients) are unchanged. Optical/visual fields
+ * (width, height, crimpAmplitude, twill) keep describing the individual yarns.
+ */
+export function bundleWeave(m: WeaveMaterial, bu: number, bv: number = bu): WeaveMaterial {
+  for (const b of [bu, bv]) if (!Number.isInteger(b) || b < 1) throw new Error(`bundle factors must be positive integers, got ${bu}, ${bv}`);
+  if (bu === 1 && bv === 1) return m;
+  // u-family spans (picks) carry bv yarns; v-family spans (warps) carry bu yarns
+  const yarn = (y: YarnFamily, b: number): YarnFamily => ({
+    ...y,
+    linearDensity: b * y.linearDensity,
+    eaLow: b * y.eaLow,
+    eaHigh: b * y.eaHigh,
+    eaCompress: b * y.eaCompress,
+    axialViscosity: b * y.axialViscosity,
+    bendRigidity: b * y.bendRigidity,
+    strength: b * y.strength,
+    yarnsPerSpan: b,
+  });
+  // diagonal spring giving the same in-plane shear modulus scales with (a^2 + c^2) / (a c)
+  const shape = (a: number, c: number) => (a * a + c * c) / (a * c);
+  return {
+    ...m,
+    name: `${m.name}/b${bu}x${bv}`,
+    pitchU: bu * m.pitchU,
+    pitchV: bv * m.pitchV,
+    yarns: [yarn(m.yarns[0], bv), yarn(m.yarns[1], bu)],
+    shearStiffness: (m.shearStiffness * shape(bu * m.pitchU, bv * m.pitchV)) / shape(m.pitchU, m.pitchV),
+    // a sliding bundle passes bu x bv real crossings; the wrap force from the crossing bundle's
+    // tension is scaled by the sliding family's yarn count (Yarn.yarnsPerSpan) where it is applied
+    crossingNormal0: bu * bv * m.crossingNormal0,
+  };
+}
 
 /** Mass lumped at one crossing node: one u-span of weft plus one v-span of warp. */
 export function crossingMass(m: WeaveMaterial): number {

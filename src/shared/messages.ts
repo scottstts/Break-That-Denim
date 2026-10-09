@@ -5,7 +5,13 @@ export type ToEngine =
   | PointerCommand
   | { type: 'wheel'; seq: number; deltaY: number; time: number }
   | { type: 'reset' }
-  | { type: 'visibility'; visible: boolean };
+  | { type: 'visibility'; visible: boolean }
+  | DevCommand;
+
+/** Development-only commands (never sent by the product UI). */
+export type DevCommand =
+  | { type: 'dev'; op: 'step'; substeps: number; id: number }
+  | { type: 'dev'; op: 'camera'; distance?: number; pitch?: number; yaw?: number; target?: [number, number, number]; id: number };
 
 /** Pointer coordinates are in CSS pixels relative to the canvas, with the CSS size alongside. */
 export interface PointerCommand {
@@ -23,7 +29,8 @@ export type FromEngine =
   | { type: 'ready' }
   | { type: 'status'; state: 'loading' | 'running' | 'paused' | 'error'; message?: string }
   | { type: 'cursor'; cursor: 'grab' | 'grabbing' | 'default' }
-  | { type: 'stats'; stats: EngineStats };
+  | { type: 'stats'; stats: EngineStats }
+  | { type: 'devDone'; id: number; result?: unknown };
 
 export interface EngineStats {
   frameMs: number;
@@ -32,4 +39,6 @@ export interface EngineStats {
   gpuMsPerSubstep: number;
   gpuRenderMs: number;
   brokenSegments: number;
+  /** Simulation is asleep (cloth at rest, no interaction). */
+  asleep: boolean;
 }

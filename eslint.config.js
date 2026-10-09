@@ -15,4 +15,8 @@ export default tseslint.config(
       'no-constant-condition': ['error', { checkLoops: false }],
     },
   },
+  {
+    files: ['tools/**/*.{ts,mjs}'],
+    languageOptions: { globals: { ...globals.node } },
+  },
 );

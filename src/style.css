@@ -1,0 +1,72 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #020203;
+}
+
+.stage {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  touch-action: none;
+  cursor: default;
+}
+
+body.loading .stage {
+  opacity: 0;
+}
+
+.stage {
+  transition: opacity 600ms ease;
+}
+
+.status {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  color: rgba(220, 222, 228, 0.78);
+  font: 13px/1.4 system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.01em;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 300ms ease;
+}
+
+.status.visible {
+  opacity: 1;
+}
+
+.reset {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: rgba(225, 228, 235, 0.55);
+  background: rgba(20, 22, 28, 0.35);
+  backdrop-filter: blur(6px);
+  cursor: pointer;
+  transition:
+    color 150ms ease,
+    background 150ms ease;
+}
+
+.reset:hover,
+.reset:focus-visible {
+  color: rgba(240, 242, 248, 0.95);
+  background: rgba(30, 33, 42, 0.6);
+  outline: none;
+}
+
+.reset:focus-visible {
+  box-shadow: 0 0 0 2px rgba(200, 210, 255, 0.5);
+}
