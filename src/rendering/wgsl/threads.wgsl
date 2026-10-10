@@ -4,7 +4,8 @@
 // crossings is one thread, drawn continuously from where it leaves the cloth to where it re-enters it
 // or ends at its own cut (thread.wgsl): every yarn end standing out of an edge, and every longer run
 // (at least MIN_RUN crossings) held at both ends. A shorter run held at both ends (a worn-through
-// float of the twill) stays part of the cloth surface.
+// float of the twill) stays part of the cloth surface. A run ends where its bundle no longer holds in
+// the mechanics (emitSplit).
 //
 // Per crossing and family, in order:
 //  - present: the field has not separated the yarn segment (cut, or pulled out: the end slid away from
@@ -256,6 +257,62 @@ fn yarnState(c: u32, f: u32) -> u32 {
   return select(1u, 2u, clothAt(c));
 }
 
+// Append run [pos, pos + n) of a yarn (family f, cross index yarn) with its ends (0 held in the cloth,
+// 1 free, 2 the field's border). A piece cut free at both ends has nothing holding it: it has fallen.
+fn emitRun(l: u32, f: u32, yarn: u32, pos: u32, n: u32, endA: u32, endB: u32) {
+  if (n == 0u || (endA == 1u && endB == 1u)) { return; }
+  let r = atomicAdd(&threadCount[0], 1u);
+  if (r >= MAX_RUNS) { return; }
+  runs[r] = vec4<u32>(l | (f << 4u) | (endA << 5u) | (endB << 7u), yarn | (pos << 16u), n, 0u);
+  // drawn over n + 1 crossings: half a crossing beyond each end (into the weave, or to the cut)
+  let nc = n / CHUNK + 1u;
+  let c0 = atomicAdd(&threadCount[1], nc);
+  for (var q = 0u; q < nc; q++) {
+    if (c0 + q < MAX_CHUNKS) { chunks[c0 + q] = (r << 10u) | q; }
+  }
+}
+
+// The run as the mechanics holds it. A bundle span that no longer holds (every yarn in it separated,
+// or the bundle slipped out of a crossing) carries no yarn across it: its material went to the two
+// nodes as tails, split at the span's failure site (yarnfield.wgsl couple). A yarn of that bundle may
+// still be uncut along its own lone run (its cut lies just past where it is held), but nothing joins
+// its two sides any more: the run ends there, each part hanging from its own side. Drawing it held at
+// both ends would bridge an opening the mechanics opened, straight through whatever lies between.
+fn emitSplit(l: u32, f: u32, yarn: u32, pos: u32, n: u32, endA: u32, endB: u32) {
+  // a yarn with a free end already hangs from its held side (thread_geom.wgsl runCenter)
+  if (endA == 1u || endB == 1u) {
+    emitRun(l, f, yarn, pos, n, endA, endB);
+    return;
+  }
+  let LR = R.layers[l];
+  let L = LR.lattice;
+  let bu = bundleOf(LR, 1u);
+  let bv = bundleOf(LR, 0u);
+  let Bal = select(bv, bu, f == 0u);
+  let Bcr = select(bu, bv, f == 0u);
+  let len = select(L.z, L.y, f == 0u);
+  let b = yarn / Bcr;
+  // crossings the drawn run covers, held ends included
+  let lo = select(pos, pos - 1u, endA == 0u && pos > 0u);
+  let hi = select(pos + n - 1u, pos + n, endB == 0u);
+  let half = Bal / 2u;
+  let a0 = select(0u, (lo - half) / Bal, lo >= half);
+  let a1 = min(select(0u, (hi - half) / Bal, hi >= half), len - 2u);
+  var cur = pos;
+  var curA = endA;
+  for (var a = a0; a <= a1; a++) {
+    let owner = L.x + select(a * L.y + b, b * L.y + a, f == 0u);
+    let w = segw[2u * (2u * owner + f) + 1u];
+    if ((w.y & (SEG_EXISTS_R | SEG_BROKEN_R)) == SEG_EXISTS_R) { continue; }
+    let site = a * Bal + half + u32(round(clamp(bitcast<f32>(w.z), 0.0, 1.0) * f32(Bal)));
+    let sp = clamp(site, cur, pos + n);
+    if (sp > cur) { emitRun(l, f, yarn, cur, sp - cur, curA, 1u); }
+    cur = sp;
+    curA = 1u;
+  }
+  emitRun(l, f, yarn, cur, pos + n - cur, curA, endB);
+}
+
 @compute @workgroup_size(128)
 fn threadScan(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = gid.x;
@@ -283,23 +340,10 @@ fn threadScan(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pos > 0u) { endA = select(0u, 1u, yarnState(c - stride, f) == 0u); }
     var endB = 2u;
     if (pos + n < len) { endB = select(0u, 1u, yarnState(c + n * stride, f) == 0u); }
-    // a piece cut free at both ends has nothing holding it: it has fallen away
-    let fallen = endA == 1u && endB == 1u;
     // a short run held at both ends is a worn-through float of the cloth; a yarn end standing out of
     // an edge is a thread however short
     if (n < MIN_RUN && endA != 1u && endB != 1u) { continue; }
-    if (!fallen) {
-      let r = atomicAdd(&threadCount[0], 1u);
-      if (r >= MAX_RUNS) { continue; }
-      let yarn = select(t.k, t.m, f == 0u);
-      runs[r] = vec4<u32>(t.l | (f << 4u) | (endA << 5u) | (endB << 7u), yarn | (pos << 16u), n, 0u);
-      // drawn over n + 1 crossings: half a crossing beyond each end (into the weave, or to the cut)
-      let nc = n / CHUNK + 1u;
-      let c0 = atomicAdd(&threadCount[1], nc);
-      for (var q = 0u; q < nc; q++) {
-        if (c0 + q < MAX_CHUNKS) { chunks[c0 + q] = (r << 10u) | q; }
-      }
-    }
+    emitSplit(t.l, f, select(t.k, t.m, f == 0u), pos, n, endA, endB);
     for (var q = 0u; q < n; q++) {
       let cc = c + q * stride;
       atomicOr(&threadBits[cc >> 4u], 1u << (2u * (cc & 15u) + f));
