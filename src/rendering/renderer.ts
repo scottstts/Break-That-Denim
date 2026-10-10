@@ -50,8 +50,8 @@ const REFINE = 2;
 /** Loose-thread runs and their draw chunks (threads.wgsl). */
 const MAX_RUNS = 65536;
 const MAX_CHUNKS = 262144;
-/** Apparent density of a loose cotton yarn (fibre density 1520 kg/m^3 at 0.6 packing), kg/m^3. */
-const LOOSE_YARN_DENSITY = 1520 * 0.6;
+/** Apparent density of a freed cotton yarn: fibre density 1520 kg/m^3 at 0.4 packing (abraded and partly untwisted once out of the weave), kg/m^3. */
+const LOOSE_YARN_DENSITY = 1520 * 0.4;
 /** Cells drawn per crossing (refine.wgsl list from FINE_BASE). */
 const MAX_FINE = 32768;
 /** Nodes with a connection field (pieces.wgsl) and the free-edge crossings (edge fibres). */
@@ -129,11 +129,16 @@ export class Renderer {
   readonly solver: GpuSolver;
   readonly scene: CompiledScene;
   /** Key light position relative to the camera target, its intensity, and exposure. */
-  keyOffset: Vec3 = [-0.3, 0.46, 0.56];
-  keyIntensity = 4.2;
+  /** A broad key grazing in from the top of the frame, as in the reference: folds read as relief and
+   * the light falls off toward the bottom. */
+  keyOffset: Vec3 = [-0.05, 0.6, 0.3];
+  keyIntensity = 6.0;
   exposure = 1.0;
   /** Sky/bounce fill (hemisphere top): shadowed cloth stays a dark blue, as in the reference. */
-  ambient: Vec3 = [0.07, 0.08, 0.11];
+  ambient: Vec3 = [0.03, 0.035, 0.05];
+  /** Where the key's cone is aimed, relative to the camera target, and the cosine where its soft edge starts. */
+  keyAim: Vec3 = [0.0, 0.12, 0];
+  keyCone = 0.9;
 
   private readonly frameU: GPUBuffer;
   private readonly renderU: GPUBuffer;
@@ -662,7 +667,7 @@ export class Renderer {
     const m = cameraMatrices(camera, this.width / this.height);
     const key: Vec3 = [camera.target[0] + this.keyOffset[0], camera.target[1] + this.keyOffset[1], camera.target[2] + this.keyOffset[2]];
     // aim the key slightly above the frame centre so illumination falls off toward the bottom
-    const aim: Vec3 = [camera.target[0] + 0.03, camera.target[1] + 0.065, camera.target[2]];
+    const aim: Vec3 = [camera.target[0] + this.keyAim[0], camera.target[1] + this.keyAim[1], camera.target[2] + this.keyAim[2]];
     const axis = normalize(sub(aim, key));
     const fu = new Float32Array(64);
     fu.set(m.viewProj, 0);
@@ -670,7 +675,7 @@ export class Renderer {
     fu.set([...m.eye, camera.fovY / this.height], 32);
     // keyPos relative intensity normalisation uses |keyPos| (see keyLight); positions are in world space
     fu.set([...key, this.keyIntensity], 36);
-    fu.set([...axis, 0.93], 40);
+    fu.set([...axis, this.keyCone], 40);
     fu.set([...this.ambient, (2 * SHADOW_HALF) / SHADOW_SIZE], 44);
     fu.set([this.width, this.height, 1 / this.width, 1 / this.height], 48);
     const kd = Math.hypot(key[0] - camera.target[0], key[1] - camera.target[1], key[2] - camera.target[2]);

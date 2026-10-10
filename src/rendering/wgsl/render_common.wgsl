@@ -227,7 +227,7 @@ fn cellGrid(L: LayerR, ci: u32, cj: u32) -> vec4<u32> {
 const MIN_RUN: u32 = 4u;
 const CHUNK: u32 = 8u;
 const THREAD_VERTS: u32 = 34u;
-const FIBERS_PER_CHUNK: u32 = 12u;
+const FIBERS_PER_CHUNK: u32 = 20u;
 const FIBER_VERTS: u32 = 14u;
 // vec4 per run of the per-frame thread geometry (thread_prep.wgsl)
 const RUN_GEO: u32 = 7u;

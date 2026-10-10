@@ -33,6 +33,8 @@ export default async function main(args: string[]): Promise<void> {
   const format: GPUTextureFormat = 'rgba8unorm';
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(width, height);
+  // LIGHT='{"keyOffset":[..],"keyIntensity":..,"exposure":..,"ambient":[..],"keyAim":[..],"keyCone":..}'
+  Object.assign(renderer, JSON.parse(process.env.LIGHT ?? '{}') as object);
   const camera = { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.CAMERA ?? '{}') as object) };
   const tex = device.createTexture({ size: [width, height], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   // SETTLE seconds (default 2) of frames at 30 Hz first: the loose threads' dynamics come to rest

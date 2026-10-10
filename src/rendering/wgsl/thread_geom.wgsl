@@ -6,7 +6,8 @@
 // chain's Catmull-Rom curve through the spans that still hold. The chain is a one-dimensional strand:
 // mechanics resolves the bundle's motion, not where its yarns lie across it. Where a yarn is held in
 // the weave it keeps its woven place; away from it, freed of the crossing yarns, the bundle's yarns lie
-// together as one twisted cord (two in some bundles) of their combined cross-section around the chain.
+// together as one twisted cord (two in some bundles) of their combined cross-section around the chain,
+// over a free length of several millimetres (a short ladder keeps its picks at their woven places).
 // No shape is added that the chain does not have: a thread swings, sags and settles as its strand does.
 // Near a free end (a few millimetres at most: the bundle span beyond its last node) the yarn untwists
 // out of the cord and droops.
@@ -235,9 +236,12 @@ fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Thr
   let eA = select(1e6, p - ri.pos + 0.5, ri.heldA);
   let eB = select(1e6, ri.pos + ri.n - 0.5 - p, ri.heldB);
   let e = max(min(eA, eB), 0.0);
-  // freed of the crossing yarns within about a crossing of the weave, the yarns gather
-  let gather = 1.0 - exp(-e / 1.2);
-  let dGather = select(0.0, exp(-e / 1.2) / 1.2, e > 0.0 && e < 1e5) * select(1.0, -1.0, eA > eB);
+  // freed of the crossing yarns, the yarns drift together only over a free length of several
+  // millimetres: across a short ladder they stay at their woven places, held close by on both sides
+  let eMm = e * pitchAl * 1e3;
+  let gather = smoothstep(1.5, 10.0, eMm);
+  let gs = clamp((eMm - 1.5) / 8.5, 0.0, 1.0);
+  let dGather = select(0.0, 6.0 * gs * (1.0 - gs) / 8.5 * pitchAl * 1e3, e > 0.0 && e < 1e5) * select(1.0, -1.0, eA > eB);
   let woven = (f32(q) - 0.5 * f32(Bcr - 1u)) * pitchCr;
   // the cord: the whole bundle, or one of its halves in some bundles; packed yarns of radius rY
   let split = Bcr >= 4u && hashf(seedB) < 0.3;
