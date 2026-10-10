@@ -224,6 +224,15 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: 0.6 },
   ],
+  // a user hauling on the cloth: a fast, long drag in the screen plane (AUTOLIFT=1), held at full reach,
+  // then released (does the grip hold, where does the cloth fail)
+  haul: [
+    { grab: (process.env.GRAB ?? '0.004,-0.003').split(',').map(Number) as [number, number] },
+    { to: (process.env.PULL ?? '0.06,0.02,0').split(',').map(Number) as [number, number, number], t: 0.5 },
+    { wait: Number(process.env.HOLD ?? 1.5) },
+    { release: true },
+    { wait: 1.0 },
+  ],
   intact: [
     { grab: [-0.035, 0.03] },
     { to: [-0.03, 0.0, 0.015], t: 0.8 },
@@ -295,13 +304,14 @@ export default async function main(args: string[]): Promise<void> {
     handle = [...anchor];
     grabT = t;
     interaction.attach(picked, anchor);
+    console.log(`  grab node ${picked} at ${anchor.map((q) => q.toFixed(4)).join(',')}`);
   };
   let lastX = x0;
   let grabbed = -1;
   // scrap fixture: the piece's centre node (its height against the sheet below it is logged)
   let scrapCentre = -1;
   let grabT = 0;
-  let slipFor = 0;
+  let gripLost = false;
   let cutBox: number[] | null = null;
 
   const runFrame = async (goal: [number, number, number] | null) => {
@@ -320,6 +330,10 @@ export default async function main(args: string[]): Promise<void> {
       }
       const hunting = process.env.HUNT && t > Number(process.env.HUNT);
       if (hunting) snapshot(device, solver, true);
+      if (process.env.LSPROBE && t + k * h > Number(process.env.LSPROBE)) {
+        await lineProbe(device, solver, interaction, `t=${(t + (k + 1) * h).toFixed(4)}`);
+        continue;
+      }
       const enc = device.createCommandEncoder();
       solver.encodeSubstep(enc);
       device.queue.submit([enc.finish()]);
@@ -331,22 +345,12 @@ export default async function main(args: string[]): Promise<void> {
     }
     await drain(device);
     t += perFrame * h;
-    // the product's grip slip (worker.ts SLIP_EXCESS / SLIP_TIME): pulled 3 cm beyond what the bounded grip
-    // force can make the cloth follow for 0.2 s, the cloth slips out of the fingers
-    if (handle && !process.env.NOSLIP) {
-      const excess = await interaction.gripExcess();
-      if (excess !== null && excess >= 0.03) {
-        slipFor += perFrame * h;
-        if (slipFor >= 0.25) {
-          console.log(`  slip at t=${(t + perFrame * h).toFixed(2)}`);
-          interaction.release();
-          handle = null;
-          slipFor = 0;
-        }
-      } else slipFor = 0;
-    }
     const xs = new Float32Array(await readBuffer(device, solver.x));
     const v = new Float32Array(await readBuffer(device, solver.v));
+    if (handle && interaction.coreNodes.length > 0 && !gripLost && interaction.coreNodes.every((n) => xs[4 * n + 3] > 0.5)) {
+      gripLost = true;
+      console.log(`  grip core became debris at t=${(t).toFixed(2)} (the pinched piece tore out)`);
+    }
     const c = new Uint32Array(await readBuffer(device, solver.counters, 64));
     lastX = xs;
     if (topology && c[0] + c[1] !== events) {
@@ -382,6 +386,7 @@ export default async function main(args: string[]): Promise<void> {
       console.log(`  scrap centre x ${(xs[4 * c] * 1e3).toFixed(1)} z ${(xs[4 * c + 2] * 1e3).toFixed(2)} mm v ${Array.from(v.slice(4 * c, 4 * c + 3)).map((q) => q.toFixed(3)).join(',')} (state ${xs[4 * c + 3]}), sheet below ${(zs * 1e3).toFixed(2)} mm at ${(best * 1e3).toFixed(1)} mm in plan`);
     }
     if (process.env.TRACK) {
+      if (handle) console.log(`  handle ${handle.map((q) => q.toFixed(4)).join(',')}`);
       for (const tn of process.env.TRACK.split(',').map(Number)) {
         const k = interaction.patchNodes.indexOf(tn);
         console.log(`  node ${tn} x=${Array.from(xs.slice(4 * tn, 4 * tn + 4)).map((q) => q.toFixed(4))} v=${Array.from(v.slice(4 * tn, 4 * tn + 3)).map((q) => q.toFixed(3))} grip=${k >= 0}`);
@@ -619,6 +624,7 @@ export default async function main(args: string[]): Promise<void> {
       interaction.release();
       await topology?.request([]);
       handle = null;
+      gripLost = false;
     } else if ('wait' in s) {
       for (let q = 0; q < Math.round(s.wait / H_FRAME); q++) await runFrameS(null);
     } else {
@@ -880,4 +886,126 @@ async function replay(device: GPUDevice, solver: import('../../../src/simulation
     await stage(`apply${it}`, (p) => s.dispatch.call(solver, p, 'newtonApply', `newtonApply${it}`, Math.ceil(solver.N / 128)));
   }
   await stage('finalize', (p) => solver.encodeFinalize(p));
+}
+
+/**
+ * One substep run stage by stage (LSPROBE=t0 from that time on): per Newton iteration the directional
+ * derivative g.d of the incremental potential along the PCG direction, the evaluated energy changes at
+ * steps 1, 1/2, 1/4, 1/8 with their rounding bounds, the chosen step, and the nodes contributing most
+ * to an ascent.
+ */
+async function lineProbe(device: GPUDevice, solver: import('../../../src/simulation/gpu/solver').GpuSolver, interaction: Interaction, tag: string): Promise<void> {
+  const s = solver as unknown as Record<string, (...a: unknown[]) => void>;
+  const run = (f: (pass: GPUComputePassEncoder) => void) => {
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    f(pass);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+  };
+  const c0 = device.createCommandEncoder();
+  const contact = solver.contact as unknown as { encodeClear(e: GPUCommandEncoder): void; encodeTerms(p: GPUComputePassEncoder): void; encodeDetect(p: GPUComputePassEncoder): void };
+  if (solver.contactEnabled) contact.encodeClear(c0);
+  c0.clearBuffer(solver.counters, 16, 32);
+  device.queue.submit([c0.finish()]);
+  run((p) => {
+    solver.encodePredict(p);
+    interaction.encodeSubstep(p);
+    if (solver.contactEnabled) contact.encodeDetect(p);
+  });
+  for (let it = 0; it < solver.params.newtonMax; it++) {
+    run((p) => {
+      if (solver.contactEnabled) contact.encodeTerms(p);
+      interaction.encode((pipe, group, g) => {
+        p.setPipeline(pipe);
+        p.setBindGroup(0, group);
+        p.dispatchWorkgroups(g);
+      });
+      solver.encodeAssemble(p, it === 0);
+      solver.encodePCG(p);
+      solver.encodeLineSearch(p);
+    });
+    const B = new Float32Array(await readBuffer(device, solver.levels[0].B));
+    const D = new Float32Array(await readBuffer(device, solver.delta));
+    const P4 = new Float32Array(await readBuffer(device, solver.partial4));
+    const C = new Float32Array(await readBuffer(device, solver.counters, 64));
+    const xs = new Float32Array(await readBuffer(device, solver.x));
+    let gd = 0;
+    const contrib: Array<[number, number]> = [];
+    for (let n = 0; n < solver.N; n++) {
+      const q = -(B[4 * n] * D[4 * n] + B[4 * n + 1] * D[4 * n + 1] + B[4 * n + 2] * D[4 * n + 2]);
+      gd += q;
+      if (q > 0) contrib.push([q, n]);
+    }
+    contrib.sort((a, b) => b[0] - a[0]);
+    const e = [0, 0, 0, 0];
+    const m = [0, 0, 0, 0];
+    for (let w = 0; w < 256; w++) for (let k = 0; k < 4; k++) {
+      e[k] += P4[8 * w + k];
+      m[k] += P4[8 * w + 4 + k];
+    }
+    if (e[3] > 4e-6 * m[3]) {
+      const dbg = await perNodeEnergy(device, solver);
+      const ranked = Array.from({ length: solver.N }, (_, n) => n).sort((a, b) => dbg[8 * b + 3] - dbg[8 * a + 3]).slice(0, 3);
+      const xs2 = new Float32Array(await readBuffer(device, solver.x));
+      const dx2 = new Float32Array(await readBuffer(device, solver.dx));
+      const sg = new Float32Array(await readBuffer(device, solver.segs));
+      const sgu = new Uint32Array(sg.buffer);
+      const L = solver.scene.layers[0];
+      for (const n of ranked) {
+        const spans = [0, 1].map((f) => `f${f} rest=${(sg[8 * (2 * n + f)] * 1e3).toFixed(3)}mm intact=${sg[8 * (2 * n + f) + 1].toFixed(3)} flags=${sgu[8 * (2 * n + f) + 5]}`).join(' ');
+        console.log(`    node ${n} (i=${n % L.nx} j=${Math.floor(n / L.nx)}) w=${xs2[4 * n + 3]} dE=[${Array.from(dbg.slice(8 * n, 8 * n + 4)).map((v) => v.toExponential(2)).join(' ')}] cat(ax,visc,bend,shear)=[${Array.from(dbg.slice(8 * n + 4, 8 * n + 8)).map((v) => v.toExponential(2)).join(' ')}] dx=${(Math.hypot(dx2[4 * n], dx2[4 * n + 1], dx2[4 * n + 2]) * 1e3).toFixed(3)}mm |d|=${Math.hypot(D[4 * n], D[4 * n + 1], D[4 * n + 2]).toExponential(2)} ${spans}`);
+      }
+    }
+    const top = contrib.slice(0, 4).map(([q, n]) => `${n}(${q.toExponential(1)} w=${xs[4 * n + 3]})`).join(' ');
+    console.log(`  LS ${tag} it${it} g.d=${gd.toExponential(3)} e=[${e.map((v) => v.toExponential(2)).join(' ')}] tol=[${m.map((v) => (4e-6 * v).toExponential(1)).join(' ')}] alpha=${C[3]} | ascent nodes ${top}`);
+    run((p) => s.dispatch.call(solver, p, 'newtonApply', `newtonApply${it}`, Math.ceil(solver.N / 128)));
+  }
+  run((p) => solver.encodeFinalize(p));
+  await device.queue.onSubmittedWorkDone();
+}
+
+let dbgMod: { pipe: GPUComputePipeline; group: GPUBindGroup; buf: GPUBuffer } | null = null;
+/** Per-node energy changes of the line search (energy.wgsl nodeDelta) at the current Newton iterate. */
+async function perNodeEnergy(device: GPUDevice, solver: import('../../../src/simulation/gpu/solver').GpuSolver): Promise<Float32Array> {
+  if (!dbgMod) {
+    const { ComputeModule, createBuffer } = await import('../../../src/gpu/util');
+    const common = (await import('../../../src/simulation/gpu/wgsl/common.wgsl?raw')).default;
+    const drag = (await import('../../../src/simulation/gpu/wgsl/drag.wgsl?raw')).default;
+    const energy = (await import('../../../src/simulation/gpu/wgsl/energy.wgsl?raw')).default;
+    // per category (axial elastic, axial viscous, bending, shear): the change at the shortest step
+    const tag = (src: string, c: number) => {
+      const at = en.indexOf(src);
+      if (at < 0) throw new Error(`energy probe: ${src} not found`);
+      const inner = src.slice('add1(k, '.length, -2);
+      en = en.replace(src, `{ let pv = ${inner}; add1(k, pv); if (k == 3u) { cat[${c}] += pv; } }`);
+    };
+    let en = energy.replace('var<private> mag: vec4<f32>;', 'var<private> mag: vec4<f32>;\nvar<private> cat: vec4<f32>;');
+    tag('add1(k, 0.5 * (T0 + Ta) * r.x);', 0);
+    tag('add1(k, 0.5 * c * r.x * (r.y + l0 - 2.0 * ln));', 1);
+    tag('add1(k, 0.5 * ke * bendPsiDelta(q0, q0 + dq, dq, ab));', 2);
+    tag('add1(k, 0.5 * (f0 + shearLaw(ks, jam, Ld, rr.y).x) * rr.x);', 3);
+    const code = common + drag + en + `
+@group(0) @binding(10) var<storage, read_write> dbg: array<vec4<f32>>;
+@compute @workgroup_size(128)
+fn perNode(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= P.counts.x) { return; }
+  cat = vec4<f32>(0.0);
+  nodeDelta(gid.x);
+  dbg[2u * gid.x] = acc;
+  dbg[2u * gid.x + 1u] = cat;
+}`;
+    const mod = new ComputeModule(device, 'energyDbg', code);
+    const buf = createBuffer(device, 'dbg', 32 * solver.N);
+    const group = mod.bindGroup('dbg', { 0: solver.simParams, 1: solver.nodes, 2: solver.x, 3: solver.dx, 4: solver.pred, 5: solver.segs, 6: solver.delta, 7: solver.ext, 8: solver.partial4, 9: solver.counters, 10: buf });
+    dbgMod = { pipe: mod.pipeline('perNode'), group, buf };
+  }
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(dbgMod.pipe);
+  pass.setBindGroup(0, dbgMod.group);
+  pass.dispatchWorkgroups(Math.ceil(solver.N / 128));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  return new Float32Array(await readBuffer(device, dbgMod.buf));
 }
