@@ -18,6 +18,9 @@ restless settling, grip slipping). Earlier: `docs/decisions/2026-10-10-assessmen
 - `npm run check` (33 unit), `npm run test:gpu` (26/26).
 - Session `settle`: 0 line-search rejections (was 164), settles 0.73 s after release.
 - `haul` (fast long drag, AUTOLIFT=1): grip held on worn and intact cloth; worn scrap stays in the hand.
+- `maul` (four hard drags, AUTOLIFT=1): no non-finite values, 2 rejections in 6.5 s, no bridging threads,
+  21 of 40k sheet spans through a cell. Without the slip release a 19 cm drag at full force tears out a
+  large worn piece (freed 368 nodes), which falls when released.
 
 ## Reproduce
 
@@ -36,3 +39,7 @@ restless settling, grip slipping). Earlier: `docs/decisions/2026-10-10-assessmen
 3. Threads inside openings are often single yarns in shadow (physically consistent, faint).
 4. The reference framing camera sees past the coupon's top edge (product framing does not).
 5. Rim halo reads as a uniform pale glow at default framing (plausible abrasion up close).
+6. The aggregate edge fringe still draws at half weight at ~0.1 mm/px, where it doubles the strands
+   and reads as glassy streaks; at default framing it gives the rims their soft fibrous edge.
+7. One-ended threads beyond their chain hang procedurally toward -z without contact (978 such runs in
+   `maul`, 34 longer than 5 mm).
