@@ -261,7 +261,7 @@ export class Renderer {
     kappaInit.fill(0xffffffff, 4, 4 + N);
     this.kappa = createBufferWith(device, 'kappa', kappaInit);
     this.cellDirty = createBuffer(device, 'cellDirty', 4 * cells);
-    this.piecesArgs = createBuffer(device, 'piecesArgs', 48, STORAGE | GPUBufferUsage.INDIRECT);
+    this.piecesArgs = createBuffer(device, 'piecesArgs', 64, STORAGE | GPUBufferUsage.INDIRECT);
     this.edgeList = createBuffer(device, 'edgeList', 4 * (MAX_EDGES + 1));
     this.edgeRoots = createBuffer(device, 'edgeRoots', 48 * MAX_EDGES);
 
@@ -456,6 +456,7 @@ export class Renderer {
     this.pipes.fineShadow = pipe('fine.shadow', surfaceLayout, surfaceModule, 'vsFineShadow', null, list, null);
     const fuzzModule = shaderModule(device, 'fuzz', common + lightWgsl + fuzzWgsl);
     this.pipes.edgeFuzz = pipe('edgeFuzz', fuzzLayout, fuzzModule, 'vsEdgeFuzz', 'fsFuzz', strip, ms, blended);
+    this.pipes.edgeTuft = pipe('edgeTuft', fuzzLayout, fuzzModule, 'vsEdgeTuft', 'fsEdgeTuft', strip, ms, blended);
     const threadModule = shaderModule(device, 'thread', common + lightWgsl + threadGeomWgsl + threadWgsl);
     this.pipes.thread = pipe('thread', threadLayout, threadModule, 'vsThread', 'fsThread', strip, coverage);
     this.pipes.threadShadow = pipe('thread.shadow', threadLayout, threadModule, 'vsThreadShadow', null, strip, null);
@@ -765,6 +766,8 @@ export class Renderer {
     mp.setPipeline(this.pipes.threadFuzz);
     mp.drawIndirect(this.threadDraw, 16);
     mp.setBindGroup(0, this.groups.fuzz);
+    mp.setPipeline(this.pipes.edgeTuft);
+    mp.drawIndirect(this.piecesArgs, 48);
     mp.setPipeline(this.pipes.edgeFuzz);
     mp.drawIndirect(this.piecesArgs, 16);
     mp.end();

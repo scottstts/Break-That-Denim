@@ -191,3 +191,96 @@ fn fsFuzz(in: VOut) -> @location(0) vec4<f32> {
   let c = fiberShade(N, T, V, key.xyz, albedo, 0.3) * (key.w * sh) + F.ambient.rgb * albedo;
   return vec4<f32>(c, in.alpha);
 }
+
+// ---------------------------------------------------------------- aggregate fringe
+
+// The fringe of a free edge as the eye sees it beyond a few fibres per pixel: one translucent ribbon
+// per open side of an edge crossing, from the side out over the opening, whose opacity is the
+// coverage of the fibres and yarn ends standing out there (falling off toward their tips, tufted
+// along the edge) and whose texture streaks along them. Where single fibres resolve (close views) it
+// fades out and the individual strands above carry the fringe alone.
+
+struct TOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) world: vec3<f32>,
+  // along the side (m), out of it (0 root .. 1 tip)
+  @location(1) st: vec2<f32>,
+  @location(2) out: vec3<f32>,
+  // fibre length here (m), aggregate weight, layer, unused
+  @location(3) @interpolate(flat) info: vec4<f32>,
+};
+
+fn hiddenT() -> TOut {
+  var o: TOut;
+  o.pos = vec4<f32>(0.0, 0.0, -2.0, 1.0);
+  return o;
+}
+
+@vertex
+fn vsEdgeTuft(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> TOut {
+  let ei = ii / 4u;
+  let side = ii % 4u;
+  let root0 = edgeRoots[3u * ei];
+  if (root0.w < 0.5) { return hiddenT(); }
+  let entry = edgeList[ei];
+  if (((entry >> (28u + side)) & 1u) == 0u) { return hiddenT(); }
+  let c = entry & 0x0FFFFFFFu;
+  var l = 0u;
+  for (var q = 1u; q < R.counts.y; q++) {
+    if (c >= R.layers[q].field.x) { l = q; }
+  }
+  let LR = R.layers[l];
+  let FL = LR.field;
+  let dU = edgeRoots[3u * ei + 1u].xyz;
+  let dV = edgeRoots[3u * ei + 2u].xyz;
+  var N = normalize(cross(dU, dV));
+  if (dot(N, F.camPos.xyz - root0.xyz) < 0.0) { N = -N; }
+  let sg = select(-1.0, 1.0, (side & 1u) == 1u);
+  let outR = select(vec2<f32>(0.0, sg), vec2<f32>(sg, 0.0), side < 2u);
+  let alongR = vec2<f32>(-outR.y, outR.x);
+  let outW = dU * outR.x + dV * outR.y;
+  let alongW = dU * alongR.x + dV * alongR.y;
+  // the same tuft density as the strands (tufted stretches next to nearly bare ones)
+  let restC = vec2<f32>(f32((c - FL.x) % FL.y) * LR.pitch.x, f32((c - FL.x) / FL.y) * LR.pitch.y);
+  let tuftN = 0.6 * noise2(6007u + l, restC / 5.0e-3) + 0.4 * noise2(6011u + l, restC / 1.6e-3);
+  let density = smoothstep(-0.45, 0.5, tuftN);
+  let len = (2.0e-3 + 3.0e-3 * density) * (0.8 + 0.4 * hashf(c * 2654435761u + side));
+  let pix = F.camPos.w * length(F.camPos.xyz - root0.xyz);
+  // individual fibres (~30 um) resolve below ~40 um per pixel
+  let agg = clamp((pix - 40e-6) / 120e-6, 0.0, 1.0);
+  if (agg <= 0.0) { return hiddenT(); }
+  let su = select(-0.5, 0.5, (vi & 1u) == 1u);
+  let tv = f32(vi >> 1u);
+  let olen = length(outW);
+  let dir = normalize(outW / max(olen, 1e-12) + N * 0.25) ;
+  // from the side's midpoint (half a crossing out), fanned slightly wider at the tip, drooping a little
+  let base = root0.xyz + outW * 0.5;
+  let P = base + alongW * (su * (1.0 + 0.4 * tv)) + dir * (len * tv) + vec3<f32>(0.0, 0.0, -0.2 * len * tv * tv);
+  var o: TOut;
+  o.pos = F.viewProj * vec4<f32>(P, 1.0);
+  o.world = P;
+  o.st = vec2<f32>(su * length(alongW), tv);
+  o.out = dir;
+  o.info = vec4<f32>(len, agg * (0.6 + 0.35 * density), f32(l), 0.0);
+  return o;
+}
+
+@fragment
+fn fsEdgeTuft(in: TOut) -> @location(0) vec4<f32> {
+  let l = u32(in.info.z);
+  let t = clamp(in.st.y, 0.0, 1.0);
+  // fibres end at scattered lengths: coverage falls toward the tips; streaked along the fibres
+  let streak = 0.5 + 0.5 * noise2(7001u + l, vec2<f32>(in.st.x / 0.12e-3, t * in.info.x / 1.2e-3));
+  let clump = 0.5 + 0.5 * noise2(7013u + l, vec2<f32>(in.st.x / 0.5e-3, t * in.info.x / 2.0e-3));
+  let cover = in.info.y * pow(1.0 - t, 0.9) * mix(0.4, 1.0, streak) * mix(0.65, 1.0, clump);
+  if (cover <= 0.003) { discard; }
+  let V = normalize(F.camPos.xyz - in.world);
+  let T = normalize(in.out);
+  let Nf = normalize(V - dot(V, T) * T);
+  // loose fibre: pale cores and weft, some keeping their indigo near the root
+  let albedo = mix(vec3<f32>(0.3, 0.36, 0.52), vec3<f32>(0.62, 0.64, 0.68), smoothstep(0.0, 0.4, t) * 0.75 + 0.25 * clump);
+  let key = keyLight(in.world);
+  let sh = shadowFactor(in.world, Nf);
+  let c = fiberShade(Nf, T, V, key.xyz, albedo, 0.4) * (key.w * sh) + F.ambient.rgb * albedo;
+  return vec4<f32>(c, cover);
+}

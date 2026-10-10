@@ -30,7 +30,8 @@
 // per cell: lacks surface material somewhere
 @group(0) @binding(6) var<storage, read_write> cellDirty: array<u32>;
 // [0..2] indirect dispatch of kappaSolve, [3] edge crossings, [4..7] indirect draw of the edge fibres,
-// [8..10] indirect dispatch of their roots (edge_roots.wgsl, 64 per group)
+// [8..10] indirect dispatch of their roots (edge_roots.wgsl, 64 per group), [12..15] indirect draw of
+// the aggregate fringe
 @group(0) @binding(7) var<storage, read_write> piecesArgs: array<atomic<u32>>;
 // edge crossings (crossing | open sides << 28: bit 0 -u, 1 +u, 2 -v, 3 +v), for the edge fibres; their
 // count at [MAX_EDGES]
@@ -173,6 +174,11 @@ fn edgeDrawArgs() {
   atomicStore(&piecesArgs[8], (n + 63u) / 64u);
   atomicStore(&piecesArgs[9], 1u);
   atomicStore(&piecesArgs[10], 1u);
+  // aggregate fringe (fuzz.wgsl vsEdgeTuft): a quad per side of each edge crossing
+  atomicStore(&piecesArgs[12], 4u);
+  atomicStore(&piecesArgs[13], 4u * n);
+  atomicStore(&piecesArgs[14], 0u);
+  atomicStore(&piecesArgs[15], 0u);
   edgeList[MAX_EDGES] = n;
 }
 
