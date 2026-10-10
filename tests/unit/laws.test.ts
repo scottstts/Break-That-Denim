@@ -30,6 +30,14 @@ describe('fold-stiffening bending', () => {
     const dq = 1e-9 * a;
     expect(bendPsiDelta(q0, q0 + dq, dq, a) / (bendPsi(q0, a)[1] * dq)).toBeCloseTo(1, 6);
   });
+  it('agrees with the energy difference on and across both branches, and is zero without a change', () => {
+    for (const [s0, s1] of [[0.2, 0.5], [0.8, 0.9], [0.9, 0.8], [0.95, 3.0], [40, 41], [41, 40]]) {
+      const ref = bendPsi(s1 * a, a)[0] - bendPsi(s0 * a, a)[0];
+      expect(bendPsiDelta(s0 * a, s1 * a, (s1 - s0) * a, a) / ref).toBeCloseTo(1, 9);
+    }
+    // a sharply folded triple that does not move (e.g. debris outside the solve): no change at all
+    expect(bendPsiDelta(50 * a, 50 * a, 0, a)).toBe(0);
+  });
 });
 
 describe('shear locking', () => {

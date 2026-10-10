@@ -185,12 +185,21 @@ fn bendScale(ia: f32, ic: f32, maskA: u32, maskC: u32, B: u32) -> f32 {
   return f32(cont) / fb * min(ma, mc);
 }
 
-// Psi(q1) - Psi(q0) without cancellation for small changes (dq = q1 - q0 computed stably).
+// Psi(q1) - Psi(q0) without cancellation (dq = q1 - q0 computed stably; laws.ts bendPsiDelta): a
+// product with dq on both branches, exactly zero for dq = 0.
 fn bendPsiDelta(q0: f32, q1: f32, dq: f32, a: f32) -> f32 {
   let s0 = q0 / a;
   let s1 = q1 / a;
   if (s0 < BEND_S0 && s1 < BEND_S0) { return dq / ((1.0 - s0) * (1.0 - s1)); }
-  return bendPsi(q1, a).x - bendPsi(q0, a).x;
+  let qb = BEND_S0 * a;
+  let d0 = 1.0 - BEND_S0;
+  let p1 = 1.0 / (d0 * d0);
+  let p2 = 2.0 / (a * d0 * d0 * d0);
+  if (s0 >= BEND_S0 && s1 >= BEND_S0) { return dq * (p1 + 0.5 * p2 * ((q0 - qb) + (q1 - qb))); }
+  let lo = min(q0, q1);
+  let t = max(q0, q1) - qb;
+  let up = (qb - lo) / ((1.0 - lo / a) * d0) + t * (p1 + 0.5 * p2 * t);
+  return select(-up, up, q1 >= q0);
 }
 
 // Shear-locking diagonal (see shearLaw in src/simulation/laws.ts): (force, tangent stiffness).

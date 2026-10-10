@@ -80,12 +80,26 @@ function popcount(v: number): number {
   return (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) >>> 0;
 }
 
-/** Psi(q1) - Psi(q0) without cancellation for small changes (dq = q1 - q0 computed stably). */
+/**
+ * Psi(q1) - Psi(q0) without cancellation (dq = q1 - q0 computed stably): on both branches the change
+ * is a product with dq, so it vanishes exactly for dq = 0 and its rounding scales with |dq|, not with
+ * Psi. A difference of Psi values lost ~1e-7 Psi on sharply folded triples, which the line search read
+ * as a conclusive increase (docs/decisions/2026-10-10-interaction-round.md).
+ */
 export function bendPsiDelta(q0: number, q1: number, dq: number, a: number): number {
   const s0 = q0 / a;
   const s1 = q1 / a;
   if (s0 < BEND_S0 && s1 < BEND_S0) return dq / ((1 - s0) * (1 - s1));
-  return bendPsi(q1, a)[0] - bendPsi(q0, a)[0];
+  const qb = BEND_S0 * a;
+  const d0 = 1 - BEND_S0;
+  const p1 = 1 / (d0 * d0);
+  const p2 = 2 / (a * d0 * d0 * d0);
+  if (s0 >= BEND_S0 && s1 >= BEND_S0) return dq * (p1 + 0.5 * p2 * (q0 - qb + (q1 - qb)));
+  // across the joint: the lower branch up to qb, the quadratic continuation beyond it
+  const lo = Math.min(q0, q1);
+  const t = Math.max(q0, q1) - qb;
+  const up = (qb - lo) / ((1 - lo / a) * d0) + t * (p1 + 0.5 * p2 * t);
+  return q1 >= q0 ? up : -up;
 }
 
 /**
