@@ -439,8 +439,10 @@ export function defaultSceneSpecs(): LayerSpec[] {
       sizeV: 0.4,
       z: 0,
       angle: 0.06,
+      // slack across the weft, slightly stretched along the warp (as denim over a knee, user decision):
+      // torn holes stay open with their weft across them; below the worn yarns' failure at rest
       compressU: 0.025,
-      compressV: 0.015,
+      compressV: -0.002,
       shear: 0.06,
       collarRows: 2,
       wear: {

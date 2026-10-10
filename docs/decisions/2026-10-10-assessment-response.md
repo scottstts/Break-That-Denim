@@ -30,7 +30,13 @@
 
 - The reference's holes grow radially from pale spots while the weave around them barely deforms
   (dense frames 0-1.6 s): time-driven erosion, which the design excludes. They are not a target.
-- Pre-tension (mount -0.5 % / -0.3 %) gives no round lobes: folds vanish and more pieces drop. Rejected.
+- Pre-tension in both directions (mount -0.5 % / -0.3 %) gives no round lobes: folds vanish and more
+  pieces drop. Rejected.
+- **Warp tension only** (`compressV` -0.002, weft slack 2.5 %; user decision): on the slack drape torn
+  holes closed back into slits on release; stretched along the warp, as denim over a knee, they stay
+  open as rounded openings with their weft across them. Folds now run along the warp instead of
+  diagonally. At -0.4 % the weakest worn yarns failed at rest (2 ruptures in 1.5 s); at -0.2 % the
+  rest state holds (0 in 4 s).
 - Stronger warp/weft abrasion contrast (0.97 / 0.7) changes which cracks form, not their nature: strand
   damage-softening localizes into bundle rows (grain cracks), as woven fabric tears under a pinch.
 - Per-float abrasion scatter (lognormal sigma 0.6) does not make worn cells fail diffusely either: the
