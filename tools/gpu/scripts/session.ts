@@ -313,7 +313,7 @@ export default async function main(args: string[]): Promise<void> {
     t += perFrame * h;
     const xs = new Float32Array(await readBuffer(device, solver.x));
     const v = new Float32Array(await readBuffer(device, solver.v));
-    const c = new Uint32Array(await readBuffer(device, solver.counters, 16));
+    const c = new Uint32Array(await readBuffer(device, solver.counters, 64));
     lastX = xs;
     if (topology && c[0] + c[1] !== events) {
       events = c[0] + c[1];
@@ -385,7 +385,7 @@ export default async function main(args: string[]): Promise<void> {
       }
       console.log(`  KE uJ in=${(keIn * 1e6).toFixed(1)} edge=${(keEdge * 1e6).toFixed(1)} deb=${(keDeb * 1e6).toFixed(1)} fast(>2cm/s) in=${fastIn} edge=${fastEdge} top=${top} deg=${topDeg} v=${topV.toFixed(3)} fastByDegree=${fastByDeg.join('/')}`);
     }
-    const line = `t=${t.toFixed(2)} rupt=${c[0]} pull=${c[1]} freed=${topology?.freedCount ?? 0} vmax=${new Float32Array(c.buffer)[2].toFixed(3)} maxDisp=${(maxDisp * 1e3).toFixed(1)}mm far=${far} nonfinite=${bad} gatedNodes=${gated}`;
+    const line = `t=${t.toFixed(2)} rupt=${c[0]} pull=${c[1]} rejected=${c[12]} freed=${topology?.freedCount ?? 0} vmax=${new Float32Array(c.buffer)[2].toFixed(3)} maxDisp=${(maxDisp * 1e3).toFixed(1)}mm far=${far} nonfinite=${bad} gatedNodes=${gated}`;
     log.push(line);
     if (frame % every === 0 || bad > 0) console.log(line);
     {

@@ -49,13 +49,16 @@ fn segForce(a: u32, b: u32, f: u32, mat: LayerMat) -> SegForce {
   return SegForce(fs, max(r.y, 0.0) / L + c, max(fs, 0.0) / l, e / l);
 }
 
-// Bending of the triple (a, b, c) centered at b (fold-stiffening energy, see bendPsi): the gradient
-// coefficient ke Psi' and a scalar stiffness k = ke (Psi' + 2 Psi'' q) + kd that majorizes the
-// exact Hessian ke (Psi' I + 2 Psi'' r r^T) + kd I (the operator stores this stencil as scalars).
+// Bending of the triple (a, b, c) centered at b (fold-stiffening energy, see bendPsi, with the
+// rest-length weights r = wa x_a - 2 x_b + wc x_c of bendGeometry): the gradient coefficient ke Psi'
+// and a scalar stiffness k = ke (Psi' + 2 Psi'' q) + kd that majorizes the exact Hessian
+// ke (Psi' I + 2 Psi'' r r^T) + kd I (the operator stores this stencil as scalars, times w w^T).
 struct Triple {
   ke: f32,
   kd: f32,
   k: f32,
+  wa: f32,
+  wc: f32,
   r: vec3<f32>,
   rn: vec3<f32>,
 };
@@ -63,16 +66,16 @@ struct Triple {
 fn triple(a: u32, b: u32, c: u32, f: u32, mat: LayerMat) -> Triple {
   let sa = segs[2u * a + f];
   let sb = segs[2u * b + f];
-  let L = 0.5 * (sa.rest + sb.rest);
+  let geo = bendGeometry(sa.rest, sb.rest);
   let y = mat.yarn[f];
-  // only the continuous fibres of the spans' yarns bend (laws.ts bendScale)
-  let kb = y.bendRigidity * 0.5 * (sa.intact + sb.intact) / (L * L * L);
+  // only yarns continuous through b bend (laws.ts bendScale)
+  let kb = y.bendRigidity * bendScale(sa.intact, sb.intact, sa.cutMask, sb.cutMask, u32(y.yarnsPerSpan)) * geo.z;
   let kd = kb * y.bendVisc / P.hg.x;
-  let rn = x[a].xyz - 2.0 * x[b].xyz + x[c].xyz;
-  let r = rn + dx[a].xyz - 2.0 * dx[b].xyz + dx[c].xyz;
+  let rn = geo.x * x[a].xyz - 2.0 * x[b].xyz + geo.y * x[c].xyz;
+  let r = rn + geo.x * dx[a].xyz - 2.0 * dx[b].xyz + geo.y * dx[c].xyz;
   let q = dot(r, r);
-  let ps = bendPsi(q, 4.0 * L * L);
-  return Triple(kb * ps.y, kd, kb * (ps.y + 2.0 * ps.z * q) + kd, r, rn);
+  let ps = bendPsi(q, geo.w);
+  return Triple(kb * ps.y, kd, kb * (ps.y + 2.0 * ps.z * q) + kd, geo.x, geo.y, r, rn);
 }
 
 fn tripleGrad(t: Triple) -> vec3<f32> { return t.ke * t.r + t.kd * (t.r - t.rn); }
@@ -190,32 +193,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       D = symAdd(D, H);
       if (freeNext) { C1[kp] = symAdd(C1[kp], symScale(H, -1.0)); }
     }
-    // triple centered at n: (prev, n, next)
+    // triple centered at n: (prev, n, next), weight of n -2
     if (actPrev && actNext) {
       let t = triple(u32(prev), n, u32(next), f, mat);
       g += -2.0 * tripleGrad(t);
       let k = t.k;
       D = symAdd(D, symId(4.0 * k));
-      if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * k)); }
-      if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * k)); }
+      if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * t.wc * k)); }
+      if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * t.wa * k)); }
     }
-    // triple centered at next: (n, next, next2)
+    // triple centered at next: (n, next, next2), weight of n wa
     if (actNext && activeSeg(next, f) && next2 >= 0) {
       let t = triple(n, u32(next), u32(next2), f, mat);
-      g += tripleGrad(t);
+      g += t.wa * tripleGrad(t);
       let k = t.k;
-      D = symAdd(D, symId(k));
-      if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * k)); }
-      if (!isPinned(next2)) { C2[kp] += k; }
+      D = symAdd(D, symId(t.wa * t.wa * k));
+      if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * t.wa * k)); }
+      if (!isPinned(next2)) { C2[kp] += t.wa * t.wc * k; }
     }
-    // triple centered at prev: (prev2, prev, n)
+    // triple centered at prev: (prev2, prev, n), weight of n wc
     if (actPrev && activeSeg(prev2, f)) {
       let t = triple(u32(prev2), u32(prev), n, f, mat);
-      g += tripleGrad(t);
+      g += t.wc * tripleGrad(t);
       let k = t.k;
-      D = symAdd(D, symId(k));
-      if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * k)); }
-      if (!isPinned(prev2)) { C2[km] += k; }
+      D = symAdd(D, symId(t.wc * t.wc * k));
+      if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * t.wc * k)); }
+      if (!isPinned(prev2)) { C2[km] += t.wa * t.wc * k; }
     }
   }
 

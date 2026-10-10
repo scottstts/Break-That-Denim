@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { DENIM } from '../../src/simulation/material';
 import { compileScene, SEG_BROKEN, SEG_EXISTS, type LayerSpec } from '../../src/simulation/scene';
-import { coupleSpans, DAMAGE_CUT, DAMAGE_PULLED, interpolatedStrain, ownSpan, pullDraw, pullOut, pullRecoil, SHARE, shareCap, shareFactor, shareReach, spanCrossing, spanLength, updateField } from '../../src/simulation/yarnField';
+import { axialEnergyDensity, axialTension } from '../../src/simulation/axial';
+import { coupleSpans, DAMAGE_CUT, DAMAGE_PULLED, interpolatedStrain, ownSpan, pullOut, recoilLength, SHARE, shareCap, shareFactor, shareReach, spanCrossing, spanLength, updateField } from '../../src/simulation/yarnField';
 
 function coupon(extra: Partial<LayerSpec> = {}): LayerSpec {
   return {
@@ -105,22 +106,37 @@ describe('yarn damage field', () => {
     }
   });
 
-  it('a cut end recoils one crossing per step until a crossing holds, and then never moves', () => {
+  it('a cut end pulls out by its shear-lag retraction under load, and never in unloaded cloth', () => {
     const s = compileScene([coupon()]);
     const damage = Uint8Array.from(s.fieldDamage);
     const c0 = fl.offset + 30 * fl.K + 40;
     damage[2 * c0] = DAMAGE_CUT;
-    let steps = 0;
-    while (pullOut(s.field, s.fieldArea, damage) > 0) steps++;
+    const pullAll = (strain: Float64Array) => {
+      let total = 0;
+      for (let n = pullOut(s.layers, s.field, s.fieldArea, damage, strain, s.crossingNormal0); n > 0; n = pullOut(s.layers, s.field, s.fieldArea, damage, strain, s.crossingNormal0)) total += n;
+      return total;
+    };
+    // slack cloth: the end carries nothing and stays where it broke
+    expect(pullAll(new Float64Array(2 * s.nodeCount))).toBe(0);
+    // strained cloth (picks at 6 %, warps unloaded): the picks' end slides out over (T eps - W) / f
+    const strain = new Float64Array(2 * s.nodeCount);
+    for (let q = 0; q < strain.length; q += 2) strain[q] = 0.06;
+    pullAll(strain);
+    const y = L.material.yarns[0];
+    const B = fl.bv;
+    const comp = (axialTension(y, 0.06) * 0.06 - axialEnergyDensity(y, 0.06)) / B;
+    const p = L.weave.pitchU;
+    const delta = (comp * p) / (L.material.crossingFriction * (s.crossingNormal0[0] / (fl.bu * fl.bv)));
+    expect(recoilLength(y, B, 1, 0.06, L.material.crossingFriction, s.crossingNormal0[0] / (fl.bu * fl.bv), L.material.crossingWrap, 0, p)).toBeCloseTo(delta, 12);
+    const run = Math.min(12, Math.floor(delta / p + 0.5));
+    expect(run).toBeGreaterThan(0);
     for (const dir of [-1, 1]) {
-      let k = 1;
-      while (damage[2 * (c0 + dir * k)] === DAMAGE_PULLED) k++;
-      // stopped at the first crossing whose draw holds, passed every one before it
-      expect(pullDraw(c0 + dir * k, 0)).toBeGreaterThanOrEqual(pullRecoil(s.fieldArea[2 * (c0 + dir * k)] / 255));
-      for (let q = 1; q < k; q++) expect(pullDraw(c0 + dir * q, 0)).toBeLessThan(pullRecoil(s.fieldArea[2 * (c0 + dir * q)] / 255));
-      expect(steps).toBeGreaterThanOrEqual(k - 1);
+      for (let k = 1; k <= run; k++) expect(damage[2 * (c0 + dir * k)]).toBe(DAMAGE_PULLED);
+      expect(damage[2 * (c0 + dir * (run + 1))]).toBeLessThan(DAMAGE_PULLED);
     }
-    expect(pullOut(s.field, s.fieldArea, damage)).toBe(0);
+    // unloading does not draw the yarn back in
+    expect(pullAll(new Float64Array(2 * s.nodeCount))).toBe(0);
+    expect(damage[2 * (c0 + 1)]).toBe(DAMAGE_PULLED);
   });
 
   it('overloads the yarns beside a run of separated neighbours, near the breaks only', () => {

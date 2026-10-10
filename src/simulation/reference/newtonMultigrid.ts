@@ -198,7 +198,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
     axialBlock(Math.max(K, 0) / L + c, geomStiff(fs) / l, e, H);
     scatterPair(A, a, b, H);
   }
-  // bending triples (a, b, c) along each family: block coefficients k * [1,-2,1]^T [1,-2,1]
+  // bending triples (a, b, c) along each family: block coefficients k * w^T w, w = [wa, -2, wc]
   for (let b = 0; b < S.N; b++) {
     for (let f = 0; f < 2; f++) {
       const a = S.nbr[4 * b + 2 * f];
@@ -208,19 +208,18 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       const s1 = 2 * b + f;
       if (!S.segActive(s0) || !S.segActive(s1)) continue;
       const yarn = S.layer(b).material.yarns[f];
-      const Lm = 0.5 * (S.restLength[s0] + S.restLength[s1]);
-      const kb = (yarn.bendRigidity * 0.5 * (S.intact[s0] + S.intact[s1])) / (Lm * Lm * Lm);
+      const [kb, , fold, wa, wc] = S.bendCoeffs(b, f, s0, s1);
       // fold-stiffening energy: the exact Hessian kb (Psi' I + 2 Psi'' r r^T) is majorized by the
       // scalar kb (Psi' + 2 Psi'' |r|^2), which keeps the stencil's scalar-identity block form
       let q2 = 0;
       for (let z = 0; z < 3; z++) {
-        const rz = S.x[3 * a + z] + S.dx[3 * a + z] - 2 * (S.x[3 * b + z] + S.dx[3 * b + z]) + S.x[3 * c + z] + S.dx[3 * c + z];
+        const rz = wa * (S.x[3 * a + z] + S.dx[3 * a + z]) - 2 * (S.x[3 * b + z] + S.dx[3 * b + z]) + wc * (S.x[3 * c + z] + S.dx[3 * c + z]);
         q2 += rz * rz;
       }
-      const ps = bendPsi(q2, 4 * Lm * Lm);
+      const ps = bendPsi(q2, fold);
       const k = kb * (ps[1] + 2 * ps[2] * q2) + (kb * yarn.bendViscosity) / h;
       const nodes = [a, b, c];
-      const w = [1, -2, 1];
+      const w = [wa, -2, wc];
       for (let p = 0; p < 3; p++) {
         const r = nodes[p];
         if (A.fixed[r]) continue;
@@ -567,6 +566,30 @@ export function pcg(
 /** One projected-Newton iteration solved by PCG with a V-cycle preconditioner. Returns max |step|. */
 const lagged = new WeakMap<ReferenceSolver, MGLevel[]>();
 
+/** Step lengths evaluated by the line search (energy.wgsl ALPHA). */
+export const LINE_ALPHAS = [1, 0.5, 0.25, 0.125];
+
+/**
+ * Relative rounding bound of a line-search energy change: f32 per-term rounding accumulated over the
+ * GPU reduction tree, as a multiple of the sum of the terms' magnitudes (energy.wgsl LINE_NOISE). Both
+ * backends classify changes with the same bound, so a decision does not depend on their precision.
+ */
+export const LINE_NOISE = 4e-6;
+
+/**
+ * Step length from the evaluated energy changes e and their magnitude sums m (energy.wgsl lineChoose):
+ * the lowest potential if it is a conclusive decrease; 0 if every evaluated step conclusively increases
+ * it (a non-descent direction); otherwise the changes are within rounding (a converged iterate) and the
+ * full Newton step is taken.
+ */
+export function chooseStep(e: readonly number[], m: readonly number[]): number {
+  let best = 0;
+  for (let k = 1; k < e.length; k++) if (e[k] < e[best]) best = k;
+  if (e[best] < -LINE_NOISE * m[best]) return LINE_ALPHAS[best];
+  if (e.every((v, k) => v > LINE_NOISE * m[k])) return 0;
+  return 1;
+}
+
 /** Forget lagged coarse levels (call at the start of each substep). */
 export function resetLaggedLevels(S: ReferenceSolver): void {
   lagged.delete(S);
@@ -595,18 +618,9 @@ export function newtonStepPCG(S: ReferenceSolver, pcgIterations: number, cfg: MG
   pcg(levels, b, d, pcgIterations, undefined, smoothLines, cfg);
   let alpha = 1;
   if (cfg.lineSearch) {
-    // step length with the lowest potential among {1, 1/2, 1/4}; 1/8 if none decreases it (energy.wgsl)
-    const e = S.energyChange(d, [1, 0.5, 0.25]);
-    let best = e[0];
-    if (e[1] < best) {
-      alpha = 0.5;
-      best = e[1];
-    }
-    if (e[2] < best) {
-      alpha = 0.25;
-      best = e[2];
-    }
-    if (best > 0) alpha = 0.125;
+    const mag = [0, 0, 0, 0];
+    const e = S.energyChange(d, LINE_ALPHAS, mag);
+    alpha = chooseStep(e, mag);
   }
   let m = 0;
   for (let q = 0; q < d.length; q++) {

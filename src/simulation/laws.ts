@@ -29,6 +29,57 @@ export function bendPsi(q: number, a: number): [number, number, number] {
   return [q0 / d0 + p1 * t + 0.5 * p2 * t * t, p1 + p2 * t, p2];
 }
 
+/**
+ * Discrete bending of a yarn triple (a, b, c) whose spans have rest lengths La (a-b) and Lc (b-c).
+ * Crossing slip moves material between neighbouring spans, so they are generally unequal. The
+ * curvature vector r = wa x_a - 2 x_b + wc x_c with wa = 2 Lc / (La + Lc), wc = 2 La / (La + Lc)
+ * vanishes for every straight chain whose spans are strained alike (positions in proportion to the
+ * rest lengths), and |r| = Lh |t_c - t_a| = 2 Lh sin(theta / 2) with the harmonic mean
+ * Lh = 2 La Lc / (La + Lc). The rod energy B kappa^2 l / 2 over the Voronoi length l = (La + Lc) / 2,
+ * with kappa = theta / l, is then 0.5 kb |r|^2 with kb = B / (Lh^2 l); the fold scale is a = 4 Lh^2
+ * (bendPsi). For La = Lc these reduce to the second difference [1, -2, 1] and kb = B / L^3. The
+ * weights depend on rest lengths only (frozen during a solve), so r stays linear in the positions
+ * and the energy convex.
+ */
+export interface BendGeometry {
+  /** Weights of x_a and x_c (x_b has -2). */
+  wa: number;
+  wc: number;
+  /** Stiffness per unit bending rigidity, 1 / (Lh^2 l), 1/m^3. */
+  kPerB: number;
+  /** Fold scale a = 4 Lh^2. */
+  fold: number;
+}
+
+export function bendGeometry(La: number, Lc: number): BendGeometry {
+  const s = La + Lc;
+  const lh = (2 * La * Lc) / s;
+  return { wa: (2 * Lc) / s, wc: (2 * La) / s, kPerB: 1 / (lh * lh * 0.5 * s), fold: 4 * lh * lh };
+}
+
+/**
+ * Fraction of a bundle's bending rigidity carried across the middle node of a triple. Only yarns
+ * continuous through it bend: a yarn separated in either span (bit q of a span's cut mask) contributes
+ * nothing, even if both spans keep other yarns. With intact fractions ia, ic of the spans and B yarns,
+ * the continuous yarns' share is their count over B, times the weaker span's mean intactness per
+ * surviving yarn (the damage of individual yarns is not resolved along the bundle).
+ */
+export function bendScale(ia: number, ic: number, maskA: number, maskC: number, B: number): number {
+  const full = B >= 32 ? 0xffffffff : (1 << B) - 1;
+  const cont = popcount(~(maskA | maskC) & full);
+  if (cont === 0) return 0;
+  const ua = popcount(~maskA & full);
+  const uc = popcount(~maskC & full);
+  return (cont / B) * Math.min(ua > 0 ? (ia * B) / ua : 0, uc > 0 ? (ic * B) / uc : 0);
+}
+
+function popcount(v: number): number {
+  let x = v >>> 0;
+  x -= (x >>> 1) & 0x55555555;
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (Math.imul((x + (x >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24) >>> 0;
+}
+
 /** Psi(q1) - Psi(q0) without cancellation for small changes (dq = q1 - q0 computed stably). */
 export function bendPsiDelta(q0: number, q1: number, dq: number, a: number): number {
   const s0 = q0 / a;

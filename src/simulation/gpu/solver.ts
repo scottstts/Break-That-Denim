@@ -193,7 +193,8 @@ export class GpuSolver {
   /**
    * [0] ruptures, [1] pulled-out spans, [2] max speed since last cleared (f32 bits), [3] line-search
    * step length of the current Newton iteration (f32 bits),
-   * [4 + k] largest nodal update of Newton iteration k in the current substep (f32 bits).
+   * [4 + k] largest nodal update of Newton iteration k in the current substep (f32 bits),
+   * [12] Newton directions rejected by the line search (no evaluated step decreased the potential).
    */
   readonly counters: GPUBuffer;
   /** Cross-layer contact for multi-layer scenes, self-contact for a single layer. */
@@ -270,7 +271,7 @@ export class GpuSolver {
     this.pullBits = createBuffer(device, 'pullBits', 4 * Math.ceil(scene.fieldDamage.length / 2 / 16));
     this.tails = createBufferWith(device, 'tails', Float32Array.from(scene.tails));
     this.ext = createBuffer(device, 'ext', 48 * N);
-    this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON);
+    this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON + 16);
     this.contactEnabled = scene.layers.length > 1 || this.params.selfContact;
 
     // ---- levels
@@ -300,7 +301,7 @@ export class GpuSolver {
     this.Ap = createBuffer(device, 'pcg.Ap', 16 * N);
     this.rec = createBuffer(device, 'smooth.scratch', 10 * 16 * N);
     this.partial = createBuffer(device, 'pcg.partial', 4 * DOT_GROUPS);
-    this.partial4 = createBuffer(device, 'lineSearch.partial', 16 * DOT_GROUPS);
+    this.partial4 = createBuffer(device, 'lineSearch.partial', 32 * DOT_GROUPS);
     this.scal = createBuffer(device, 'pcg.scal', 4 * SCALARS);
     this.slotData = new Uint32Array((SLOT / 4) * 256);
     this.slots = createBuffer(device, 'slots', this.slotData.byteLength, UNIFORM);

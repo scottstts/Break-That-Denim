@@ -1,6 +1,6 @@
 import { DENIM, FAMILY_U, FAMILY_V, bundleWeave, crossingMass, type WeaveMaterial } from './material';
 import { fbm, noise1, rand01, smoothstep } from '../shared/noise';
-import { DAMAGE_CUT, MAX_BUNDLE, areaCode, coupleSpans, fieldLayers, pullOut, type FieldLayer } from './yarnField';
+import { DAMAGE_CUT, MAX_BUNDLE, areaCode, coupleSpans, fieldLayers, type FieldLayer } from './yarnField';
 
 /**
  * Scene asset compilation: three independent woven lattices with explicit identities, mounts,
@@ -123,7 +123,7 @@ export interface CompiledScene {
  * Version of the mechanical model (laws and their constants outside the material assets). Bump it
  * whenever equilibrium shapes change, so stale precomputed drapes are rejected.
  */
-export const MECHANICS_VERSION = 9;
+export const MECHANICS_VERSION = 10;
 
 /** Content hash of a compiled scene's initial state and mechanics (validates precomputed drapes). */
 export function sceneHash(s: CompiledScene): number {
@@ -263,8 +263,7 @@ export function compileScene(specs: LayerSpec[]): CompiledScene {
     fillLayer(scene, specs[l], layers[l]);
     fillField(scene, specs[l], layers[l], fl.layers[l]);
   }
-  // the worn-through yarns' ends have recoiled as they would have when they broke
-  while (pullOut(fl.layers, scene.fieldArea, scene.fieldDamage) > 0);
+  // yarns worn through by abrasion carried no load when they parted: their ends have not been pulled out
   // span state from the initial field; spans that lost every yarn start separated
   const active = (q: number) => (scene.segFlags[q] & (SEG_EXISTS | SEG_BROKEN)) === SEG_EXISTS;
   const before = Uint16Array.from(scene.segFlags);
@@ -327,10 +326,11 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
         scene.segFlags[sIdx] = SEG_EXISTS;
         scene.restLength[sIdx] = f === FAMILY_U ? m.pitchU : m.pitchV;
         scene.intact[sIdx] = 1;
-        // Worn yarns lose their grip in a loosened weave: past the peak they slide out of it over
-        // millimetres while still carrying a falling load (pull-out) instead of snapping, so damaged
-        // cloth thins, stretches and bridges an opening before it lets go. Intact cloth stays brittle.
-        scene.softening[sIdx] = yarn.softeningOpening * (1 + 2.5 * w) + 0.6e-3 * Math.pow(w, 1.5);
+        // Cohesive opening of a yarn's failure site, 2 Gamma / T_peak. Abrasion removes fibres, so
+        // fracture work and peak tension fall together and the opening does not depend on wear. Yarn
+        // sliding through the weave is a separate mechanism with its own material transport (crossing
+        // slip, step.wgsl; free-end pull-out, yarnField.ts pullOut), not an extended softening branch.
+        scene.softening[sIdx] = yarn.softeningOpening;
         scene.failSite[sIdx] = 0.5;
       }
     }

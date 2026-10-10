@@ -253,20 +253,54 @@ fn fieldTotalY() -> u32 {
   return F.x + F.y * F.z;
 }
 
-// lowbias32 (shared/noise.ts hash32)
-fn hashY(x0: u32) -> u32 {
-  var v = x0;
-  v ^= v >> 16u;
-  v *= 0x7feb352du;
-  v ^= v >> 15u;
-  v *= 0x846ca68bu;
-  v ^= v >> 16u;
-  return v;
+// Pull-out of free yarn ends (yarnField.ts pullOut, recoilLength): a crossing still interlaced leaves
+// the weave once the nearest cut along its yarn (through crossings already pulled out) lies within the
+// end's shear-lag retraction (T eps - W) / f at the local strain.
+const RECOIL_MAX: i32 = 12;
+
+fn breakDistance(F: vec4<u32>, f: u32, k: u32, m: u32) -> i32 {
+  let pos = i32(select(m, k, f == 0u));
+  let len = i32(select(F.z, F.y, f == 0u));
+  let stride = i32(select(F.y, 1u, f == 0u));
+  let c = i32(F.x + m * F.y + k);
+  var best = -1;
+  for (var side = 0; side < 2; side++) {
+    let dir = select(-1, 1, side == 1);
+    for (var d = 1; d <= RECOIL_MAX; d++) {
+      let p = pos + dir * d;
+      if (p < 0 || p >= len) { break; }
+      let code = damageAt(u32(c + dir * d * stride), f);
+      if (code == CUT) {
+        if (best < 0 || d < best) { best = d; }
+        break;
+      }
+      if (code != PULLED) { break; }
+    }
+  }
+  return best;
 }
 
-fn pullPasses(c: u32, f: u32, area: f32) -> bool {
-  let draw = f32(hashY(c * 2u + f + 0x632be5abu)) / 4294967296.0;
-  return draw < 0.5 + 0.38 * (1.0 - area);
+fn pullsOut(l: u32, F: vec4<u32>, c: u32, f: u32, k: u32, m: u32) -> bool {
+  let d = breakDistance(F, f, k, m);
+  if (d < 0) { return false; }
+  let eps = interpolatedStrain(l, f, k, m);
+  if (eps >= 0.5 * NO_STRAIN || eps <= 0.0) { return false; }
+  let mat = P.layers[l];
+  let g = 1u - f;
+  let ec = interpolatedStrain(l, g, k, m);
+  let bu = bundleF(l, 1u);
+  let bv = bundleF(l, 0u);
+  let Bg = select(bv, bu, g == 1u);
+  let tCross = select(max(0.0, axialTension(mat.yarn[g], ec)) * areaAt(c, g) / f32(Bg), 0.0, ec >= 0.5 * NO_STRAIN);
+  let L = latticeOf(l);
+  let n = L.x + min(L.z - 1u, m / bv) * L.y + min(L.y - 1u, k / bu);
+  // pitch of the individual weave along the yarn: the bundled pitch over the crossing family's count
+  let pitch = select(mat.a.w / f32(bu), mat.b.x / f32(bv), f == 1u);
+  let B = select(bv, bu, f == 1u);
+  let y = mat.yarn[f];
+  let comp = areaAt(c, f) / f32(B) * (axialTension(y, eps) * eps - axialEnergyDensity(y, eps));
+  let fric = mat.a.y * (nodes[n].n0 / f32(bu * bv) + mat.a.z * tCross);
+  return comp * pitch >= (f32(d) - 0.5) * pitch * fric;
 }
 
 // One invocation per 16 crossings: which ends pull out of their next crossing this substep.
@@ -288,12 +322,7 @@ fn pullMark(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = (c - F.x) / F.y;
     for (var f = 0u; f < 2u; f++) {
       if (damageAt(c, f) >= PULLED) { continue; }
-      let pos = select(m, k, f == 0u);
-      let len = select(F.z, F.y, f == 0u);
-      let stride = select(F.y, 1u, f == 0u);
-      let end = (pos > 0u && damageAt(c - stride, f) >= PULLED) || (pos + 1u < len && damageAt(c + stride, f) >= PULLED);
-      if (!end) { continue; }
-      if (pullPasses(c, f, areaAt(c, f))) { bits |= 1u << (2u * e + f); }
+      if (pullsOut(l, F, c, f, k, m)) { bits |= 1u << (2u * e + f); }
     }
   }
   pullBits[w] = bits;

@@ -85,6 +85,17 @@ fn axialStiffness(y: Yarn, eps: f32) -> f32 {
   return y.eaHigh;
 }
 
+// Undamaged strain energy per unit rest length (axial.ts axialEnergyDensity).
+fn axialEnergyDensity(y: Yarn, eps: f32) -> f32 {
+  if (eps <= 0.0) { return 0.5 * y.eaCompress * eps * eps; }
+  let ec = y.crimpStrain;
+  let dk = y.eaHigh - y.eaLow;
+  if (eps <= ec) { return 0.5 * y.eaLow * eps * eps + dk * eps * eps * eps / (6.0 * ec); }
+  let tc = y.eaLow * ec + dk * ec * 0.5;
+  let d = eps - ec;
+  return 0.5 * y.eaLow * ec * ec + dk * ec * ec / 6.0 + tc * d + 0.5 * y.eaHigh * d * d;
+}
+
 // Strain at which the undamaged curve reaches tension t > 0 (cancellation-free quadratic root).
 fn strainAtTension(y: Yarn, t: f32) -> f32 {
   let ec = y.crimpStrain;
@@ -150,6 +161,28 @@ fn bendPsi(q: f32, a: f32) -> vec3<f32> {
   let p2 = 2.0 / (a * d0 * d0 * d0);
   let t = q - q0;
   return vec3<f32>(q0 / d0 + p1 * t + 0.5 * p2 * t * t, p1 + p2 * t, p2);
+}
+
+// Bending geometry of a triple with rest spans La (a-b) and Lc (b-c) (laws.ts bendGeometry):
+// r = wa x_a - 2 x_b + wc x_c; returns (wa, wc, 1 / (Lh^2 l), fold scale 4 Lh^2).
+fn bendGeometry(La: f32, Lc: f32) -> vec4<f32> {
+  let s = La + Lc;
+  let lh = 2.0 * La * Lc / s;
+  return vec4<f32>(2.0 * Lc / s, 2.0 * La / s, 1.0 / (lh * lh * 0.5 * s), 4.0 * lh * lh);
+}
+
+// Share of a bundle's bending rigidity carried through the middle node (laws.ts bendScale): only
+// yarns uncut in both spans are continuous.
+fn bendScale(ia: f32, ic: f32, maskA: u32, maskC: u32, B: u32) -> f32 {
+  let full = select((1u << B) - 1u, 0xFFFFFFFFu, B >= 32u);
+  let cont = countOneBits(~(maskA | maskC) & full);
+  if (cont == 0u) { return 0.0; }
+  let ua = countOneBits(~maskA & full);
+  let uc = countOneBits(~maskC & full);
+  let fb = f32(B);
+  let ma = select(0.0, ia * fb / f32(ua), ua > 0u);
+  let mc = select(0.0, ic * fb / f32(uc), uc > 0u);
+  return f32(cont) / fb * min(ma, mc);
 }
 
 // Psi(q1) - Psi(q0) without cancellation for small changes (dq = q1 - q0 computed stably).

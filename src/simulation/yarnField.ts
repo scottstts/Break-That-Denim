@@ -30,8 +30,7 @@
  * [i bu + floor(bu / 2), + bu). Damage and strength are stored per crossing and family f (0 = pick,
  * running along u; 1 = warp, along v) at index 2 c + f. Mirrored in WGSL (yarnfield.wgsl).
  */
-import { axialTension, strainAtTension, yarnDamage } from './axial';
-import { hash32 } from '../shared/noise';
+import { axialEnergyDensity, axialTension, strainAtTension, yarnDamage } from './axial';
 import type { LayerInfo } from './scene';
 
 export const DAMAGE_CUT = 255;
@@ -87,52 +86,97 @@ export function damageCode(d: number): number {
   return d >= 1 ? DAMAGE_CUT : Math.min(DAMAGE_PULLED - 1, Math.floor(d * DAMAGE_CUT));
 }
 
+/** Longest pull-out (crossings from the break) evaluated along a yarn. */
+export const RECOIL_MAX = 12;
+
 /**
- * Pull-out of loose yarn ends (DAMAGE_PULLED), mirrored by pullMark / pullApply in yarnfield.wgsl.
+ * Pull-out of a free yarn end (shear lag). A cut yarn carries no tension at its end; along it the
+ * crossings pass at most the friction f per unit length, so where the cloth around it is strained the
+ * yarn's tension rises from zero over T / f, and the yarn slides relative to the weave there. Its end
+ * moves back through the crossings by
  *
- * A loaded yarn that snaps releases its stretch: the free end recoils through the weave until the
- * friction of the crossings it passes holds it. With the yarn's tension near its peak and the
- * friction per crossing of compacted denim, that is a crossing or two in sound weave, several in
- * abraded, loosened weave. So a fringe of loose ends is left wherever yarns broke, irregular along
- * an edge. Per crossing a fixed draw passes with probability pullRecoil(area): an end next to a
- * separated crossing slips out of the next one when that draw passes. The fringe is therefore a
- * geometric number of crossings, decided by the material, not by time or the strain of the cloth.
- * A cut end carries no tension, so the cloth stretching past it does not pull it out further, and a
- * torn edge never creeps at rest. At most one crossing per end advances per substep, decided from the
- * state before it.
+ *   delta = integral of eps(T(s)) ds = (1 / f) integral_0^T eps dT = (T eps - W(eps)) / f,
+ *
+ * the yarn's complementary energy per unit length over the friction per unit length (exact for the
+ * J-curve). T and W are the yarn's share of the bundle law at the local strain (area / B of it), and
+ * f = mu (n0 + wrap T_cross) / pitch is the crossing friction along the yarn: compaction plus the wrap
+ * force of the crossing yarn's tension, one crossing per pitch. A yarn end in slack or unloaded cloth
+ * does not move; an end in strained, loosened (worn) weave slides out of several crossings.
  */
-export function pullRecoil(area: number): number {
-  return 0.5 + 0.38 * (1 - area);
-}
-/** Fixed draw in [0, 1) of crossing c, family f for the recoil test. */
-export function pullDraw(c: number, f: number): number {
-  return hash32((c * 2 + f + 0x632be5ab) >>> 0) / 4294967296;
+export function recoilLength(y: YarnMaterialLaw, B: number, area: number, eps: number, mu: number, n0: number, wrap: number, tCross: number, pitch: number): number {
+  if (!(eps > 0)) return 0;
+  const share = area / B;
+  const comp = share * (axialTension(y, eps) * eps - axialEnergyDensity(y, eps));
+  return (comp * pitch) / (mu * (n0 + wrap * Math.max(0, tCross)));
 }
 
 /**
- * One pull-out step over every layer: marks from the current codes, then applies. Returns the
- * number of crossings pulled out.
+ * Pull-out of yarn ends (DAMAGE_PULLED): a crossing whose yarn is still interlaced is marked pulled out
+ * once the nearest break along the yarn (a cut reached through crossings already pulled out) lies
+ * within the end's retraction recoilLength, measured from half a pitch inside the cut. Marks are never
+ * undone: the yarn does not re-enter a crossing it left. Evaluated after each substep from the strain
+ * snapshot `strain` (per span, NaN where none), so ends move out progressively as the cloth around them
+ * is loaded. Mirrored by pullMark / pullApply in yarnfield.wgsl. Returns the number of crossings pulled out.
  */
-export function pullOut(fls: readonly FieldLayer[], area: Uint8Array, damage: Uint8Array): number {
+export function pullOut(layers: readonly LayerInfo[], fls: readonly FieldLayer[], area: Uint8Array, damage: Uint8Array, strain: ArrayLike<number>, crossingNormal0: ArrayLike<number>): number {
   const marked: number[] = [];
-  fls.forEach((fl) => {
+  layers.forEach((L, l) => {
+    const fl = fls[l];
+    const mat = L.material;
     for (let m = 0; m < fl.M; m++) {
       for (let k = 0; k < fl.K; k++) {
         const c = fl.offset + m * fl.K + k;
         for (let f = 0; f < 2; f++) {
           if (damage[2 * c + f] >= DAMAGE_SEPARATED) continue;
-          const pos = f === 0 ? k : m;
-          const len = f === 0 ? fl.K : fl.M;
-          const stride = f === 0 ? 1 : fl.K;
-          const end = (pos > 0 && damage[2 * (c - stride) + f] >= DAMAGE_SEPARATED) || (pos + 1 < len && damage[2 * (c + stride) + f] >= DAMAGE_SEPARATED);
-          if (!end) continue;
-          if (pullDraw(c, f) < pullRecoil(areaOf(area[2 * c + f]))) marked.push(2 * c + f);
+          const d = breakDistance(fl, damage, f, k, m);
+          if (d < 0) continue;
+          const eps = interpolatedStrain(L, fl, f, k, m, strain);
+          if (!Number.isFinite(eps)) continue;
+          const g = 1 - f;
+          const ec = interpolatedStrain(L, fl, g, k, m, strain);
+          const tCross = Number.isFinite(ec) ? (Math.max(0, axialTension(mat.yarns[g], ec)) * areaOf(area[2 * c + g])) / bundleOf(fl, g) : 0;
+          const n = nodeOfCrossing(L, fl, k, m);
+          const pitch = f === 1 ? L.weave.pitchV : L.weave.pitchU;
+          const delta = recoilLength(mat.yarns[f], bundleOf(fl, f), areaOf(area[2 * c + f]), eps, mat.crossingFriction, crossingNormal0[n] / (fl.bu * fl.bv), mat.crossingWrap, tCross, pitch);
+          if (delta >= (d - 0.5) * pitch) marked.push(2 * c + f);
         }
       }
     }
   });
   for (const q of marked) damage[q] = DAMAGE_PULLED;
   return marked.length;
+}
+
+/**
+ * Crossings from (k, m) to the nearest cut along its family-f yarn reached through pulled-out
+ * crossings only (1 = adjacent), within RECOIL_MAX; -1 if there is none.
+ */
+export function breakDistance(fl: FieldLayer, damage: Uint8Array, f: number, k: number, m: number): number {
+  const pos = f === 0 ? k : m;
+  const len = f === 0 ? fl.K : fl.M;
+  const stride = f === 0 ? 1 : fl.K;
+  const c = fl.offset + m * fl.K + k;
+  let best = -1;
+  for (const dir of [-1, 1]) {
+    for (let d = 1; d <= RECOIL_MAX; d++) {
+      const p = pos + dir * d;
+      if (p < 0 || p >= len) break;
+      const code = damage[2 * (c + dir * d * stride) + f];
+      if (code === DAMAGE_CUT) {
+        if (best < 0 || d < best) best = d;
+        break;
+      }
+      if (code !== DAMAGE_PULLED) break;
+    }
+  }
+  return best;
+}
+
+/** Lattice node nearest to crossing (k, m): the bundle crossing it belongs to. */
+export function nodeOfCrossing(L: LayerInfo, fl: FieldLayer, k: number, m: number): number {
+  const i = Math.min(L.nx - 1, Math.floor(k / fl.bu));
+  const j = Math.min(L.ny - 1, Math.floor(m / fl.bv));
+  return L.nodeOffset + j * L.nx + i;
 }
 
 /** Lattice span (owner i, j) of the yarn of family f at crossing (k, m), or null outside every span. */

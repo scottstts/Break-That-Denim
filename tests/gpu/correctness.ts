@@ -221,11 +221,11 @@ async function correctness(device: GPUDevice): Promise<void> {
   check('PCG step', maxAbsRelToScale(dg, dc) < 2e-2, `maxAbs/scale=${maxAbsRelToScale(dg, dc).toExponential(2)}`);
 
   // line-search energy changes along the GPU direction
-  const eCpu = cpu.energyChange(dg, [1, 0.5, 0.25]);
+  const eCpu = cpu.energyChange(dg, [1, 0.5, 0.25, 0.125]);
   await submit(device, (p) => gpu.encodeLineSearch(p));
   const part = new Float32Array(await readBuffer(device, gpu.partial4));
-  const eGpu = [0, 0, 0];
-  for (let k = 0; k < part.length / 4; k++) for (let q = 0; q < 3; q++) eGpu[q] += part[4 * k + q];
+  const eGpu = [0, 0, 0, 0];
+  for (let k = 0; k < part.length / 8; k++) for (let q = 0; q < 4; q++) eGpu[q] += part[8 * k + q];
   const eScale = Math.max(...eCpu.map(Math.abs));
   const eErr = Math.max(...eGpu.map((v, q) => Math.abs(v - eCpu[q]))) / eScale;
   check('line-search energy changes', eErr < 1e-2, `gpu [${eGpu.map((v) => v.toExponential(3)).join(', ')}] cpu [${eCpu.map((v) => v.toExponential(3)).join(', ')}]`);
@@ -290,6 +290,29 @@ async function torn(device: GPUDevice): Promise<void> {
   for (let i = 15; i <= 31; i++) cut(i, 11, 1);
   for (let i = 6; i < 13; i++) cut(i, 30, 1);
   for (let k = 0; k < 12; k++) cpu.substep();
+  // crossing slip leaves neighbouring spans of a yarn unequal, and yarns cut in one span but not the
+  // next: move material along lines (conserving each line's length) and cut yarns in alternate spans,
+  // so bending weights (bendGeometry) and continuity (bendScale) are exercised away from their defaults
+  const ny = scene.layers[0].ny;
+  for (let j = 4; j < ny - 4; j += 3) {
+    for (let i = 4; i < nx - 5; i += 2) {
+      const s0 = 2 * (j * nx + i);
+      const s1 = 2 * (j * nx + i + 1);
+      if (!cpu.segActive(s0) || !cpu.segActive(s1)) continue;
+      const dl = 0.18 * cpu.restLength[s0] * Math.sin(0.7 * i + j);
+      cpu.restLength[s0] += dl;
+      cpu.restLength[s1] -= dl;
+    }
+  }
+  for (let j = 5; j < ny - 5; j += 4) {
+    for (let i = 5; i < nx - 5; i += 3) {
+      const s = 2 * (j * nx + i) + 1;
+      if (!cpu.segActive(s)) continue;
+      const mask = (i + j) % 2 === 0 ? 0b001 : 0b110;
+      cpu.cutMask[s] = mask;
+      cpu.intact[s] = (3 - (mask === 1 ? 1 : 2)) / 3;
+    }
+  }
   const gpu = new GpuSolver(device, scene, params);
   const N = scene.nodeCount;
   const { xs, vs } = copyState(cpu, N);
@@ -306,6 +329,19 @@ async function torn(device: GPUDevice): Promise<void> {
   const kinks = kinkRows(cpu, N);
   const eOp = maxAbsRelToScaleRows(Agpu, A.A, kinks);
   check('torn: fine operator', eOp < 5e-5, `${eOp.toExponential(2)} (${kinks.size} rows at the axial kink excluded)`);
+  {
+    const g = new Float64Array(3);
+    const bCpu = new Float64Array(3 * N);
+    for (let n = 0; n < N; n++) {
+      if (kinks.has(n)) continue;
+      cpu.nodeGradient(n, g);
+      for (let q = 0; q < 3; q++) bCpu[3 * n + q] = -g[q];
+    }
+    const bGpu = await readVec(device, gpu.levels[0].B, N);
+    for (const n of kinks) for (let q = 0; q < 3; q++) bGpu[3 * n + q] = 0;
+    const e = maxAbsRelToScale(bGpu, bCpu);
+    check('torn: newton rhs', e < 1e-3, `maxAbs/scale=${e.toExponential(2)}`);
+  }
   A.A.set(Agpu);
   const levels = buildHierarchy(A, MG);
   for (let k = 1; k < Math.min(levels.length, gpu.levels.length); k++) {
@@ -325,11 +361,11 @@ async function torn(device: GPUDevice): Promise<void> {
   await submit(device, (p) => gpu.encodePCG(p));
   const dg = await readVec(device, gpu.delta, N);
   check('torn: PCG step', maxAbsRelToScale(dg, dc) < 2e-2, `maxAbs/scale=${maxAbsRelToScale(dg, dc).toExponential(2)}`);
-  const eCpu = cpu.energyChange(dg, [1, 0.5, 0.25]);
+  const eCpu = cpu.energyChange(dg, [1, 0.5, 0.25, 0.125]);
   await submit(device, (p) => gpu.encodeLineSearch(p));
   const part = new Float32Array(await readBuffer(device, gpu.partial4));
-  const eGpu = [0, 0, 0];
-  for (let k = 0; k < part.length / 4; k++) for (let q = 0; q < 3; q++) eGpu[q] += part[4 * k + q];
+  const eGpu = [0, 0, 0, 0];
+  for (let k = 0; k < part.length / 8; k++) for (let q = 0; q < 4; q++) eGpu[q] += part[8 * k + q];
   const eScale = Math.max(...eCpu.map(Math.abs));
   const eErr = Math.max(...eGpu.map((v, q) => Math.abs(v - eCpu[q]))) / eScale;
   check('torn: line-search energy changes', eErr < 1e-2, `gpu [${eGpu.map((v) => v.toExponential(3)).join(', ')}] cpu [${eCpu.map((v) => v.toExponential(3)).join(', ')}]`);
