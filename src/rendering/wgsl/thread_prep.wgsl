@@ -34,6 +34,35 @@ fn chainCarries(ri: RunInfo) -> bool {
   return true;
 }
 
+// A run held at one end only: the drawn parameter up to which (from that end) its chain still holds,
+// in one piece. Beyond it the yarn hangs from the chain's last point (thread_geom.wgsl runCenter).
+fn chainReach(ri: RunInfo) -> f32 {
+  let LR = R.layers[ri.layer];
+  let L = LR.lattice;
+  let f = ri.fam;
+  let Bal = f32(select(bundleOf(LR, 0u), bundleOf(LR, 1u), f == 0u));
+  let Bcr = select(bundleOf(LR, 1u), bundleOf(LR, 0u), f == 0u);
+  let len = select(L.z, L.y, f == 0u);
+  let b = ri.yarn / Bcr;
+  let off = 0.5 * (Bal - 1.0);
+  let a0 = u32(clamp(floor((ri.drawA - off) / Bal), 0.0, f32(len) - 2.0));
+  let a1 = u32(clamp(floor((ri.drawB - off) / Bal), 0.0, f32(len) - 2.0));
+  if (ri.heldA) {
+    let w0 = x[chainNode(L, f, a0, b)].w;
+    for (var a = a0; a <= a1; a++) {
+      let n = chainNode(L, f, a, b);
+      if (!segOkTh(n, f, L) || abs(x[chainNode(L, f, a + 1u, b)].w - w0) > 0.5) { return clamp(f32(a) * Bal + off, ri.drawA, ri.drawB); }
+    }
+    return ri.drawB;
+  }
+  let w1 = x[chainNode(L, f, a1 + 1u, b)].w;
+  for (var a = i32(a1); a >= i32(a0); a--) {
+    let n = chainNode(L, f, u32(a), b);
+    if (!segOkTh(n, f, L) || abs(x[n].w - w1) > 0.5) { return clamp(f32(a + 1) * Bal + off, ri.drawA, ri.drawB); }
+  }
+  return ri.drawA;
+}
+
 // The held end at drawn parameter p (a crossing where the yarn is in the cloth): where that cloth is,
 // and the yarn's unit direction there (toward increasing p). Falls back to the chain when the cloth
 // is not held there.
@@ -74,7 +103,10 @@ fn threadPrep(@builtin(global_invocation_id) gid: vec3<u32>) {
     g.pB = e[0];
     g.tB = e[1];
   }
-  runGeo[RUN_GEO * r] = vec4<f32>(select(0.0, 1.0, g.chain), 0.0, 0.0, 0.0);
+  // a run held at one end and not carried whole: how far its chain carries it from that end
+  var reach = select(ri.drawA, ri.drawB, ri.heldA);
+  if (!g.chain && ri.heldA != ri.heldB) { reach = chainReach(ri); }
+  runGeo[RUN_GEO * r] = vec4<f32>(select(0.0, 1.0, g.chain), reach, 0.0, 0.0);
   runGeo[RUN_GEO * r + 1u] = vec4<f32>(g.pA, 0.0);
   runGeo[RUN_GEO * r + 2u] = vec4<f32>(g.pB, 0.0);
   runGeo[RUN_GEO * r + 3u] = vec4<f32>(g.tA, 0.0);

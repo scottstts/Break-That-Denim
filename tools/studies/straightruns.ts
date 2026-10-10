@@ -38,6 +38,7 @@ export default async function main(args: string[]): Promise<void> {
   let straight = 0;
   const lens: number[] = [];
   const reasons: string[] = [];
+  const hanging: number[] = [];
   const xs = new Float32Array(await readBuffer(device, solver.x));
   const sg = new Uint32Array(await readBuffer(device, solver.segs));
   const L = scene.layers[0];
@@ -74,9 +75,12 @@ export default async function main(args: string[]): Promise<void> {
   for (let q = 0; q < count; q++) {
     const heldA = ((runs[4 * q] >> 5) & 3) !== 1;
     const heldB = ((runs[4 * q] >> 7) & 3) !== 1;
-    if (!heldA || !heldB) continue;
-    both++;
     const g = 28 * q;
+    if (!heldA || !heldB) {
+      if (heldA !== heldB && geo[g] < 0.5) hanging.push(((runs[4 * q + 2] + 0.5) * (((runs[4 * q] >> 4) & 1) === 0 ? scene.layers[0].weave.pitchU : scene.layers[0].weave.pitchV)) * 1e3);
+      continue;
+    }
+    both++;
     if (geo[g] > 0.5) continue;
     straight++;
     reasons.push(reason(runs[4 * q], runs[4 * q + 1], runs[4 * q + 2]));
@@ -84,6 +88,8 @@ export default async function main(args: string[]): Promise<void> {
   }
   lens.sort((a, b) => b - a);
   console.log(`${args[0]}: runs ${count}, held at both ends ${both}, straight (no carrying chain) ${straight}; longest mm ${lens.slice(0, 8).map((v) => v.toFixed(1)).join(' ')}; reasons ${JSON.stringify(reasons.reduce<Record<string, number>>((acc, r) => ((acc[r] = (acc[r] ?? 0) + 1), acc), {}))}`);
+  hanging.sort((a, b) => b - a);
+  console.log(`  hanging (one end held, no carrying chain): ${hanging.length}; longest mm ${hanging.slice(0, 10).map((v) => v.toFixed(1)).join(' ')}; over 5 mm ${hanging.filter((v) => v > 5).length}`);
   void N;
   device.destroy();
 }

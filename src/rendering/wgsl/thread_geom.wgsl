@@ -128,6 +128,9 @@ fn cmrdT(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> 
 // held end along tA, the yarn's direction there.
 struct RunGeo {
   chain: bool,
+  // held at one end only, not carried whole: the drawn parameter up to which the chain carries it from
+  // its held end (thread_prep.wgsl chainReach)
+  reach: f32,
   pA: vec3<f32>,
   pB: vec3<f32>,
   tA: vec3<f32>,
@@ -167,14 +170,27 @@ fn runCenter(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Ce
     o.d = (g.pB - g.pA) / span;
     return o;
   }
-  // hanging from its held end: it leaves along the yarn's direction there and bends over toward the
-  // vertical within a bending length, at its own length (integrated along the arc)
+  // held at one end: along its chain as far as the chain holds (shifted to meet the held end), then
+  // hanging from the chain's last point: it leaves along the yarn's direction there and bends over
+  // toward the vertical within a bending length, at its own length (integrated along the arc)
   let fromA = ri.heldA;
-  let reach = select(ri.drawB - p, p - ri.drawA, fromA) * pitchAl;
-  let dir0 = select(-g.tB, g.tA, fromA);
+  let held = select(ri.drawB, ri.drawA, fromA);
+  let shift = endOffset(ri, g, cA, cB, p);
+  if (select(p >= g.reach, p <= g.reach, fromA) && c.valid) {
+    o.p = c.p + shift;
+    o.d = c.d;
+    return o;
+  }
+  var q = select(g.pB, g.pA, fromA);
+  var dir0 = select(-g.tB, g.tA, fromA);
+  if (g.reach != held) {
+    let e = centerAt(ri, g.reach);
+    q = e.p + shift;
+    dir0 = normalize(e.d * select(-1.0, 1.0, fromA) + vec3<f32>(1e-9, 0.0, 0.0));
+  }
+  let reach = abs(p - g.reach) * pitchAl;
   let down = vec3<f32>(0.0, 0.0, -1.0);
   let lb = 1.5e-3;
-  var q = select(g.pB, g.pA, fromA);
   var dq = dir0;
   let steps = 6u;
   for (var k = 0u; k < steps; k++) {
@@ -190,6 +206,7 @@ fn runCenter(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Ce
 fn runGeoZero() -> RunGeo {
   var g: RunGeo;
   g.chain = true;
+  g.reach = 0.0;
   g.pA = vec3<f32>(0.0);
   g.pB = vec3<f32>(0.0);
   g.tA = vec3<f32>(1.0, 0.0, 0.0);
@@ -298,6 +315,7 @@ fn runGeoAt(r: u32) -> RunGeo {
   var g: RunGeo;
   let h = runGeo[RUN_GEO * r];
   g.chain = h.x > 0.5;
+  g.reach = h.y;
   g.pA = runGeo[RUN_GEO * r + 1u].xyz;
   g.pB = runGeo[RUN_GEO * r + 2u].xyz;
   g.tA = runGeo[RUN_GEO * r + 3u].xyz;
