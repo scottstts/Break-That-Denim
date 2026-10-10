@@ -447,12 +447,15 @@ export default async function main(args: string[]): Promise<void> {
   mkdirSync(CAPTURES, { recursive: true });
   writeFileSync(resolve(CAPTURES, `${name}.log`), log.join('\n'));
   if (process.env.DUMP) {
-    // final state for offline analysis: x (vec4 per node) then segs (8 x 32-bit per span)
+    // final state for offline analysis (still.ts): x (vec4 per node), segs (8 x 32-bit per span),
+    // tails (4 per node)
     const xb = new Uint8Array(await readBuffer(device, solver.x));
     const sb = new Uint8Array(await readBuffer(device, solver.segs));
-    const out = new Uint8Array(xb.length + sb.length);
+    const tb = new Uint8Array(await readBuffer(device, solver.tails));
+    const out = new Uint8Array(xb.length + sb.length + tb.length);
     out.set(xb, 0);
     out.set(sb, xb.length);
+    out.set(tb, xb.length + sb.length);
     writeFileSync(resolve(CAPTURES, `${name}.state`), out);
   }
   const path = resolve(CAPTURES, `${name}.png`);

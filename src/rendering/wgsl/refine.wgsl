@@ -1,7 +1,7 @@
 // Per-frame geometry preparation from the accepted mechanical state:
 //  - nodeFrame: per-node unit normal and +u / +v tangents from connected yarn neighbours (holes never
 //    bridge; a missing direction completes the frame and an isolated node keeps its last frame),
-//  - classify: per-cell intact flag, compact lists of torn cells, explicitly drawn spans and yarn tails,
+//  - classify: per-cell intact flag and strand masks, compact lists of torn cells and loose yarn tails,
 //  - refine: bicubic (Catmull-Rom) surface samples on an S x S grid per cell with exact derivatives,
 //  - args: indirect draw arguments from the list counters.
 
@@ -18,16 +18,15 @@
 // per node: +u unit tangent with the node's wear in w (static), +v unit tangent
 @group(0) @binding(10) var<storage, read_write> tframe: array<vec4<f32>>;
 
-// lists layout: [0] span count, [1] tail count, [2] torn cell count, [3] unused, then spans at
+// lists layout: [0] unused, [1] tail count, [2] torn cell count, [3] unused, then (unused) spans at
 // SPAN_BASE, tails after MAX_SPANS entries, torn cells after MAX_TAILS more
 const SPAN_BASE: u32 = 4u;
 override MAX_SPANS: u32 = 65536u;
 override MAX_TAILS: u32 = 65536u;
-override MAX_TORN: u32 = 32768u;
-override TORN_VERTS: u32 = 24u;
+override MAX_TORN: u32 = 16384u;
+override TORN_VERTS: u32 = 96u;
 override TAIL_VERTS: u32 = 14u;
-override FUZZ_VERTS: u32 = 10u;
-override FUZZ_PER_YARN: u32 = 10u;
+override FUZZ_VERTS: u32 = 14u;
 override FUZZ_PER_TAIL: u32 = 12u;
 
 // Node still in the scene (retired debris, x.w = 2, is not drawn).
@@ -127,56 +126,26 @@ fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   cellFlags[cell] = flags;
 }
 
-fn cellOk(l: u32, ci: i32, cj: i32) -> bool {
-  let L = R.layers[l].lattice;
-  if (ci < 0 || cj < 0 || ci + 1 >= i32(L.y) || cj + 1 >= i32(L.z)) { return true; }
-  return cellFlags[cellOf(l, u32(ci), u32(cj))] != 0u;
-}
-
-// Active spans next to a non-intact cell are drawn as explicit yarns; tails of broken or pulled-out
-// yarn ends are listed per node side.
+// Loose yarn ends (broken or pulled-out tails) are listed per node side.
 @compute @workgroup_size(128)
 fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
-  if (n >= R.counts.x) { return; }
-  let l = layerOf(n);
-  let L = R.layers[l].lattice;
-  let i = nodeI(n);
-  let j = nodeJ(n);
-  for (var f = 0u; f < 2u; f++) {
-    let len = select(i32(L.z), i32(L.y), f == 0u);
-    let a = select(j, i, f == 0u);
-    if (a + 1 >= len || !segOk(n, f)) { continue; }
-    // the two cells sharing span (n, f): on its +lateral side (+v for u-spans, +u for v-spans) and -side
-    var plus = true;
-    var minus = true;
-    if (f == 0u) {
-      plus = cellOk(l, i, j);
-      minus = cellOk(l, i, j - 1);
-    } else {
-      plus = cellOk(l, i, j);
-      minus = cellOk(l, i - 1, j);
-    }
-    if (plus && minus) { continue; }
-    let k = atomicAdd(&lists[0], 1u);
-    // bits 30 / 31: the +/- side cell is intact surface (its yarns are drawn there, not here)
-    if (k < MAX_SPANS) { atomicStore(&lists[SPAN_BASE + k], (2u * n + f) | (select(0u, 1u, plus) << 30u) | (select(0u, 1u, minus) << 31u)); }
-  }
+  if (n >= R.counts.x || !live(n)) { return; }
   for (var side = 0u; side < 4u; side++) {
-    if (live(n) && tails[4u * n + side] > 1e-6) {
+    if (tails[4u * n + side] > 1e-6) {
       let k = atomicAdd(&lists[1], 1u);
       if (k < MAX_TAILS) { atomicStore(&lists[SPAN_BASE + MAX_SPANS + k], 4u * n + side); }
     }
   }
 }
 
-// Indirect draw arguments: [unused, tails, yarn fuzz, tail fuzz, torn corners] x (vertexCount,
-// instanceCount, 0, 0). Fuzz on a listed span's yarns is drawn per half yarn.
+// Indirect arguments: draws [unused, tails, edge fibres, tail fibres, torn groups] x (vertexCount,
+// instanceCount, 0, 0), then the torn-geometry dispatch (x, y, z).
 @compute @workgroup_size(1)
 fn args() {
-  let spans = min(atomicLoad(&lists[0]), MAX_SPANS);
   let tl = min(atomicLoad(&lists[1]), MAX_TAILS);
-  // instances per span / tail: the larger bundle (extra instances of the smaller family are empty)
+  let torn = min(atomicLoad(&lists[2]), MAX_TORN);
+  // instances per tail: the larger bundle (extra instances of the smaller family are empty)
   let b = bundleMax(R.layers[0]);
   drawArgs[0] = 0u;
   drawArgs[1] = 0u;
@@ -187,7 +156,7 @@ fn args() {
   drawArgs[6] = 0u;
   drawArgs[7] = 0u;
   drawArgs[8] = FUZZ_VERTS;
-  drawArgs[9] = spans * b * 2u * FUZZ_PER_YARN;
+  drawArgs[9] = torn * FIBERS_PER_CELL;
   drawArgs[10] = 0u;
   drawArgs[11] = 0u;
   drawArgs[12] = FUZZ_VERTS;
@@ -195,9 +164,13 @@ fn args() {
   drawArgs[14] = 0u;
   drawArgs[15] = 0u;
   drawArgs[16] = TORN_VERTS;
-  drawArgs[17] = min(atomicLoad(&lists[2]), MAX_TORN) * 4u;
+  drawArgs[17] = torn * 4u;
   drawArgs[18] = 0u;
   drawArgs[19] = 0u;
+  drawArgs[20] = (torn * 4u + 127u) / 128u;
+  drawArgs[21] = 1u;
+  drawArgs[22] = 1u;
+  drawArgs[23] = 0u;
 }
 
 // ---------------------------------------------------------------- bicubic surface samples
@@ -266,8 +239,23 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rnx = LR.refine.y;
   let I = rl % rnx;
   let J = rl / rnx;
-  let ci = min(I / S, L.y - 2u);
-  let cj = min(J / S, L.z - 2u);
+  var ci = min(I / S, L.y - 2u);
+  var cj = min(J / S, L.z - 2u);
+  // a vertex on a cell boundary is shared by its neighbours: take its tangents from a neighbour drawn
+  // as surface, never from a torn cell's net (its far corners may have separated, which would tilt
+  // the boundary normals of the intact cell beside it past the vertical)
+  if (cellFlags[cellOf(l, ci, cj)] == 0u) {
+    let onI = I == ci * S && ci > 0u;
+    let onJ = J == cj * S && cj > 0u;
+    if (onI && cellFlags[cellOf(l, ci - 1u, cj)] != 0u) {
+      ci -= 1u;
+    } else if (onJ && cellFlags[cellOf(l, ci, cj - 1u)] != 0u) {
+      cj -= 1u;
+    } else if (onI && onJ && cellFlags[cellOf(l, ci - 1u, cj - 1u)] != 0u) {
+      ci -= 1u;
+      cj -= 1u;
+    }
+  }
   let s = f32(I - ci * S) / f32(S);
   let t = f32(J - cj * S) / f32(S);
   let net = controlNet(L, ci, cj);

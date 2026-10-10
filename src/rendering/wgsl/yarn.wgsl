@@ -1,4 +1,4 @@
-// Explicit yarns: loose tails of broken/pulled-out ends beyond the torn corner patches.
+// Explicit yarns: loose tails of broken/pulled-out ends beyond the cracks of torn cells.
 // Each yarn is a camera-facing ribbon around its centreline shaded as a round fibrous cylinder with
 // the same material identity as the intact surface.
 
@@ -66,8 +66,8 @@ fn tailVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
   let e = tailEntry(ii / b);
   let q = ii % b;
   if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u)) { return degenerate(); }
-  // yarns ending inside the node's quarter of the torn cell are drawn by its corner patch alone
-  if (tailLength(e, q) <= 0.0) { return degenerate(); }
+  // yarns ending inside the torn group's material are drawn by the group alone
+  if (tailLength(e, q) < TAIL_MIN) { return degenerate(); }
   let t = f32(vi >> 1u) / f32(SEGS - 2u);
   return ribbon(tailYarn(e, q, t), vi, fromLight);
 }

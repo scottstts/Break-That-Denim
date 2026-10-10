@@ -92,7 +92,7 @@ export interface CompiledScene {
   position: Float64Array;
   mass: Float64Array;
   pinned: Uint8Array;
-  /** Abrasion/wear per node, 0..1 (drives optics and fuzz). */
+  /** Visible abrasion per node, 0..1 (drives optics and fuzz; strength uses the structural wear). */
   wear: Float32Array;
   restLength: Float64Array;
   peakTension: Float64Array;
@@ -156,9 +156,14 @@ function worley(seed: number, x: number, y: number): [number, number] {
   return [f1, f2];
 }
 
-/** Wear in [0, 1] at world-rest-plane point (x, y). */
-export function wearAt(spec: WearSpec, seed: number, x: number, y: number): number {
-  if (spec.amount <= 0) return 0;
+/**
+ * Wear in [0, 1] at world-rest-plane point (x, y): [structural, visible]. Both share the worn zone's
+ * envelope and fine variation; the cellular structure (worn cells, retained ligaments) governs the
+ * yarns' remaining strength fully, but shows on the surface only faintly, as the abraded zone is
+ * diffusely pale rather than drawn in cells.
+ */
+export function wearAt(spec: WearSpec, seed: number, x: number, y: number): [number, number] {
+  if (spec.amount <= 0) return [0, 0];
   const al = Math.hypot(spec.axis[0], spec.axis[1]) || 1;
   const ax = spec.axis[0] / al;
   const ay = spec.axis[1] / al;
@@ -170,17 +175,21 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): numb
   const warp = 0.32 * fbm(seed + 3, x / (1.4 * S), y / (1.4 * S), 4);
   const r = Math.hypot(a, b) + warp;
   let w = 1 - smoothstep(0.25, 1.05, r);
+  let cells = 1;
   if (spec.cellSize > 0) {
     const jx = x + 0.4 * S * fbm(seed + 11, x / S, y / S, 3);
     const jy = y + 0.4 * S * fbm(seed + 12, x / S, y / S, 3);
     const [f1, f2] = worley(seed + 5, jx / spec.cellSize, jy / spec.cellSize);
-    // 1 at cell interiors, small near the boundaries between neighboring cells (retained ligaments).
-    const ligament = smoothstep(0.0, 0.38, f2 - f1);
-    w *= 0.5 + 0.5 * ligament;
+    // Worn hardest at cell centres, recovering toward the boundaries between neighbouring cells
+    // (retained ligaments, nearly intact). Under load a cell then fails from its middle outward along
+    // these contours, into a rounded opening that the ligaments around it arrest.
+    const interior = Math.pow(smoothstep(0.0, 0.55, f2 - f1), 0.8);
+    cells = interior;
   }
   // Fine correlated abrasion variation.
-  w *= 0.82 + 0.18 * fbm(seed + 7, x / (0.3 * S), y / (0.3 * S), 3);
-  return Math.min(1, Math.max(0, w * spec.amount));
+  w *= (0.82 + 0.18 * fbm(seed + 7, x / (0.3 * S), y / (0.3 * S), 3)) * spec.amount;
+  const clamp = (v: number) => Math.min(1, Math.max(0, v));
+  return [clamp(w * (0.12 + 0.88 * cells)), clamp(w * (0.78 + 0.22 * cells))];
 }
 
 export function compileLayer(spec: LayerSpec, index: number, nodeOffset: number): { info: LayerInfo } {
@@ -279,8 +288,8 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
       scene.pinned[n] = pinned ? 1 : 0;
 
       const [rx, ry] = restPlanePoint(spec, info, u, v);
-      const w = wearAt(spec.wear, seed, rx, ry);
-      scene.wear[n] = w;
+      const [w, wVisible] = wearAt(spec.wear, seed, rx, ry);
+      scene.wear[n] = wVisible;
       scene.crossingNormal0[n] = m.crossingNormal0 * (1 - 0.7 * w);
 
       for (let f = 0; f < 2; f++) {
@@ -294,16 +303,23 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
         const yarnVar = 0.12 * noise1(seed + 31 * (f + 1) + yarnIndex * 7, along / 0.004);
         const loss = spec.wearStrengthLoss[f];
         const wf = f === FAMILY_U ? Math.pow(w, 1.6) : Math.pow(w, 1.25);
-        // Span-to-span scatter (log-normal, uncorrelated between neighbours): abrasion and yarn
-        // irregularity vary over millimetres, more so in worn cloth. Without it a crack tip always
-        // breaks the next span in line and every tear runs dead straight along the lattice.
+        // Strength scatter (log-normal). Abrasion and yarn irregularity vary smoothly over 5-15 mm, more
+        // so in worn cloth, so most of it is spatially correlated: a crack tip then follows a weak
+        // valley that wanders instead of breaking the next span in line (dead-straight tears along the
+        // lattice), and no lone weak span fails far from the tear. A small uncorrelated part keeps the
+        // path irregular at the cell scale.
+        const [sx, sy] = restPlanePoint(spec, info, f === FAMILY_U ? u + 0.5 * m.pitchU : u, f === FAMILY_U ? v : v + 0.5 * m.pitchV);
+        const corr = fbm(seed + 503, sx / 0.011, sy / 0.011, 3);
         const z = (rand01(seed + 503, sIdx, f) + rand01(seed + 617, sIdx, f) - 1) * 2.45;
-        const scatter = Math.exp((0.25 + 0.2 * w) * z);
+        const scatter = Math.exp((0.2 + 0.12 * w) * corr + 0.07 * z);
         const factor = Math.max(0.04, (1 - loss * wf) * (1 + yarnVar) * scatter);
         scene.segFlags[sIdx] = SEG_EXISTS;
         scene.restLength[sIdx] = f === FAMILY_U ? m.pitchU : m.pitchV;
         scene.peakTension[sIdx] = yarn.strength * factor;
-        scene.softening[sIdx] = yarn.softeningOpening * (1 + 2.5 * w);
+        // Worn yarns lose their grip in a loosened weave: past the peak they slide out of it over
+        // millimetres while still carrying a falling load (pull-out) instead of snapping, so damaged
+        // cloth thins, stretches and bridges an opening before it lets go. Intact cloth stays brittle.
+        scene.softening[sIdx] = yarn.softeningOpening * (1 + 2.5 * w) + 3.0e-3 * Math.pow(w, 1.5);
         scene.failSite[sIdx] = 0.25 + 0.5 * rand01(seed + 77, sIdx, f);
         // Strands of the bundle: strength varies along each real yarn (correlated over a few mm:
         // slubs, thin places); in the most worn material some warp strands are worn through already.
@@ -368,12 +384,12 @@ export function defaultSceneSpecs(): LayerSpec[] {
         axis: [1, -1.15],
         radii: [0.12, 0.08],
         amount: 1,
-        cellSize: 0.042,
+        cellSize: 0.022,
         featureScale: 0.032,
         defectThreshold: 0.8,
         defectDensity: 0.55,
       },
-      wearStrengthLoss: [0.85, 0.96],
+      wearStrengthLoss: [0.75, 0.97],
       seed: 1001,
       perturbation: 2.5e-3,
     },

@@ -43,6 +43,41 @@ function coupon(nu: number, nv: number, extra: Partial<LayerSpec> = {}): LayerSp
   };
 }
 
+/**
+ * Operator rows (nodes) touched by an active span whose strain at the predicted iterate lies within
+ * rounding of the axial law's tension/compression kink, where the tangent jumps (eaCompress -> eaLow)
+ * and f32 and f64 may legitimately take different branches. Crossing slip relaxes spans next to free or
+ * mounted boundaries to zero tension, so such spans occur in torn fixtures. Branch boundaries are
+ * tested separately (design: numerical thresholds), not inside smooth-operator comparisons.
+ */
+function kinkRows(cpu: ReferenceSolver, N: number): Set<number> {
+  const rows = new Set<number>();
+  for (let sIdx = 0; sIdx < 2 * N; sIdx++) {
+    if (!cpu.segActive(sIdx)) continue;
+    const a = sIdx >> 1;
+    const b = cpu.segOther(sIdx);
+    let l = 0;
+    for (let q = 0; q < 3; q++) l += (cpu.x[3 * b + q] + cpu.dx[3 * b + q] - cpu.x[3 * a + q] - cpu.dx[3 * a + q]) ** 2;
+    if (Math.abs(Math.sqrt(l) / cpu.restLength[sIdx] - 1) < 1e-6) {
+      rows.add(a);
+      rows.add(b);
+    }
+  }
+  return rows;
+}
+
+/** maxAbsRelToScale over operator rows (STENCIL x 9 entries per node) not in `skip`. */
+function maxAbsRelToScaleRows(a: ArrayLike<number>, b: ArrayLike<number>, skip: Set<number>): number {
+  const row = STENCIL * 9;
+  let scale = 0;
+  let e = 0;
+  for (let q = 0; q < b.length; q++) {
+    scale = Math.max(scale, Math.abs(b[q]));
+    if (!skip.has(Math.floor(q / row))) e = Math.max(e, Math.abs(a[q] - b[q]));
+  }
+  return e / Math.max(scale, 1e-30);
+}
+
 function maxAbsRelToScale(a: ArrayLike<number>, b: ArrayLike<number>): number {
   let scale = 0;
   let e = 0;
@@ -264,7 +299,9 @@ async function torn(device: GPUDevice): Promise<void> {
   });
   const A = assembleFineOperator(cpu);
   const Agpu = await readOperator(device, gpu.levels[0].op, N, true);
-  check('torn: fine operator', maxAbsRelToScale(Agpu, A.A) < 5e-5, `${maxAbsRelToScale(Agpu, A.A).toExponential(2)}`);
+  const kinks = kinkRows(cpu, N);
+  const eOp = maxAbsRelToScaleRows(Agpu, A.A, kinks);
+  check('torn: fine operator', eOp < 5e-5, `${eOp.toExponential(2)} (${kinks.size} rows at the axial kink excluded)`);
   A.A.set(Agpu);
   const levels = buildHierarchy(A, MG);
   for (let k = 1; k < Math.min(levels.length, gpu.levels.length); k++) {

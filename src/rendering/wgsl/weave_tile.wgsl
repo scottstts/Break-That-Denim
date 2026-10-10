@@ -18,7 +18,6 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rep = f32(L.twill.x);
   let texel = rep / f32(size);
   let hTop = L.warp.z + 0.5 * L.warp.y;
-  let none = CellYarns(0, 0, 1, 1, 1, 1, 0u, noTorn());
   var wf = 0.0;
   var aoc = 0.0;
   var slope = vec2<f32>(0.0);
@@ -28,7 +27,7 @@ fn build(@builtin(global_invocation_id) gid: vec3<u32>) {
       // stratified samples over the texel (at coarse levels the texel spans several yarns)
       let U = (f32(gid.x) + (f32(a) + 0.5) / f32(SUB)) * texel;
       let V = (f32(gid.y) + (f32(b) + 0.5) / f32(SUB)) * texel;
-      let w2 = weave2(L, U, V, 1.0, 1.0, true, 0.018e-3, none);
+      let w2 = weave2(L, U, V, 1.0, 1.0, true, 0.018e-3);
       if (!w2.a.covered) { continue; }
       var top = select(0.0, 1.0, w2.a.fam == 1u);
       var s = w2.a.slope;

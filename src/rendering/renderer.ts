@@ -11,6 +11,8 @@ import yarnWgsl from './wgsl/yarn.wgsl?raw';
 import fuzzWgsl from './wgsl/fuzz.wgsl?raw';
 import postWgsl from './wgsl/post.wgsl?raw';
 import weaveTileWgsl from './wgsl/weave_tile.wgsl?raw';
+import tornWgsl from './wgsl/torn.wgsl?raw';
+import edgeFieldWgsl from './wgsl/edgefield.wgsl?raw';
 
 export interface CameraState {
   target: Vec3;
@@ -32,6 +34,8 @@ export const DEFAULT_CAMERA: CameraState = {
 };
 
 const SAMPLES = 4;
+/** Bytes per layer in the RenderU uniform (render_common.wgsl LayerR). */
+const LAYER_BYTES = 112;
 /** Texels per side of the prefiltered weave tile (one twill repeat) at mip level 0. */
 const TILE_SIZE = 128;
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -41,13 +45,18 @@ const SHADOW_HALF = 0.34;
 const REFINE = 2;
 const MAX_SPANS = 65536;
 const MAX_TAILS = 65536;
-/** Torn cells drawn per corner (refine.wgsl list layout; surface.wgsl TORN_BASE). */
-const MAX_TORN = 32768;
-/** Vertices of one torn corner's quarter: 2 x 2 sub-quads (surface.wgsl TQ). */
-const TORN_VERTS = 24;
+/** Torn cells (refine.wgsl list layout after spans and tails; torn.wgsl TORN_BASE). */
+const MAX_TORN = 16384;
+/** tornGeo record per torn cell, vec4 units (render_common.wgsl TORN_STRIDE). */
+const TORN_STRIDE = 89;
+/** Vertices of one torn group's patch: 4 x 4 sub-quads over the whole cell (surface.wgsl TQ). */
+const TORN_VERTS = 96;
 /** Vertices per explicit-yarn ribbon (2 per centreline sample), tails, and fibres; see the WGSL. */
 const TAIL_VERTS = 14;
-const FUZZ_VERTS = 10;
+const FUZZ_VERTS = 14;
+/** Edge-field texel size in the rest chart (m): finer than the rim's fray detail it positions. */
+const EDGE_TEXEL = 0.3e-3;
+const EDGE_FORMAT: GPUTextureFormat = 'r16float';
 
 export interface ViewMatrices {
   eye: Vec3;
@@ -95,6 +104,16 @@ export class Renderer {
   private readonly cellFlags: GPUBuffer;
   private readonly lists: GPUBuffer;
   private readonly drawArgs: GPUBuffer;
+  /** Per torn cell: broken edges, crack crossings and each group's control net (torn.wgsl). */
+  private readonly tornGeo: GPUBuffer;
+  private readonly edgeSig: GPUBuffer;
+  private readonly edgeArgs: GPUBuffer;
+  private readonly torn: ComputeModule;
+  private readonly tornGroup: GPUBindGroup;
+  /** Distance from each rest-chart point to the nearest crack (edgefield.wgsl). */
+  private readonly edgeTex: GPUTexture;
+  private readonly edgeSampler: GPUSampler;
+  private readonly edgeGroup: GPUBindGroup;
   private readonly rsurf: GPUBuffer;
   private readonly cellCount: number;
   private readonly refinedCount: number;
@@ -121,6 +140,9 @@ export class Renderer {
   width = 1;
   height = 1;
   private frameIndex = 0;
+  /** Edge-field texture: first row of each layer's region, and its size (texels). */
+  private edgeRows: number[] = [];
+  private edgeSize: [number, number] = [1, 1];
 
   constructor(device: GPUDevice, format: GPUTextureFormat, solver: GpuSolver, scene: CompiledScene) {
     this.device = device;
@@ -153,7 +175,10 @@ export class Renderer {
     this.wear = createBufferWith(device, 'wear', Float32Array.from(scene.wear));
     this.cellFlags = createBuffer(device, 'cellFlags', 4 * cells);
     this.lists = createBuffer(device, 'lists', 4 * (4 + MAX_SPANS + MAX_TAILS + MAX_TORN));
-    this.drawArgs = createBuffer(device, 'drawArgs', 80, STORAGE | GPUBufferUsage.INDIRECT);
+    this.drawArgs = createBuffer(device, 'drawArgs', 96, STORAGE | GPUBufferUsage.INDIRECT);
+    this.tornGeo = createBuffer(device, 'tornGeo', 16 * TORN_STRIDE * MAX_TORN);
+    this.edgeSig = createBuffer(device, 'edgeSig', 16);
+    this.edgeArgs = createBuffer(device, 'edgeArgs', 32, STORAGE | GPUBufferUsage.INDIRECT);
     this.rsurf = createBuffer(device, 'rsurf', 48 * refined);
 
     this.refine = new ComputeModule(device, 'refine', commonWgsl + refineWgsl);
@@ -172,6 +197,19 @@ export class Renderer {
       10: this.tframe,
     });
 
+    this.torn = new ComputeModule(device, 'torn', commonWgsl + tornWgsl);
+    for (const e of ['tornGeoMain', 'edgeArgsMain']) this.cpipes[e] = this.torn.pipeline(e);
+    this.tornGroup = this.torn.bindGroup('torn', {
+      0: this.renderU,
+      1: solver.x,
+      2: solver.segs,
+      3: this.tframe,
+      4: this.lists,
+      5: this.tornGeo,
+      6: this.edgeSig,
+      7: this.edgeArgs,
+    });
+
     const V = GPUShaderStage.VERTEX;
     const F = GPUShaderStage.FRAGMENT;
     const VF = V | F;
@@ -188,9 +226,8 @@ export class Renderer {
         { binding: 6, visibility: F, texture: { sampleType: 'float', viewDimension: '2d-array' } },
         { binding: 7, visibility: F, sampler: { type: 'filtering' } },
         ro(8),
-        ro(9),
-        ro(10),
-        ro(11),
+        { binding: 9, visibility: F, texture: { sampleType: 'float' } },
+        { binding: 10, visibility: F, sampler: { type: 'filtering' } },
       ],
     });
     this.yarnLayout = device.createBindGroupLayout({
@@ -208,6 +245,7 @@ export class Renderer {
         { binding: 9, visibility: F, texture: { sampleType: 'depth' } },
         { binding: 10, visibility: F, sampler: { type: 'comparison' } },
         ro(11),
+        ro(12),
       ],
     });
 
@@ -248,6 +286,7 @@ export class Renderer {
       label: 'torn.shadow',
       layout: surfacePL,
       vertex: { module: surfaceModule, entryPoint: 'vsTornShadow' },
+      fragment: { module: surfaceModule, entryPoint: 'fsTornShadow', targets: [] },
       primitive: list,
       depthStencil: shadowDepth,
     });
@@ -274,7 +313,7 @@ export class Renderer {
     }
     const fuzzModule = shaderModule(device, 'fuzz', commonWgsl + lightWgsl + yarnGeomWgsl + fuzzWgsl);
     for (const [name, vs] of [
-      ['yarnFuzz', 'vsYarnFuzz'],
+      ['edgeFuzz', 'vsEdgeFuzz'],
       ['tailFuzz', 'vsTailFuzz'],
     ]) {
       this.pipes[name] = device.createRenderPipeline({
@@ -297,6 +336,50 @@ export class Renderer {
     this.dummyDepth = device.createTexture({ size: [1, 1], format: 'depth32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
     this.shadowSampler = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
 
+    // edge field: one rest-chart region per layer, stacked vertically
+    let edgeW = 1;
+    let edgeH = 0;
+    this.edgeRows = scene.layers.map((L) => {
+      const w = Math.ceil(((L.nx - 1) * L.material.pitchU) / EDGE_TEXEL) + 2;
+      const h = Math.ceil(((L.ny - 1) * L.material.pitchV) / EDGE_TEXEL) + 2;
+      const row = edgeH;
+      edgeW = Math.max(edgeW, w);
+      edgeH += h;
+      return row;
+    });
+    this.edgeSize = [edgeW, edgeH];
+    device.queue.writeBuffer(this.renderU, 0, new Uint8Array(this.renderParams()));
+    this.edgeTex = device.createTexture({ label: 'edgeField', size: [edgeW, edgeH], format: EDGE_FORMAT, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.edgeSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+    const edgeModule = shaderModule(device, 'edgeField', commonWgsl + edgeFieldWgsl);
+    const edgeLayout = device.createBindGroupLayout({
+      label: 'edgeField',
+      entries: [
+        { binding: 0, visibility: V, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: V, buffer: { type: 'read-only-storage' } },
+      ],
+    });
+    const edgePL = device.createPipelineLayout({ bindGroupLayouts: [edgeLayout] });
+    this.pipes.edgeClear = device.createRenderPipeline({
+      label: 'edgeField.clear',
+      layout: edgePL,
+      vertex: { module: edgeModule, entryPoint: 'vsClear' },
+      fragment: { module: edgeModule, entryPoint: 'fsClear', targets: [{ format: EDGE_FORMAT }] },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.pipes.edgeCrack = device.createRenderPipeline({
+      label: 'edgeField.crack',
+      layout: edgePL,
+      vertex: { module: edgeModule, entryPoint: 'vsCrack' },
+      fragment: {
+        module: edgeModule,
+        entryPoint: 'fsCrack',
+        targets: [{ format: EDGE_FORMAT, blend: { color: { operation: 'min', srcFactor: 'one', dstFactor: 'one' }, alpha: { operation: 'min', srcFactor: 'one', dstFactor: 'one' } } }],
+      },
+      primitive: { topology: 'triangle-list' },
+    });
+    this.edgeGroup = device.createBindGroup({ layout: edgeLayout, entries: [{ binding: 0, resource: { buffer: this.renderU } }, { binding: 1, resource: { buffer: this.tornGeo } }] });
+
     this.weaveTile = this.buildWeaveTile();
     this.tileSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
     const tileView = this.weaveTile.createView({ dimension: '2d-array' });
@@ -309,10 +392,9 @@ export class Renderer {
       { binding: 5, resource: this.shadowSampler },
       { binding: 6, resource: tileView },
       { binding: 7, resource: this.tileSampler },
-      { binding: 8, resource: { buffer: solver.x } },
-      { binding: 9, resource: { buffer: solver.segs } },
-      { binding: 10, resource: { buffer: this.tframe } },
-      { binding: 11, resource: { buffer: this.lists } },
+      { binding: 8, resource: { buffer: this.tornGeo } },
+      { binding: 9, resource: this.edgeTex.createView() },
+      { binding: 10, resource: this.edgeSampler },
     ];
     const yarnEntries = (shadow: GPUTextureView): GPUBindGroupEntry[] => [
       { binding: 0, resource: { buffer: this.frameU } },
@@ -327,6 +409,7 @@ export class Renderer {
       { binding: 9, resource: shadow },
       { binding: 10, resource: this.shadowSampler },
       { binding: 11, resource: { buffer: this.tframe } },
+      { binding: 12, resource: { buffer: this.tornGeo } },
     ];
     const shadowView = this.shadowTex.createView();
     const dummyView = this.dummyDepth.createView();
@@ -398,7 +481,7 @@ export class Renderer {
   }
 
   private renderParams(): ArrayBuffer {
-    const buf = new ArrayBuffer(16 + 3 * 96);
+    const buf = new ArrayBuffer(16 + 3 * LAYER_BYTES);
     const u = new Uint32Array(buf);
     const f = new Float32Array(buf);
     const s = this.scene;
@@ -409,7 +492,7 @@ export class Renderer {
     let cellOffset = 0;
     let refinedOffset = 0;
     s.layers.forEach((L, l) => {
-      const b = (16 + 96 * l) / 4;
+      const b = (16 + LAYER_BYTES * l) / 4;
       const m = L.weave;
       u[b] = L.nodeOffset;
       u[b + 1] = L.nx;
@@ -431,6 +514,7 @@ export class Renderer {
       u[b + 21] = rnx;
       u[b + 22] = cellOffset;
       u[b + 23] = m.id;
+      f.set([this.edgeRows[l] ?? 0, EDGE_TEXEL, this.edgeSize[0], this.edgeSize[1]], b + 24);
       cellOffset += (L.nx - 1) * (L.ny - 1);
       refinedOffset += rnx * ((L.ny - 1) * REFINE + 1);
     });
@@ -487,6 +571,7 @@ export class Renderer {
 
     const N = this.scene.nodeCount;
     encoder.clearBuffer(this.lists, 0, 16);
+    encoder.clearBuffer(this.edgeSig, 0, 4);
     const cp = encoder.beginComputePass({ label: 'renderPrep', timestampWrites: tw(0) });
     cp.setBindGroup(0, this.refineGroup);
     const run = (name: string, groups: number) => {
@@ -498,7 +583,23 @@ export class Renderer {
     run('classifySpans', Math.ceil(N / 128));
     run('args', 1);
     run('refine', Math.ceil(this.refinedCount / 128));
+    cp.setBindGroup(0, this.tornGroup);
+    cp.setPipeline(this.cpipes.tornGeoMain);
+    cp.dispatchWorkgroupsIndirect(this.drawArgs, 80);
+    run('edgeArgsMain', 1);
     cp.end();
+
+    // redraw the edge field when the cracks changed (indirect counts are zero otherwise)
+    const ep = encoder.beginRenderPass({
+      label: 'edgeField',
+      colorAttachments: [{ view: this.edgeTex.createView(), loadOp: 'load', storeOp: 'store' }],
+    });
+    ep.setBindGroup(0, this.edgeGroup);
+    ep.setPipeline(this.pipes.edgeClear);
+    ep.drawIndirect(this.edgeArgs, 0);
+    ep.setPipeline(this.pipes.edgeCrack);
+    ep.drawIndirect(this.edgeArgs, 16);
+    ep.end();
 
     const surfaceVerts = REFINE * REFINE * 6;
     const sp = encoder.beginRenderPass({
@@ -531,7 +632,7 @@ export class Renderer {
     mp.setBindGroup(0, this.yarnGroup);
     mp.setPipeline(this.pipes.tail);
     mp.drawIndirect(this.drawArgs, 16);
-    mp.setPipeline(this.pipes.yarnFuzz);
+    mp.setPipeline(this.pipes.edgeFuzz);
     mp.drawIndirect(this.drawArgs, 32);
     mp.setPipeline(this.pipes.tailFuzz);
     mp.drawIndirect(this.drawArgs, 48);
