@@ -57,8 +57,10 @@ export default async function main(args: string[]): Promise<void> {
     for (let k = 0; k < frames; k++) {
       const rd = device.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
-      // REBUILD=1: rebuild the field-derived state every frame (the cost while yarns are separating)
-      if (process.env.REBUILD) renderer.resetTopology(enc);
+      // REBUILD=1: rebuild the field-derived state every frame (the cost while yarns are separating), as
+      // the solver's field event triggers it; REBUILD=reset: from scratch, as after a reset
+      if (process.env.REBUILD === 'reset') renderer.resetTopology(enc);
+      else if (process.env.REBUILD) device.queue.writeBuffer(solver.fieldEvents, 0, new Uint32Array([1]));
       renderer.encode(enc, camera, (frames + k) / 30, tex.createView(), qs);
       enc.resolveQuerySet(qs, 0, 8, res, 0);
       enc.copyBufferToBuffer(res, 0, rd, 0, 64);

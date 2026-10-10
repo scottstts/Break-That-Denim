@@ -41,14 +41,18 @@ fn retiredP(n: u32) -> bool { return x[n].w > 1.5; }
 
 fn nodeIJ(n: u32) -> vec2<u32> { return vec2<u32>(nodes[n].ijl & 0xFFFu, (nodes[n].ijl >> 12u) & 0xFFFu); }
 
+// Slots persist across rebuilds (cleared only by a reset): a node keeps its slot, and a slot whose
+// node's domain graph is unchanged keeps its connection field (kappaSolve compares a hash). During a
+// tear only the domains the new separations touch are solved again.
+fn hashBase() -> u32 { return KAPPA_TABLE + R.counts.x + KAPPA_SLOTS + KAPPA_SLOTS * KAPPA_WORDS; }
+// per slot: hash of the domain graph of its last solve (0: never), bit 31 set when it came out clean
+fn slotHash(s: u32) -> u32 { return hashBase() + s; }
+// per node: its slot + 1 (0: none)
+fn nodeSlot(n: u32) -> u32 { return hashBase() + KAPPA_SLOTS + n; }
+
 @compute @workgroup_size(128)
 fn piecesClear(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x;
-  if (n == 0u) {
-    atomicStore(&kappa[0], 0u);
-    atomicStore(&piecesArgs[3], 0u);
-  }
-  if (n < R.counts.x) { atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE); }
+  if (gid.x == 0u) { atomicStore(&piecesArgs[3], 0u); }
 }
 
 // One invocation per cell (global cell index over all layers).
@@ -109,11 +113,23 @@ fn nodeAlloc(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
   }
-  if (!dirty) { return; }
-  let s = atomicAdd(&kappa[0], 1u);
-  if (s >= KAPPA_SLOTS) { return; }
-  atomicStore(&kappa[KAPPA_TABLE + n], s);
-  atomicStore(&kappa[KAPPA_TABLE + R.counts.x + s], n);
+  if (!dirty) {
+    atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE);
+    return;
+  }
+  var s = atomicLoad(&kappa[nodeSlot(n)]);
+  if (s == 0u) {
+    let a = atomicAdd(&kappa[0], 1u);
+    if (a >= KAPPA_SLOTS) {
+      atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE);
+      return;
+    }
+    s = a + 1u;
+    atomicStore(&kappa[nodeSlot(n)], s);
+    atomicStore(&kappa[KAPPA_TABLE + R.counts.x + a], n);
+  }
+  // kappaSolve keeps this, or gives the slot's table entry up when the node's cells are all connected
+  atomicStore(&kappa[KAPPA_TABLE + n], s - 1u);
 }
 
 @compute @workgroup_size(1)
@@ -188,6 +204,8 @@ var<workgroup> dist: array<f32, KAPPA_DOMAIN>;
 var<workgroup> graph: array<u32, KAPPA_DOMAIN>;
 var<workgroup> changed: u32;
 var<workgroup> unclean: u32;
+var<workgroup> graphHash: atomic<u32>;
+var<workgroup> decide: u32;
 // nearest material of the node's own piece within its half cell (rest distance, um)
 var<workgroup> nearest: atomic<u32>;
 
@@ -195,6 +213,9 @@ var<workgroup> nearest: atomic<u32>;
 fn kappaSolve(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
   let slot = wg.x;
   let n = atomicLoad(&kappa[KAPPA_TABLE + R.counts.x + slot]);
+  // only nodes whose domain has a cell without surface material this rebuild (nodeAlloc)
+  if (t == 0u) { decide = select(0u, 1u, atomicLoad(&kappa[KAPPA_TABLE + n]) != slot); }
+  if (workgroupUniformLoad(&decide) != 0u) { return; }
   let l = nodes[n].ijl >> 24u;
   let LR = R.layers[l];
   let ij = nodeIJ(n);
@@ -230,9 +251,18 @@ fn kappaSolve(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
     }
     graph[e] = gb;
     dist[e] = d;
+    if (gb != 0u) { atomicXor(&graphHash, hash11(e * 16u + gb + 0x9e3779b9u)); }
   }
   if (t == 0u) { atomicStore(&nearest, 0xFFFFFFFFu); }
   workgroupBarrier();
+  // the same graph as at this slot's last solve: its connection field still holds
+  let h = ((atomicLoad(&graphHash) ^ select(0u, 0x55555555u, x[n].w > 0.5)) & 0x7FFFFFFFu) | 1u;
+  if (t == 0u) {
+    let prev = atomicLoad(&kappa[slotHash(slot)]);
+    decide = select(0u, 1u, (prev & 0x7FFFFFFFu) == h);
+    if (decide != 0u && (prev & 0x80000000u) != 0u) { atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE); }
+  }
+  if (workgroupUniformLoad(&decide) != 0u) { return; }
   for (var e = t; e < KAPPA_DOMAIN; e += 256u) {
     if ((graph[e] & 8u) != 0u) { atomicMin(&nearest, u32(dist[e] * 1e6)); }
   }
@@ -295,5 +325,8 @@ fn kappaSolve(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
     atomicStore(&kappa[base + w], word);
   }
   workgroupBarrier();
-  if (t == 0u && unclean == 0u) { atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE); }
+  if (t == 0u) {
+    if (unclean == 0u) { atomicStore(&kappa[KAPPA_TABLE + n], KAPPA_NONE); }
+    atomicStore(&kappa[slotHash(slot)], h | select(0u, 0x80000000u, unclean == 0u));
+  }
 }

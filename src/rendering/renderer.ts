@@ -257,7 +257,8 @@ export class Renderer {
     this.runGeo = createBuffer(device, 'threadRunGeo', 7 * 16 * MAX_RUNS);
     this.threadDraw = createBuffer(device, 'threadDraw', 48, STORAGE | GPUBufferUsage.INDIRECT);
     // slot table initialised to "no field" so the first frame before a rebuild draws everything intact
-    const kappaInit = new Uint32Array(4 + N + KAPPA_SLOTS + KAPPA_SLOTS * kappaWords);
+    // header, node table, slot nodes, slot fields, slot hashes, persistent node slots (pieces.wgsl)
+    const kappaInit = new Uint32Array(4 + N + KAPPA_SLOTS + KAPPA_SLOTS * kappaWords + KAPPA_SLOTS + N);
     kappaInit.fill(0xffffffff, 4, 4 + N);
     this.kappa = createBufferWith(device, 'kappa', kappaInit);
     this.cellDirty = createBuffer(device, 'cellDirty', 4 * cells);
@@ -632,6 +633,8 @@ export class Renderer {
   /** Rebuild field-derived state from scratch on the next frame (scene reset). */
   resetTopology(encoder: GPUCommandEncoder): void {
     encoder.clearBuffer(this.edgeSig);
+    // connection slots and their hashes start over (the rebuild this triggers sets every node's entry)
+    encoder.clearBuffer(this.kappa);
   }
 
   resize(width: number, height: number): void {
