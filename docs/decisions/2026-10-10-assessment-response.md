@@ -33,6 +33,9 @@
 - Pre-tension (mount -0.5 % / -0.3 %) gives no round lobes: folds vanish and more pieces drop. Rejected.
 - Stronger warp/weft abrasion contrast (0.97 / 0.7) changes which cracks form, not their nature: strand
   damage-softening localizes into bundle rows (grain cracks), as woven fabric tears under a pinch.
+- Per-float abrasion scatter (lognormal sigma 0.6) does not make worn cells fail diffusely either: the
+  scatter averages out within a 9-yarn span, whose mean softening decides where strain localizes. Area
+  failure of a worn cell would need kinematics finer than the bundle (assessment section 7). Rejected.
 
 ## Rendering
 
