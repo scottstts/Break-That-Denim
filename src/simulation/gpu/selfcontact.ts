@@ -65,7 +65,7 @@ export class SelfContact {
     u.set([SELF_CONTACT.stiffness, SELF_CONTACT.friction, SELF_CONTACT.frictionSpeed, SELF_CONTACT.boundFraction], 4);
     const su = createBufferWith(d, 'selfContactU', u, UNIFORM);
     this.cells = createBuffer(d, 'selfContact.cells', 8 * T);
-    const items = createBuffer(d, 'selfContact.items', 4 * s.N);
+    const items = createBuffer(d, 'selfContact.items', 32 * s.N);
     const pairs = createBuffer(d, 'selfContact.pairs', 4 * K * s.N);
     const acc = createBuffer(d, 'selfContact.acc', 4 * 9 * s.N);
     this.meta = createBuffer(d, 'selfContact.meta', 16 * s.N);
@@ -118,14 +118,19 @@ export class SelfContact {
     encoder.clearBuffer(this.cells);
   }
 
-  /** Hash the faces and detect contact candidates and correction bounds at the predicted iterate. */
-  encodeDetect(pass: GPUComputePassEncoder): void {
+  /**
+   * Hash the faces and detect contact candidates and correction bounds at the predicted iterate.
+   * `stages` (profiling) selects a subset: 1 count, 2 scan, 4 fill, 8 query.
+   */
+  encodeDetect(pass: GPUComputePassEncoder, stages = 15): void {
     const groups = Math.ceil(this.s.N / 128);
-    this.run(pass, 'faceCount', groups);
-    for (const g of this.scanGroups) this.run(pass, 'scanBlocks', g.blocks, g.scan);
-    for (let k = this.scanGroups.length - 2; k >= 0; k--) this.run(pass, 'addBlockSums', this.scanGroups[k].blocks, this.scanGroups[k].add);
-    this.run(pass, 'faceFill', groups);
-    this.run(pass, 'detect', groups);
+    if (stages & 1) this.run(pass, 'faceCount', groups);
+    if (stages & 2) {
+      for (const g of this.scanGroups) this.run(pass, 'scanBlocks', g.blocks, g.scan);
+      for (let k = this.scanGroups.length - 2; k >= 0; k--) this.run(pass, 'addBlockSums', this.scanGroups[k].blocks, this.scanGroups[k].add);
+    }
+    if (stages & 4) this.run(pass, 'faceFill', groups);
+    if (stages & 8) this.run(pass, 'detect', groups);
   }
 
   /** Contact and friction terms at the current Newton iterate (overwrites ext). */

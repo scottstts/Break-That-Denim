@@ -9,6 +9,10 @@ export default async function main(): Promise<void> {
   const c = solver.contact as SelfContact;
   const stages: Array<[string, (p: GPUComputePassEncoder) => void]> = [
     ['detect (hash + scan + query)', (p) => c.encodeDetect(p)],
+    ['  face count', (p) => c.encodeDetect(p, 1)],
+    ['  scan', (p) => c.encodeDetect(p, 2)],
+    ['  fill', (p) => c.encodeDetect(p, 4)],
+    ['  query', (p) => c.encodeDetect(p, 8)],
     ['terms + gather', (p) => c.encodeTerms(p)],
   ];
   const qs = device.createQuerySet({ type: 'timestamp', count: 2 * stages.length });

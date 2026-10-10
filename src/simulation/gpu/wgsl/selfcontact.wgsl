@@ -37,7 +37,9 @@ struct SelfU {
 @group(0) @binding(5) var<storage, read> segs: array<Seg>;
 // hash table: [0, T) cell counts, scanned into start offsets; [T, 2T) fill cursors
 @group(0) @binding(6) var<storage, read_write> cells: array<atomic<u32>>;
-@group(0) @binding(7) var<storage, read_write> items: array<u32>;
+// per hashed face, 2 vec4: its centroid now and a radius bounding it now and at the start of the
+// substep (w), its centroid at the start of the substep and the face index (w, exact below 2^24)
+@group(0) @binding(7) var<storage, read_write> items: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> pairs: array<u32>;
 @group(0) @binding(9) var<storage, read_write> cmeta: array<vec4<f32>>; // dx at detection, bound
 @group(0) @binding(10) var<storage, read_write> acc: array<atomic<i32>>;
@@ -164,9 +166,24 @@ fn faceCount(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn faceFill(@builtin(global_invocation_id) gid: vec3<u32>) {
   let f = gid.x;
   if (f >= P.counts.x || !faceValid(f)) { return; }
-  let h = hashCell(cellOf(centroid(corners(f))));
+  let c = corners(f);
+  let h = hashCell(cellOf(centroid(c)));
   let slot = atomicLoad(&cells[h]) + atomicAdd(&cells[tableMask() + 1u + h], 1u);
-  items[slot] = f;
+  // bounding spheres for the query's rejection test (one radius bounds both)
+  let a0 = x[c.x].xyz;
+  let b0 = x[c.y].xyz;
+  let e0 = x[c.z].xyz;
+  let g0 = x[c.w].xyz;
+  let a1 = a0 + dx[c.x].xyz;
+  let b1 = b0 + dx[c.y].xyz;
+  let e1 = e0 + dx[c.z].xyz;
+  let g1 = g0 + dx[c.w].xyz;
+  let m0 = 0.25 * (a0 + b0 + e0 + g0);
+  let m1 = 0.25 * (a1 + b1 + e1 + g1);
+  let r0 = max(max(dot(a0 - m0, a0 - m0), dot(b0 - m0, b0 - m0)), max(dot(e0 - m0, e0 - m0), dot(g0 - m0, g0 - m0)));
+  let r1 = max(max(dot(a1 - m1, a1 - m1), dot(b1 - m1, b1 - m1)), max(dot(e1 - m1, e1 - m1), dot(g1 - m1, g1 - m1)));
+  items[2u * slot] = vec4<f32>(m1, sqrt(max(r0, r1)));
+  items[2u * slot + 1u] = vec4<f32>(m0, f32(f));
 }
 
 @compute @workgroup_size(128)
@@ -207,17 +224,28 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
         let start = atomicLoad(&cells[h]);
         let count = atomicLoad(&cells[T + h]);
         for (var q = 0u; q < count; q++) {
-          let f = items[start + q];
+          // the closest-point distance is never below |p - centroid| - radius: faces that cannot
+          // matter (beyond the reach now, and no nearer than the bound's best at the start) are
+          // rejected from their compact record without touching their corners; the result is unchanged
+          let i1 = items[2u * (start + q)];
+          let i0 = items[2u * (start + q) + 1u];
+          let nearNow = length(p - i1.xyz) - i1.w < reach;
+          let nearStart = length(p0 - i0.xyz) - i1.w < min(d0min, 0.5 * SU.grid.x);
+          if (!nearNow && !nearStart) { continue; }
+          let f = u32(i0.w);
           let fijl = nodes[f].ijl;
           let di = i32(fijl & 0xFFFu) - ni;
           let dj = i32((fijl >> 12u) & 0xFFFu) - nj;
           if ((fijl >> 24u) == nl && di >= -3 && di <= 2 && dj >= -3 && dj <= 2) { continue; }
           let cf = corners(f);
-          let s0 = faceHitAt(p0, cf);
-          if (s0.d < d0min && s0.d > 1e-9) {
-            d0min = s0.d;
-            n0 = (p0 - s0.q) / s0.d;
+          if (nearStart) {
+            let s0 = faceHitAt(p0, cf);
+            if (s0.d < d0min && s0.d > 1e-9) {
+              d0min = s0.d;
+              n0 = (p0 - s0.q) / s0.d;
+            }
           }
+          if (!nearNow) { continue; }
           let hit = faceHit(p, cf);
           if (hit.d >= reach) { continue; }
           var cand = f;
