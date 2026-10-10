@@ -30,8 +30,6 @@ export class Interaction {
   private readonly group: GPUBindGroup;
   private readonly pipes: Record<string, GPUComputePipeline> = {};
   private staging: GPUBuffer[] = [];
-  private readonly excessStaging: GPUBuffer;
-  private excessBusy = false;
   /** Number of active grip entries (0 = no grip). */
   count = 0;
   /** Nodes of the active grip patch. */
@@ -49,7 +47,6 @@ export class Interaction {
     this.mod = new ComputeModule(device, 'interact', commonWgsl + code);
     for (const e of ['gripTerms', 'gripLead', 'gripInit', 'pickDepth', 'pickNearest', 'pickWrite']) this.pipes[e] = this.mod.pipeline(e);
     this.gripGoal = createBuffer(device, 'gripGoal', 16);
-    this.excessStaging = device.createBuffer({ label: 'gripExcess', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     this.gripU = createBuffer(device, 'gripU', 32, UNIFORM);
     this.pickU = createBuffer(device, 'pickU', 96, UNIFORM);
     this.grip = createBuffer(device, 'grip', 32 * MAX_GRIP);
@@ -166,26 +163,6 @@ export class Interaction {
       const enc = this.device.createCommandEncoder({ label: 'gripRelease' });
       enc.clearBuffer(this.solver.ext);
       this.device.queue.submit([enc.finish()]);
-    }
-  }
-
-  /**
-   * How far the requested handle is beyond what the bounded force can follow (m), from the last
-   * substep: small asynchronous readback. Null if a read is already in flight or there is no grip.
-   */
-  async gripExcess(): Promise<number | null> {
-    if (this.count === 0 || this.excessBusy) return null;
-    this.excessBusy = true;
-    try {
-      const enc = this.device.createCommandEncoder({ label: 'gripExcess' });
-      enc.copyBufferToBuffer(this.gripGoal, 0, this.excessStaging, 0, 16);
-      this.device.queue.submit([enc.finish()]);
-      await this.excessStaging.mapAsync(GPUMapMode.READ);
-      const w = new Float32Array(this.excessStaging.getMappedRange().slice(0))[3];
-      this.excessStaging.unmap();
-      return w;
-    } finally {
-      this.excessBusy = false;
     }
   }
 

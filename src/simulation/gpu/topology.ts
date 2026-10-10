@@ -8,13 +8,9 @@ import stateWgsl from './wgsl/state.wgsl?raw';
  * Detached-piece detection. After ruptures (or a grip release) the active span graph is read back
  * (one u32 per node) and searched from its anchors: mounted nodes and, while gripping, the grip
  * patch core. Cloth nodes that no longer reach an anchor become ballistic debris (see state.wgsl).
- * Small pieces torn off inside the grip also become debris: a few nodes held by one grip spring
- * are too weakly coupled for the global Newton step (it injects energy into them), and a scrap of
- * that size slipping out of the fingers is plausible.
+ * A piece torn out inside the pinch stays in the fingers, whatever its size, until the grip ends.
  * At most one analysis is in flight; requests made meanwhile are coalesced into one rerun.
  */
-/** Pieces with fewer nodes than this are debris unless they are connected to a mount. */
-const MIN_HELD_PIECE = 24;
 export class Topology {
   private readonly device: GPUDevice;
   private readonly solver: GpuSolver;
@@ -128,8 +124,8 @@ export class Topology {
   }
 
   /**
-   * Flood the active span graph from the mounts, then from each grip anchor not yet reached (pieces
-   * smaller than MIN_HELD_PIECE stay unreached). Returns the number of newly freed nodes.
+   * Flood the active span graph from the mounts, then from each grip anchor not yet reached. Returns
+   * the number of newly freed nodes.
    */
   private search(bits: Uint32Array, anchors: readonly number[]): number {
     const s = this.scene;
@@ -143,11 +139,10 @@ export class Topology {
       const start = this.tail;
       this.push(bits, a);
       this.flood(bits, start);
-      if (this.tail - start < MIN_HELD_PIECE) for (let k = start; k < this.tail; k++) vis[this.queue[k]] = 2;
     }
     let count = 0;
     for (let n = 0; n < s.nodeCount; n++) {
-      const f = vis[n] !== 1 && !(bits[n] & 4) ? 1 : 0;
+      const f = !vis[n] && !(bits[n] & 4) ? 1 : 0;
       this.freed[n] = f;
       count += f;
     }

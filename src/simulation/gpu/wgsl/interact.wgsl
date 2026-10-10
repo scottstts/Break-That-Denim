@@ -39,7 +39,7 @@ struct GripEntry {
 @group(0) @binding(8) var<storage, read_write> ext: array<vec4<f32>>; // 3 per node (see assemble.wgsl)
 @group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>; // [depthKey, distKey]
 @group(0) @binding(10) var<storage, read_write> pickOut: array<vec4<f32>>;
-// [0] effective handle (xyz) and how far the requested handle is beyond the force cap's reach (w, m)
+// [0] effective handle (xyz)
 @group(0) @binding(11) var<storage, read_write> gripGoal: array<vec4<f32>>;
 
 var<workgroup> leadSum: array<vec4<f32>, 256>;
@@ -67,9 +67,8 @@ fn gripLead(@builtin(local_invocation_index) t: u32) {
     let c = leadSum[0].xyz / max(leadSum[0].w, 1e-12);
     var lead = G.goal.xyz - c;
     let l = length(lead);
-    let excess = max(0.0, l - G.params.y);
     if (l > G.params.y) { lead *= G.params.y / l; }
-    gripGoal[0] = vec4<f32>(c + lead, excess);
+    gripGoal[0] = vec4<f32>(c + lead, 0.0);
   }
 }
 
