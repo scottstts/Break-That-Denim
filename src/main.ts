@@ -58,14 +58,16 @@ function onResize() {
 window.addEventListener('resize', onResize);
 matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change', onResize);
 
-// every pointer (mouse, pen, each finger) drives its own grip
+// every pointer (mouse, pen, each finger) drives its own grip; event times go on the clock both
+// threads share (performance.timeOrigin + their own performance.now())
 let seq = 0;
+const clock = (t: number) => performance.timeOrigin + t;
 function pointer(phase: 'down' | 'move' | 'up' | 'cancel', e: PointerEvent) {
   const r = canvas.getBoundingClientRect();
-  post({ type: 'pointer', phase, id: e.pointerId, seq: seq++, time: e.timeStamp, x: e.clientX - r.left, y: e.clientY - r.top });
+  post({ type: 'pointer', phase, id: e.pointerId, seq: seq++, time: clock(e.timeStamp), x: e.clientX - r.left, y: e.clientY - r.top });
 }
 function cancelAll(time: number) {
-  post({ type: 'pointer', phase: 'cancel', id: ALL_POINTERS, seq: seq++, time, x: 0, y: 0 });
+  post({ type: 'pointer', phase: 'cancel', id: ALL_POINTERS, seq: seq++, time: clock(time), x: 0, y: 0 });
 }
 canvas.addEventListener('pointerdown', (e) => {
   if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -74,8 +76,10 @@ canvas.addEventListener('pointerdown', (e) => {
   pointer('down', e);
 });
 canvas.addEventListener('pointermove', (e) => {
-  // coalesced samples are superseded by the latest; only the newest position matters
-  pointer('move', e);
+  // the engine follows the pointer's path at substep resolution: coalesced samples carry it
+  const samples = e.getCoalescedEvents?.() ?? [];
+  if (samples.length === 0) pointer('move', e);
+  for (const s of samples) pointer('move', s);
 });
 canvas.addEventListener('pointerup', (e) => {
   // iOS counts the end of a touch, not its start, as the gesture that may start audio
@@ -88,7 +92,7 @@ canvas.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
-    post({ type: 'wheel', seq: seq++, deltaY: e.deltaY, time: e.timeStamp });
+    post({ type: 'wheel', seq: seq++, deltaY: e.deltaY, time: clock(e.timeStamp) });
   },
   { passive: false },
 );

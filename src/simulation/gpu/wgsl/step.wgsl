@@ -14,8 +14,10 @@
 // [0] ruptures, [1] pulled out, [2] max speed (f32 bits), [3] line-search step length (f32 bits),
 // [4 + k] largest update of Newton iteration k
 @group(0) @binding(10) var<storage, read_write> counters: array<atomic<u32>>;
-// contact bound per node: unit normal away from its nearest face (or foreign node) at the start of the
-// substep, and the largest step displacement allowed toward it (zero normal: unbounded)
+// contact bounds per node (selfcontact.wgsl detect / resolveBounds): [2n] unit normal away from the
+// face it is bounded against and the largest step displacement allowed toward it; [2n + 1] for a face
+// corner, the direction toward the node bounded against that face and the largest step along it (zero
+// direction: unbounded)
 @group(0) @binding(11) var<storage, read> cmeta: array<vec4<f32>>;
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
@@ -72,22 +74,42 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
   dx[n] = vec4<f32>(hv, 0.0);
 }
 
+// A half-space bound: the step may move against direction m.xyz by at most m.w.
+fn bound(d: vec3<f32>, m: vec4<f32>) -> vec3<f32> {
+  let approach = -dot(d, m.xyz);
+  return select(d, d + (approach - m.w) * m.xyz, approach > m.w);
+}
+
+// The step d made feasible for node n's contact bounds (OGC-style, directional: it may approach the
+// face it is bounded against only by its share of the clearance, and a face corner may approach the
+// node bounded against it only by that node's share; motion along the face stays free). Alternating
+// projections onto the two half-spaces; both are kept to within rounding when their normals agree.
+fn feasible(n: u32, d: vec3<f32>) -> vec3<f32> {
+  let own = cmeta[2u * n];
+  let recip = cmeta[2u * n + 1u];
+  return bound(bound(bound(d, own), recip), own);
+}
+
+// After contact detection: the predicted step made feasible (the first Newton iteration starts from a
+// state that respects the bounds; the clipped approach is lost, as in an inelastic contact).
+@compute @workgroup_size(128)
+fn projectStart(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x || pinnedN(n)) { return; }
+  dx[n] = vec4<f32>(feasible(n, dx[n].xyz), dx[n].w);
+}
+
 @compute @workgroup_size(128)
 fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   if (pinnedN(n)) { return; }
-  let m = cmeta[n];
   let old = dx[n].xyz;
   // step length chosen by the line search (energy.wgsl)
   let alpha = bitcast<f32>(atomicLoad(&counters[3]));
   // firewall: a non-finite direction never enters the state
   let dn = select(vec3<f32>(0.0), delta[n].xyz, finite3(delta[n].xyz) && finite1(alpha));
-  var nd = old + alpha * dn;
-  // OGC-style feasibility, directional: the step may approach the nearest face only by the allowed
-  // share of its clearance (it can never pass through it); motion along the face stays free
-  let approach = -dot(nd, m.xyz);
-  if (approach > m.w) { nd += (approach - m.w) * m.xyz; }
+  let nd = feasible(n, old + alpha * dn);
   // w keeps the size of this node's latest Newton update (local convergence for history updates)
   dx[n] = vec4<f32>(nd, length(nd - old));
   // non-negative f32 bit patterns order like their values
@@ -110,7 +132,7 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     // cloth (the clipped normal velocity is lost, inelastic). Resting on it (within DEBRIS_REST of the
     // core), Coulomb friction with the supporting component of gravity slows its sliding by up to
     // mu |g.n| h per step: a scrap stays put on slopes below atan(mu)
-    let m = cmeta[n];
+    let m = cmeta[2u * n];
     if (any(m.xyz != vec3<f32>(0.0))) {
       let approach = -dot(d1, m.xyz);
       if (approach > m.w) { d1 += (approach - m.w) * m.xyz; }

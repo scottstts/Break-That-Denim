@@ -1,7 +1,10 @@
 # Handoff (rolling)
 
-Latest round: `docs/decisions/2026-10-10-floor-and-room-light.md` (render-only floor 12 cm below, mount board,
-dim overhead lamp, 8K base/normal cropped to the visible floor; uncommitted).
+Latest round: `docs/decisions/2026-10-10-stability-round.md` (acting on artifacts/assessment: neutral grab,
+visible picking, connected patch, shared hand on the simulation clock, release refinement against the
+numerical bounce, relative/swept contact bounds, contact across tears, deterministic contact; uncommitted).
+Before: `docs/decisions/2026-10-10-floor-and-room-light.md` (render-only floor 12 cm below, mount board,
+dim overhead lamp, 8K base/normal cropped to the visible floor).
 Before: `docs/decisions/2026-10-10-tear-sound-sample.md` (tear sound: the recording's tearing passages
 played back; the mechanics control only tearing on/off, loudness and place; fall-off on stop/release; uncommitted).
 Before: `docs/decisions/2026-10-10-tear-sound-structure.md` (the procedural voice it replaced).
@@ -15,8 +18,14 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
   cancellation-free bending energy changes, force-derived free-end pull-out, wear-independent cohesive
   opening, debris bounded against the cloth, contact query culling.
 - Scene: coupon stretched 0.2 % along the warp (user decision); `MECHANICS_VERSION` 10.
-- Grip: pinch gathering, drag lift, bounded force; holds until release; torn-out pieces stay held. Pinch
-  is the only loading (user decision): slit and eye openings are the correct result for it.
+- Grip: two-pad pinch (fingertips close along the warp; the strip between folds freely; user decision,
+  replaces the radial contraction), drag lift, bounded force; holds until release; torn-out pieces stay
+  held. Pinch is the only loading (user decision): slit and eye openings are the correct result for it. Grabs pick
+  only visible material, start exactly on it, never push behind the grab plane (src/simulation/hand.ts);
+  4 Newton iterations for 0.1 s after a release (RELEASE_REFINEMENT). Releasing frees what only that
+  grip held before the fingers open (Interaction.letGo; a crushed held piece was flung apart).
+- Contact: relative (node and face corners) directional bounds against the first face a path crosses
+  or the nearest start face; lips across tears collide inside the lattice exclusion window.
 - Rendering: threads from the strand chains, split where the mechanics ruptured their bundle; flat clumps
   of freed yarns; free tails solved as heavy elastic rods resting on the cloth (`thread_tail.wgsl`); edge
   fibre from the fibre population (fans and rim hair, per fibre or closed form);
@@ -24,6 +33,10 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
   reference and match; no shading change is justified.
 
 ## Verified
+
+- Stability round: `npm run check` 53 unit, `npm run test:gpu` 26/26 + 12/12 (tests/gpu/interaction.ts).
+  Release on intact cloth: no rebound (was 11 %, 2 rings). Sessions deterministic again; 0 post-release
+  ruptures; maul 5 rejections. Substep +1.8 %. Not yet felt in the browser by the user.
 
 - Tear sound: renders of haul / pluck / drag / rip sessions keep the recording's texture (fine texture
   distance 2.8, the recording's own tears 3.0-7.6); silent unless yarns part; falls off 60 dB in 0.3 s on
@@ -38,6 +51,12 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
   large worn piece (freed 368 nodes), which falls when released.
 
 ## Reproduce
+
+- Stability: `tools/studies/release.ts` (GRAB, PULL, SOLVER, ITERS/WINDOW/MAXITERS, TRACE, STRAIN),
+  `tools/studies/stabilityAssessment.ts` (assessment probe; GRIP override), `tools/studies/benchmoving.ts`,
+  `session.ts peel` (folded flap grabbed and lifted), `HAND` env override in session.ts; session `ASYNC=1`
+  (connectivity analysis alongside the substeps, as the worker) with `FREED=1` (pieces freed since the
+  release / per frame and their speeds); `tools/studies/freepiece.ts` (unanchored / hinged piece).
 
 - Sound: `AUDIO=f.json node tools/gpu/run.mjs tools/gpu/scripts/session.ts rip` (or `twohand.ts`), then
   `tools/audio/render.ts f.json out.wav` (`VOICE` overrides TEAR_SAMPLE); compare with
@@ -57,6 +76,10 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
   grows with fuzz, so compare coverage for our own changes).
 
 ## Open
+
+- Stability round leftovers (decision record "Open"): grip force above 120 N at the iterate; no
+  edge-edge/strand contact; torn cells have no collision face; rare crack-tip line-search rejections.
+  Pad pinch not yet seen by the user in the browser.
 
 0. Sound: verify by ear in the browser (reload: the worklet loads once per page). Loudness follows the
    mechanics' release rate (swells within a tear are the simulated cloth's); the slices come from 2 s of

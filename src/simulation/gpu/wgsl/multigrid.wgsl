@@ -38,6 +38,9 @@ fn weightOf(i: u32, I: u32, n: u32) -> f32 {
 // Whether the level-F node at (i, j) and its unit-offset neighbour are connected: an intact span on
 // the fine lattice; on coarse levels a nonzero Galerkin coupling (pieces separated by a tear have
 // none) or a fixed neighbour (mount boundaries keep their bilinear weights).
+// a span links its nodes while it carries load (newtonMultigrid.ts LINK_MIN_INTACT)
+const LINK_MIN_INTACT: f32 = 0.02;
+
 fn linked(l: u32, i: i32, j: i32, di: i32, dj: i32) -> bool {
   let a = levelNode(F, l, i, j);
   let b = levelNode(F, l, i + di, j + dj);
@@ -45,7 +48,8 @@ fn linked(l: u32, i: i32, j: i32, di: i32, dj: i32) -> bool {
   if (FINE_ROWS) {
     let f = select(1u, 0u, di != 0);
     let owner = select(b, a, di + dj > 0);
-    return segActive(segsF[2u * u32(owner) + f]);
+    let sg = segsF[2u * u32(owner) + f];
+    return segActive(sg) && sg.intact > LINK_MIN_INTACT;
   }
   if (fixedF[u32(b)] != 0u) { return true; }
   return !symIsZero(rowCoupling(u32(a), couplingIndex(vec2<i32>(di, dj))));

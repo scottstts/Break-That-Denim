@@ -60,7 +60,8 @@ export class Contact {
     const cellCursor = createBuffer(d, 'contact.cellCursor', 4 * this.cells);
     const cellItems = createBuffer(d, 'contact.cellItems', 4 * s.N);
     const pairs = createBuffer(d, 'contact.pairs', 4 * K * s.N);
-    this.meta = createBuffer(d, 'contact.meta', 16 * s.N);
+    // 2 per node, as self-contact's (step.wgsl): the node's own bound, no reciprocal bound
+    this.meta = createBuffer(d, 'contact.meta', 32 * s.N);
     this.mod = new ComputeModule(d, 'contact', commonWgsl + contactWgsl);
     for (const e of ['hashCount', 'hashFill', 'detect', 'terms']) this.pipes[e] = this.mod.pipeline(e);
     this.group = this.mod.bindGroup('contact', {

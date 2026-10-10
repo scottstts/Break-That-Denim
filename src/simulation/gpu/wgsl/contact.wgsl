@@ -26,7 +26,8 @@ struct ContactU {
 @group(0) @binding(7) var<storage, read_write> cellCursor: array<atomic<u32>>;
 @group(0) @binding(8) var<storage, read_write> cellItems: array<u32>;
 @group(0) @binding(9) var<storage, read_write> pairs: array<u32>;
-@group(0) @binding(10) var<storage, read_write> cmeta: array<vec4<f32>>; // dx at detection, bound
+// 2 per node (selfcontact.wgsl): own bound (normal, largest approach), reciprocal bound (none here)
+@group(0) @binding(10) var<storage, read_write> cmeta: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read_write> ext: array<vec4<f32>>;  // 3 per node
 
 fn layerOf(n: u32) -> u32 { return nodes[n].ijl >> 24u; }
@@ -119,10 +120,11 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Directional bound (step.wgsl newtonApply): the step may approach the nearest foreign node only by
   // a share of its clearance plus half the contact distance, so it cannot tunnel through a layer.
   if (dmin < 1e8) {
-    cmeta[n] = vec4<f32>(nmin, CU.law.w * (max(0.0, dmin) + 0.5 * CU.dist.x));
+    cmeta[2u * n] = vec4<f32>(nmin, CU.law.w * (max(0.0, dmin) + 0.5 * CU.dist.x));
   } else {
-    cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
+    cmeta[2u * n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
   }
+  cmeta[2u * n + 1u] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
 }
 
 @compute @workgroup_size(128)

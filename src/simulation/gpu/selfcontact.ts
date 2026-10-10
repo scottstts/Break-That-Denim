@@ -55,7 +55,8 @@ export class SelfContact {
   private readonly scanGroups: Array<{ scan: GPUBindGroup; add: GPUBindGroup; blocks: number }> = [];
   /** Face hash, rebuilt every substep at the predicted iterate (selfcontact.wgsl faceFill): cell counts
    * scanned into start offsets [0, T) and fill cursors [T, 2T); per item, the face centroid and a
-   * bounding radius, then its centroid at the substep's start and the face index. */
+   * bounding radius, then its centroid at the substep's start and the face index. A face whose start
+   * centroid lies in another cell is listed there too. */
   readonly cells: GPUBuffer;
   readonly items: GPUBuffer;
 
@@ -69,13 +70,16 @@ export class SelfContact {
     u.set([SELF_CONTACT.stiffness, SELF_CONTACT.friction, SELF_CONTACT.frictionSpeed, SELF_CONTACT.boundFraction], 4);
     const su = createBufferWith(d, 'selfContactU', u, UNIFORM);
     this.cells = createBuffer(d, 'selfContact.cells', 8 * T);
-    const items = createBuffer(d, 'selfContact.items', 32 * s.N);
+    // a face is hashed at most twice (its start and predicted cells)
+    const items = createBuffer(d, 'selfContact.items', 2 * 32 * s.N);
     this.items = items;
-    const pairs = createBuffer(d, 'selfContact.pairs', 4 * K * s.N);
+    // K candidates per node, then the reciprocal-bound keys (node + 1 in 20 bits) and row damage marks
+    if (s.N >= 1 << 20) throw new Error('self-contact bound keys hold at most 2^20 - 1 nodes');
+    const pairs = createBuffer(d, 'selfContact.pairs', 4 * (K + 2) * s.N);
     const acc = createBuffer(d, 'selfContact.acc', 4 * 9 * s.N);
-    this.meta = createBuffer(d, 'selfContact.meta', 16 * s.N);
+    this.meta = createBuffer(d, 'selfContact.meta', 32 * s.N);
     this.mod = new ComputeModule(d, 'selfContact', commonWgsl + selfContactWgsl);
-    for (const e of ['faceCount', 'faceFill', 'detect', 'terms', 'gather']) this.pipes[e] = this.mod.pipeline(e);
+    for (const e of ['faceCount', 'faceFill', 'damageRow', 'detect', 'resolveBounds', 'terms', 'gather']) this.pipes[e] = this.mod.pipeline(e);
     this.group = this.mod.bindGroup('selfContact', {
       0: s.simParams,
       1: su,
@@ -135,7 +139,11 @@ export class SelfContact {
       for (let k = this.scanGroups.length - 2; k >= 0; k--) this.run(pass, 'addBlockSums', this.scanGroups[k].blocks, this.scanGroups[k].add);
     }
     if (stages & 4) this.run(pass, 'faceFill', groups);
-    if (stages & 8) this.run(pass, 'detect', groups);
+    if (stages & 8) {
+      this.run(pass, 'damageRow', groups);
+      this.run(pass, 'detect', groups);
+      this.run(pass, 'resolveBounds', groups);
+    }
   }
 
   /** Contact and friction terms at the current Newton iterate (overwrites ext). */

@@ -12,7 +12,10 @@ import { readBuffer } from '../../../src/gpu/util';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
 import { Interaction } from '../../../src/simulation/gpu/interaction';
 import { Topology } from '../../../src/simulation/gpu/topology';
-import { GRIP, pinchScale } from '../../../src/simulation/grip';
+import { RELEASE_REFINEMENT } from '../../../src/simulation/gpu/solver';
+import { GRIP } from '../../../src/simulation/grip';
+import { HAND, type Hand } from '../../../src/simulation/hand';
+import { grabAt } from '../grab';
 import { AcousticLog } from '../../../src/engine/acousticLog';
 import { ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../../../src/audio/record';
 import { CAPTURES, drain, encodePng, floorImages, gpuDevice } from '../env';
@@ -77,6 +80,9 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
   scrap: [{ scrap: [-0.035, 0.03], half: 4, lift: 0.01, shift: 0.03 }, { wait: 1.2 }],
   // self-contact, deterministic: the cut flap is laid folded over the sheet 4 mm above it and drops
   drop: [{ cut: [-0.035, 0.03], half: 8 }, { foldover: 0.0025 }, { wait: 1.5 }],
+  // the folded flap grabbed where it lies on the sheet and lifted: the flap is what is picked (not the
+  // sheet under it), and the sheet is not pulled up through it
+  peel: [{ cut: [-0.035, 0.03], half: 8 }, { foldover: 0.0025 }, { wait: 0.05 }, { grab: [-0.035, 0.047] }, { to: [0, 0, 0.01], t: 0.4 }, { wait: 0.3 }, { release: true }, { wait: 0.6 }],
   fold: [
     { cut: [0.0, 0.0], half: 8 },
     { grab: [0.0, -0.0085] },
@@ -217,7 +223,7 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: Number(process.env.WAIT ?? 4) },
   ],
-  // a mouse drag as the product maps it: in-plane targets only (AUTOLIFT=1 adds the worker's drag lift),
+  // a mouse drag as the product maps it: in-plane targets (the hand adds the product's lift),
   // pulled out from the worn zone, held, then released
   drag: [
     { grab: [0.004, -0.003] },
@@ -226,7 +232,7 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: 0.6 },
   ],
-  // a user hauling on the cloth: a fast, long drag in the screen plane (AUTOLIFT=1), held at full reach,
+  // a user hauling on the cloth: a fast, long drag in the screen plane, held at full reach,
   // then released (does the grip hold, where does the cloth fail)
   haul: [
     { grab: (process.env.GRAB ?? '0.004,-0.003').split(',').map(Number) as [number, number] },
@@ -281,7 +287,6 @@ const scaleStep = (st: Step): Step =>
 const SCRIPTS: Record<string, Step[]> = Object.fromEntries(Object.entries(SCRIPTS_10CM).map(([k, v]) => [k, v.map(scaleStep)]));
 
 const H_FRAME = 1 / 30;
-const HANDLE_MAX_SPEED = 2.5;
 
 export default async function main(args: string[]): Promise<void> {
   const scriptName = args[0] ?? 'yank';
@@ -291,6 +296,8 @@ export default async function main(args: string[]): Promise<void> {
   if (!script) throw new Error(`unknown script ${scriptName}`);
   // GRIP='{"radius":0.008,"maxForce":300}' overrides the grip parameters
   Object.assign(GRIP, JSON.parse(process.env.GRIP ?? '{}') as object);
+  // HAND='{"liftPerDrag":0}' overrides the hand (hand.ts HAND)
+  Object.assign(HAND, JSON.parse(process.env.HAND ?? '{}') as object);
   const device = await gpuDevice();
   // NOMASK=1: plain bilinear prolongation (comparison with connectivity-aware masking)
   const noMask = process.env.NOMASK ? { patch: (m: string, c: string) => (m === 'multigrid' ? c.replace('      if (ok) {', '      if (true) {') : c) } : {};
@@ -298,7 +305,7 @@ export default async function main(args: string[]): Promise<void> {
   const interaction = new Interaction(device, solver, scene);
   solver.preSubstep = (pass) => interaction.encodeSubstep(pass);
   solver.preAssemble = (dispatch) => interaction.encode(dispatch);
-  const topology = process.env.NO_TOPOLOGY ? null : new Topology(device, solver, scene);
+  const topology = process.env.NO_TOPOLOGY ? null : new Topology(device, solver, scene, () => interaction.coreNodes);
   let events = 0;
   // AUDIO=file.json: the acoustic record of every substep (audio/record.ts; pan = world x of the fracture)
   const acoustic = process.env.AUDIO ? new AcousticLog(device, solver.counters) : null;
@@ -318,7 +325,14 @@ export default async function main(args: string[]): Promise<void> {
   const x0 = new Float32Array(await readBuffer(device, solver.x));
   const N = scene.nodeCount;
 
-  let handle: [number, number, number] | null = null;
+  // the product's handle (worker.ts): drags requested in world metres from the grab point
+  let hand: Hand | null = null;
+  // positions at the last release (FREED diagnostics)
+  let releaseState: Float32Array | null = null;
+  let prevX: Float32Array | null = null;
+  // substeps still refined after a release (worker.ts substepIterations)
+  let refine = 0;
+  let drag: [number, number, number] = [0, 0, 0];
   let anchor: [number, number, number] = [0, 0, 0];
   const tiles: Uint8Array[] = [];
   const labels: string[] = [];
@@ -326,28 +340,30 @@ export default async function main(args: string[]): Promise<void> {
   let t = 0;
   const log: string[] = [];
 
-  const grab = (p: [number, number]) => {
-    let picked = -1;
+  const grab = async (p: [number, number]) => {
+    // the pointer over the cloth at world (x, y): picked as the product picks it
+    let near = -1;
     let best = 1e9;
     for (let n = 0; n < N; n++) {
       const d = Math.hypot(lastX[4 * n] - p[0], lastX[4 * n + 1] - p[1]);
-      if (d < best && !scene.pinned[n]) {
-        best = d;
-        picked = n;
-      }
+      if (d < best && lastX[4 * n + 3] < 0.5) [best, near] = [d, n];
     }
-    anchor = [lastX[4 * picked], lastX[4 * picked + 1], lastX[4 * picked + 2]];
-    grabbed = picked;
-    handle = [...anchor];
-    grabT = t;
-    interaction.attach(picked, anchor);
-    console.log(`  grab node ${picked} at ${anchor.map((q) => q.toFixed(4)).join(',')}`);
+    const g = await grabAt(interaction, [p[0], p[1], lastX[4 * near + 2]], 0);
+    if (!g) {
+      console.log(`  grab at ${p.join(',')}: nothing to hold`);
+      return;
+    }
+    anchor = g.anchor;
+    grabbed = g.node;
+    hand = g.hand;
+    drag = [0, 0, 0];
+    const inCut = cutBox ? (() => { const i = g.node % scene.layers[0].nx; const j = Math.floor(g.node / scene.layers[0].nx); return i >= cutBox[0] && i <= cutBox[1] && j >= cutBox[2] && j <= cutBox[3]; })() : false;
+    console.log(`  grab node ${g.node} (${g.kind}${cutBox ? (inCut ? ', on the cut flap' : ', NOT on the cut flap') : ''}) at ${anchor.map((q) => q.toFixed(4)).join(',')}`);
   };
   let lastX = x0;
   let grabbed = -1;
   // scrap fixture: the piece's centre node (its height against the sheet below it is logged)
   let scrapCentre = -1;
-  let grabT = 0;
   let gripLost = false;
   let cutBox: number[] | null = null;
 
@@ -358,13 +374,11 @@ export default async function main(args: string[]): Promise<void> {
     device.queue.submit([ce.finish()]);
     acoustic?.begin();
     for (let k = 0; k < perFrame; k++) {
-      if (handle && goal) {
-        const d = [goal[0] - handle[0], goal[1] - handle[1], goal[2] - handle[2]];
-        const len = Math.hypot(d[0], d[1], d[2]);
-        const st = HANDLE_MAX_SPEED * h;
-        for (let q = 0; q < 3; q++) handle[q] = len <= st ? goal[q] : handle[q] + (d[q] * st) / len;
-        interaction.setTarget(handle);
-        if (!process.env.NOPINCH) interaction.setPinch(pinchScale(t + k * h - grabT));
+      if (hand) {
+        if (goal) drag = [goal[0] - anchor[0], goal[1] - anchor[1], goal[2] - anchor[2]];
+        hand.step(h, drag);
+        interaction.setTarget(hand.target);
+        interaction.setPinch(process.env.NOPINCH ? 1 : hand.pinch);
       }
       const hunting = process.env.HUNT && t > Number(process.env.HUNT);
       if (hunting) snapshot(device, solver, true);
@@ -373,7 +387,7 @@ export default async function main(args: string[]): Promise<void> {
         continue;
       }
       const enc = device.createCommandEncoder();
-      solver.encodeSubstep(enc);
+      solver.encodeSubstep(enc, refine-- > 0 ? RELEASE_REFINEMENT.newtonIterations : 0);
       acoustic?.record(enc);
       device.queue.submit([enc.finish()]);
       if (hunting && (await hunt(device, solver, `t=${(t + (k + 1) * h).toFixed(4)}`))) {
@@ -396,15 +410,51 @@ export default async function main(args: string[]): Promise<void> {
     t += perFrame * h;
     const xs = new Float32Array(await readBuffer(device, solver.x));
     const v = new Float32Array(await readBuffer(device, solver.v));
-    if (handle && interaction.coreNodes.length > 0 && !gripLost && interaction.coreNodes.every((n) => xs[4 * n + 3] > 0.5)) {
+    if (hand && interaction.coreNodes.length > 0 && !gripLost && interaction.coreNodes.every((n) => xs[4 * n + 3] > 0.5)) {
       gripLost = true;
       console.log(`  grip core became debris at t=${(t).toFixed(2)} (the pinched piece tore out)`);
     }
     const c = new Uint32Array(await readBuffer(device, solver.counters, 64));
     lastX = xs;
+    if (process.env.FREED && releaseState !== null) {
+      const rs = releaseState;
+      // FREED=1: the nodes that left the cloth since the last release (a piece the fingers held): their
+      // speeds, spread and how far they are from where they were released
+      const fresh: number[] = [];
+      for (let n = 0; n < N; n++) if (rs[4 * n + 3] < 0.5 && xs[4 * n + 3] > 0.5 && xs[4 * n + 3] < 1.5) fresh.push(n);
+      if (fresh.length > 0) {
+        const sp = fresh.map((n) => Math.hypot(v[4 * n], v[4 * n + 1], v[4 * n + 2]));
+        const travel = fresh.map((n) => Math.hypot(xs[4 * n] - rs[4 * n], xs[4 * n + 1] - rs[4 * n + 1], xs[4 * n + 2] - rs[4 * n + 2]));
+        let spread = 0;
+        for (const a of fresh) for (const b of fresh) spread = Math.max(spread, Math.hypot(xs[4 * a] - xs[4 * b], xs[4 * a + 1] - xs[4 * b + 1], xs[4 * a + 2] - xs[4 * b + 2]));
+        const far = fresh.reduce((b, n, k) => (travel[k] > travel[fresh.indexOf(b)] ? n : b), fresh[0]);
+        if (process.env.FREED === '2') {
+          const sg = new Uint32Array(await readBuffer(device, solver.segs));
+          const nxL = scene.layers[0].nx;
+          const act = (q: number) => (sg[8 * q + 5] & 3) === 1;
+          const deg = (q: number) => [act(2 * q), act(2 * q + 1), act(2 * (q - 1)), act(2 * (q - nxL) + 1)].filter(Boolean).length;
+          console.log(`    farthest ${far}: travel ${(Math.max(...travel) * 1e3).toFixed(1)} mm, z ${(rs[4 * far + 2] * 1e3).toFixed(1)} -> ${(xs[4 * far + 2] * 1e3).toFixed(1)} mm, active spans ${deg(far)}, others: ${fresh.filter((q) => q !== far).map((q) => `${q}:${deg(q)}`).join(' ')}`);
+        }
+        console.log(`  freed since release: ${fresh.length} nodes, speed max ${Math.max(...sp).toFixed(3)} mean ${(sp.reduce((a, b) => a + b, 0) / sp.length).toFixed(3)} m/s, travel max ${(Math.max(...travel) * 1e3).toFixed(1)} mm, spread ${(spread * 1e3).toFixed(1)} mm (t=${(t - releaseT).toFixed(3)} after release)`);
+      }
+    }
+    if (process.env.FREED && prevX) {
+      // nodes that became debris this frame: their speed then (a piece flung by the solve before it left it)
+      let count = 0;
+      let top = 0;
+      for (let n = 0; n < N; n++) {
+        if (prevX[4 * n + 3] < 0.5 && xs[4 * n + 3] > 0.5) {
+          count++;
+          top = Math.max(top, Math.hypot(v[4 * n], v[4 * n + 1], v[4 * n + 2]));
+        }
+      }
+      if (count > 0) console.log(`  t=${t.toFixed(3)} ${count} nodes became debris, fastest ${top.toFixed(3)} m/s`);
+    }
+    prevX = xs;
     if (topology && c[0] + c[1] !== events) {
       events = c[0] + c[1];
-      await topology.request(interaction.coreNodes);
+      if (process.env.ASYNC) void topology.request();
+      else await topology.request();
     }
     let bad = 0;
     let far = 0;
@@ -435,7 +485,7 @@ export default async function main(args: string[]): Promise<void> {
       console.log(`  scrap centre x ${(xs[4 * c] * 1e3).toFixed(1)} z ${(xs[4 * c + 2] * 1e3).toFixed(2)} mm v ${Array.from(v.slice(4 * c, 4 * c + 3)).map((q) => q.toFixed(3)).join(',')} (state ${xs[4 * c + 3]}), sheet below ${(zs * 1e3).toFixed(2)} mm at ${(best * 1e3).toFixed(1)} mm in plan`);
     }
     if (process.env.TRACK) {
-      if (handle) console.log(`  handle ${handle.map((q) => q.toFixed(4)).join(',')}`);
+      if (hand) console.log(`  handle ${hand.target.map((q) => q.toFixed(4)).join(',')}`);
       for (const tn of process.env.TRACK.split(',').map(Number)) {
         const k = interaction.patchNodes.indexOf(tn);
         console.log(`  node ${tn} x=${Array.from(xs.slice(4 * tn, 4 * tn + 4)).map((q) => q.toFixed(4))} v=${Array.from(v.slice(4 * tn, 4 * tn + 3)).map((q) => q.toFixed(3))} grip=${k >= 0}`);
@@ -665,24 +715,37 @@ export default async function main(args: string[]): Promise<void> {
       device.queue.writeBuffer(solver.segs, 0, sg);
       await topology?.request([]);
       cutBox = [i0 - a, i0 + a, j0 - a, j0 + a];
-    } else if ('grab' in s) grab(s.grab);
+    } else if ('grab' in s) await grab(s.grab);
     else if ('release' in s) {
       rupturesAtRelease = (await settleProbe()) ?? 0;
+      releaseState = new Float32Array(await readBuffer(device, solver.x));
+      if (process.env.FREED === '2') console.log(`  held: ${interaction.patchNodes.join(',')} core ${interaction.coreNodes.join(',')}`);
+      if (process.env.FREED) {
+        // the held patch just before the release
+        const vv = new Float32Array(await readBuffer(device, solver.v));
+        const sp = interaction.patchNodes.map((n) => Math.hypot(vv[4 * n], vv[4 * n + 1], vv[4 * n + 2]));
+        console.log(`  release: held patch speed max ${Math.max(...sp).toFixed(3)} m/s`);
+      }
       releaseT = t;
       settledT = -1;
-      interaction.release();
-      await topology?.request([]);
-      handle = null;
+      // as the worker: the held piece is freed first, then the fingers open (worker.ts endGrip); ASYNC=1
+      // runs the analysis alongside the substeps, as the worker does
+      interaction.letGo(0);
+      const open = () => {
+        interaction.release(0);
+        refine = Math.round(RELEASE_REFINEMENT.duration / h);
+      };
+      if (!topology) open();
+      else if (process.env.ASYNC) void topology.request().then(open);
+      else await topology.request().then(open);
+      hand = null;
       gripLost = false;
     } else if ('wait' in s) {
       for (let q = 0; q < Math.round(s.wait / H_FRAME); q++) await runFrameS(null);
     } else {
       const goal: [number, number, number] = [anchor[0] + s.to[0], anchor[1] + s.to[1], anchor[2] + s.to[2]];
-      // the product's drag lift (worker.ts LIFT_PER_DRAG): the handle rises toward the viewer with the
-      // in-plane distance dragged from the grab point
-      if (process.env.AUTOLIFT) goal[2] += Math.min(0.05, 0.35 * Math.hypot(goal[0] - anchor[0], goal[1] - anchor[1]));
-      // the pointer target moves linearly over the step; the handle follows at bounded speed
-      const start = handle ? ([...handle] as [number, number, number]) : goal;
+      // the pointer target moves linearly over the step; the hand lifts it and follows (hand.ts)
+      const start: [number, number, number] = [anchor[0] + drag[0], anchor[1] + drag[1], anchor[2] + drag[2]];
       const frames = Math.max(1, Math.round(s.t / H_FRAME));
       for (let q = 1; q <= frames; q++) {
         const a = q / frames;

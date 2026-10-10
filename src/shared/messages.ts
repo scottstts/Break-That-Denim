@@ -22,7 +22,7 @@ export interface PointerCommand {
   /** Pointer (finger) identity; ALL_POINTERS with 'cancel' releases every grip. */
   id: number;
   seq: number;
-  /** performance.now() at the event (main-thread clock). */
+  /** Event time on the shared clock: performance.timeOrigin + performance.now() at the event (ms). */
   time: number;
   x: number;
   y: number;

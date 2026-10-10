@@ -31,7 +31,7 @@ export function segTri(p: V, q: V, a: V, b: V, c: V): number {
   return t > 0 && t < 1 ? t : -1;
 }
 
-export function census(scene: ReturnType<typeof compileScene>, x: Float32Array, segs: Uint32Array): { sheet: number; strand: number; strandSpans: number; sheetSpans: number } {
+export function census(scene: ReturnType<typeof compileScene>, x: Float32Array, segs: Uint32Array): { sheet: number; strand: number; strandSpans: number; sheetSpans: number; excluded: number } {
   const L = scene.layers[0];
   const N = scene.nodeCount;
   const active = (n: number, f: number) => (segs[8 * (2 * n + f) + 5] & 3) === 1;
@@ -72,6 +72,15 @@ export function census(scene: ReturnType<typeof compileScene>, x: Float32Array, 
   let strand = 0;
   let strandSpans = 0;
   let sheetSpans = 0;
+  // crossings of a face within self-contact's lattice exclusion window of either span end
+  // (selfcontact.wgsl detect: di, dj in [-3, 2]), which contact never tests
+  let excluded = 0;
+  const inWindow = (node: number, face: number) => {
+    const di = (face % L.nx) - (node % L.nx);
+    const dj = Math.floor(face / L.nx) - Math.floor(node / L.nx);
+    return di >= -3 && di <= 2 && dj >= -3 && dj <= 2;
+  };
+  let near = false;
   for (let j = 0; j < L.ny; j++) {
     for (let i = 0; i < L.nx; i++) {
       const n = L.nodeOffset + j * L.nx + i;
@@ -100,6 +109,7 @@ export function census(scene: ReturnType<typeof compileScene>, x: Float32Array, 
             const [c00, c10, c01, c11] = c.map(P);
             if (segTri(p, q, c00, c10, c11) >= 0 || segTri(p, q, c00, c11, c01) >= 0) {
               hit = true;
+              near = inWindow(n, fc) || inWindow(m, fc);
               break;
             }
           }
@@ -107,11 +117,12 @@ export function census(scene: ReturnType<typeof compileScene>, x: Float32Array, 
         if (hit) {
           if (isSheet) sheet++;
           else strand++;
+          if (near) excluded++;
         }
       }
     }
   }
-  return { sheet, strand, strandSpans, sheetSpans };
+  return { sheet, strand, strandSpans, sheetSpans, excluded };
 }
 
 export default async function main(args: string[]): Promise<void> {
@@ -122,5 +133,5 @@ export default async function main(args: string[]): Promise<void> {
   const x = new Float32Array(buf, 0, 4 * N);
   const segs = new Uint32Array(buf, 16 * N, 16 * N);
   const r = census(scene, x, segs);
-  console.log(`${args[0]}: spans through a cell: sheet ${r.sheet} / ${r.sheetSpans}, strand ${r.strand} / ${r.strandSpans}`);
+  console.log(`${args[0]}: spans through a cell: sheet ${r.sheet} / ${r.sheetSpans}, strand ${r.strand} / ${r.strandSpans} (${r.excluded} within the contact's lattice exclusion)`);
 }

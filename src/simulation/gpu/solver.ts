@@ -13,6 +13,7 @@ import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
 import yarnFieldWgsl from './wgsl/yarnfield.wgsl?raw';
 import { SHARE, shareReach } from '../yarnField';
+import { LINK_MIN_INTACT } from '../reference/newtonMultigrid';
 import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS } from '../../audio/record';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
@@ -65,6 +66,15 @@ export const GPU_DEFAULTS: GpuSolverParams = {
   maxCoarsestNodes: 400,
   selfContact: true,
 };
+
+/**
+ * Event-targeted refinement after a grip lets go: the stretched cloth snaps back within a few substeps,
+ * and 2 Newton iterations stop well short of that solve. The unfinished correction re-enters as a
+ * spurious rebound (kinetic energy regrows after the snap, the held point swings past rest and rings);
+ * 4 iterations over the next 0.1 s give the 6 x 4 solve's recoil (no rebound) on every loading
+ * measured (tools/studies/release.ts). 3 iterations or a 0.05 s window leave part of it.
+ */
+export const RELEASE_REFINEMENT = { newtonIterations: 4, duration: 0.1 };
 
 /** Upper bound on Newton iterations (size of the per-iteration convergence slots). */
 const MAX_NEWTON = 8;
@@ -316,8 +326,8 @@ export class GpuSolver {
     this.contact = scene.layers.length > 1 ? new Contact(this, scene) : new SelfContact(this);
     if (!this.contactEnabled) {
       // no displacement bound: the detection-time displacement is zero and the bound unlimited
-      const meta = new Float32Array(4 * N);
-      for (let n = 0; n < N; n++) meta[4 * n + 3] = 1e9;
+      const meta = new Float32Array(8 * N);
+      for (let q = 0; q < 2 * N; q++) meta[4 * q + 3] = 1e9;
       device.queue.writeBuffer(this.contact.meta, 0, meta);
     }
     // the distinct dispatch sizes of a Newton iteration, recorded from a dry encoding
@@ -366,8 +376,9 @@ export class GpuSolver {
     const d = this.device;
     const patch = this.params.patch ?? ((_: string, c: string) => c);
     this.mod.assemble = new ComputeModule(d, 'assemble', patch('assemble', commonWgsl + dragWgsl + assembleWgsl));
-    this.mod.mgFine = new ComputeModule(d, 'multigrid.fine', patch('multigrid', commonWgsl + multigridWgsl + rowFineWgsl));
-    this.mod.mgCoarse = new ComputeModule(d, 'multigrid.coarse', patch('multigrid', commonWgsl + multigridWgsl + rowCoarseWgsl));
+    const mg = multigridWgsl.replace('const LINK_MIN_INTACT: f32 = 0.02;', `const LINK_MIN_INTACT: f32 = ${LINK_MIN_INTACT};`);
+    this.mod.mgFine = new ComputeModule(d, 'multigrid.fine', patch('multigrid', commonWgsl + mg + rowFineWgsl));
+    this.mod.mgCoarse = new ComputeModule(d, 'multigrid.coarse', patch('multigrid', commonWgsl + mg + rowCoarseWgsl));
     this.mod.smoothFine = new ComputeModule(d, 'smooth.fine', patch('smooth', commonWgsl + smoothWgsl + rowFineWgsl));
     this.mod.smoothCoarse = new ComputeModule(d, 'smooth.coarse', patch('smooth', commonWgsl + smoothWgsl + rowCoarseWgsl));
     this.mod.pcg = new ComputeModule(d, 'pcg', patch('pcg', commonWgsl + pcgWgsl + rowFineWgsl));
@@ -383,7 +394,7 @@ export class GpuSolver {
     this.pl.pwCoarse = this.mod.mgCoarse.pipeline('prolongWeights');
     this.pl.prolong = this.mod.mgCoarse.pipeline('prolongAdd');
     for (const e of ['matvecDot', 'dotPartial', 'reduceFinal', 'updateXR', 'updateP', 'clear2']) this.pl[e] = this.mod.pcg.pipeline(e);
-    for (const e of ['predict', 'newtonApply', 'commit', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
+    for (const e of ['predict', 'newtonApply', 'projectStart', 'commit', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
     // load-sharing constants from the reference definition (yarnField.ts SHARE)
     const share = yarnFieldWgsl.replace('override SHARE_FRACTION: f32 = 0.6;', `const SHARE_FRACTION: f32 = ${SHARE.fraction.toFixed(6)};`).replace('override SHARE_RUN: u32 = 6u;', `const SHARE_RUN: u32 = ${SHARE.maxRun}u;`);
     this.mod.yarnField = new ComputeModule(d, 'yarnField', commonWgsl + share);
@@ -446,7 +457,7 @@ export class GpuSolver {
     const group = (key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod.step.bindGroup(key, entries);
     };
-    for (const k of ['predict', 'commit']) group(k, stepEntries);
+    for (const k of ['predict', 'commit', 'project']) group(k, stepEntries);
     this.bg.yarnField = this.mod.yarnField.bindGroup('yarnField', {
       0: this.simParams,
       1: this.fieldU,
@@ -618,15 +629,21 @@ export class GpuSolver {
    * One accepted substep: predict, contact detection, Newton iterations, commit and history updates.
    * The first `newtonIterations` iterations always run; each further one (up to `newtonMax`) runs
    * with indirect sizes that the gate sets to zero once the previous update fell below tolerance.
+   * `minIterations` raises the unconditional count and `maxIterations` the gated bound for this
+   * substep (event-targeted refinement).
    */
-  encodeSubstep(encoder: GPUCommandEncoder): void {
+  encodeSubstep(encoder: GPUCommandEncoder, minIterations = 0, maxIterations = 0): void {
     if (this.contactEnabled) this.contact.encodeClear(encoder);
     encoder.clearBuffer(this.counters, 16, 4 * MAX_NEWTON);
     const pass = encoder.beginComputePass({ label: 'substep' });
     this.encodePredict(pass);
     this.preSubstep?.(pass);
-    if (this.contactEnabled) this.contact.encodeDetect(pass);
-    const { newtonIterations, newtonMax } = this.params;
+    if (this.contactEnabled) {
+      this.contact.encodeDetect(pass);
+      this.dispatch(pass, 'projectStart', 'project', this.nodeGroups(this.N));
+    }
+    const newtonIterations = Math.min(MAX_NEWTON, Math.max(this.params.newtonIterations, minIterations));
+    const newtonMax = Math.min(MAX_NEWTON, Math.max(this.params.newtonMax, newtonIterations, maxIterations));
     for (let it = 0; it < newtonMax; it++) {
       if (it >= newtonIterations) {
         this.dispatch(pass, 'gate', `gate${it - 1}`, Math.ceil(this.sizeIndex.size / 64));
@@ -659,6 +676,12 @@ export class GpuSolver {
   /** Enable/disable history updates (cohesive damage, crossing slip); off only while settling. */
   setHistoryEnabled(on: boolean): void {
     this.device.queue.writeBuffer(this.simParams, 24, new Uint32Array([on ? 1 : 0]));
+  }
+
+  /** Largest nodal update at which gated Newton iterations stop (m; subsequently submitted work). */
+  setNewtonTolerance(tolerance: number): void {
+    this.params.newtonTolerance = tolerance;
+    this.device.queue.writeBuffer(this.gateSizes, 4, new Float32Array([tolerance]));
   }
 
   /** Change the timestep (takes effect for subsequently submitted work). */

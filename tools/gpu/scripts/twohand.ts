@@ -16,8 +16,10 @@ import { readBuffer } from '../../../src/gpu/util';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
 import { Interaction } from '../../../src/simulation/gpu/interaction';
 import { Topology } from '../../../src/simulation/gpu/topology';
-import { GRIP, pinchScale } from '../../../src/simulation/grip';
+import { RELEASE_REFINEMENT } from '../../../src/simulation/gpu/solver';
+import type { Hand } from '../../../src/simulation/hand';
 import { CAPTURES, drain, encodePng, gpuDevice } from '../env';
+import { grabAt } from '../grab';
 import { settledSolver } from './render';
 
 /** A finger: where it lands (world x, y, m) and its drag (m) over `t` seconds after landing at `start`. */
@@ -75,18 +77,11 @@ const SCRIPTS: Record<string, { fingers: Finger[]; length: number }> = {
 };
 
 const H_FRAME = 1 / 30;
-/** worker.ts handle logic */
-const HANDLE_MAX_SPEED = 2.5;
-const ENGAGE_LIFT = 0.002;
-const LIFT_PER_DRAG = 0.35;
-const MAX_DRAG_LIFT = 0.05;
 
 interface Held {
   finger: Finger;
   slot: number;
-  anchor: [number, number, number];
-  handle: [number, number, number];
-  grabT: number;
+  hand: Hand;
 }
 
 export default async function main(args: string[]): Promise<void> {
@@ -100,7 +95,7 @@ export default async function main(args: string[]): Promise<void> {
   const interaction = new Interaction(device, solver, scene);
   solver.preSubstep = (pass) => interaction.encodeSubstep(pass);
   solver.preAssemble = (dispatch) => interaction.encode(dispatch);
-  const topology = new Topology(device, solver, scene);
+  const topology = new Topology(device, solver, scene, () => interaction.coreNodes);
   const acoustic = process.env.AUDIO ? new AcousticLog(device, solver.counters) : null;
   const audioRecords: number[][] = [];
   const [W, Hh] = (process.env.SIZE ?? '960x600').split('x').map(Number);
@@ -118,7 +113,7 @@ export default async function main(args: string[]): Promise<void> {
     let best = 1e9;
     let at = -1;
     for (let n = 0; n < N; n++) {
-      if (scene.pinned[n]) continue;
+      if (xs[4 * n + 3] > 0.5) continue;
       const d = Math.hypot(xs[4 * n] - p[0], xs[4 * n + 1] - p[1]);
       if (d < best) [best, at] = [d, n];
     }
@@ -132,32 +127,34 @@ export default async function main(args: string[]): Promise<void> {
   let t = 0;
   let events = 0;
   let bad = 0;
+  // substeps still refined after a finger lifts (worker.ts substepIterations)
+  let refine = 0;
   for (let frame = 0; t < script.length - 1e-9; frame++) {
     // fingers landing and lifting at this frame
     for (const f of script.fingers) {
       if (!held.has(f) && !done.has(f) && t >= f.start) {
         done.add(f);
-        const node = nearest(f.at);
-        const slot = interaction.freeSlot();
-        const taken = interaction.holder(node) >= 0;
-        const anchor: [number, number, number] = [xs[4 * node], xs[4 * node + 1], xs[4 * node + 2]];
-        const ok = !taken && slot >= 0 && interaction.attach(node, anchor, slot);
-        console.log(`  t=${t.toFixed(2)} finger at ${f.at.join(',')}: node ${node}${taken ? ' (already held)' : ''} -> ${ok ? `slot ${slot}, ${interaction.core(slot).length} core nodes` : 'holds nothing'}`);
-        if (ok) held.set(f, { finger: f, slot, anchor, handle: [...anchor], grabT: t });
+        // the pointer over the cloth at world (x, y), picked as the product picks it
+        const g = await grabAt(interaction, [f.at[0], f.at[1], xs[4 * nearest(f.at) + 2]]);
+        console.log(`  t=${t.toFixed(2)} finger at ${f.at.join(',')}: ${g ? `node ${g.node} slot ${g.slot}, ${interaction.core(g.slot).length} core nodes` : 'holds nothing'}`);
+        if (g) held.set(f, { finger: f, slot: g.slot, hand: g.hand });
       }
     }
     for (const [f, g] of [...held]) {
       if (t >= f.start + f.hold) {
-        interaction.release(g.slot);
+        // as the worker: the held piece is freed first, then the fingers open (worker.ts endGrip)
+        interaction.letGo(g.slot);
         held.delete(f);
-        await topology.request(interaction.coreNodes);
+        await topology.request();
+        interaction.release(g.slot);
+        refine = Math.round(RELEASE_REFINEMENT.duration / h);
         console.log(`  t=${t.toFixed(2)} finger at ${f.at.join(',')} lifts`);
       }
     }
     // sound sources follow the fingers (worker.ts updateAnchors)
     if (held.size > 0) {
       const anchors = new Float32Array(16);
-      for (const g of held.values()) anchors.set([...g.handle, 1], 4 * g.slot);
+      for (const g of held.values()) anchors.set([...g.hand.target, 1], 4 * g.slot);
       device.queue.writeBuffer(solver.acousticSources, 0, anchors);
     }
     acoustic?.begin();
@@ -166,19 +163,12 @@ export default async function main(args: string[]): Promise<void> {
       for (const g of held.values()) {
         const f = g.finger;
         const a = Math.min(1, Math.max(0, (tk - f.start) / f.t));
-        const target: [number, number, number] = [g.anchor[0] + a * f.pull[0], g.anchor[1] + a * f.pull[1], g.anchor[2]];
-        const since = tk - g.grabT;
-        const drag = Math.hypot(a * f.pull[0], a * f.pull[1]);
-        target[2] += ENGAGE_LIFT * Math.min(1, since / GRIP.engageTime) + Math.min(MAX_DRAG_LIFT, LIFT_PER_DRAG * drag);
-        const d = [target[0] - g.handle[0], target[1] - g.handle[1], target[2] - g.handle[2]];
-        const len = Math.hypot(d[0], d[1], d[2]);
-        const st = HANDLE_MAX_SPEED * h;
-        for (let q = 0; q < 3; q++) g.handle[q] = len <= st ? target[q] : g.handle[q] + (d[q] * st) / len;
-        interaction.setTarget(g.handle, g.slot);
-        interaction.setPinch(pinchScale(since), g.slot);
+        g.hand.step(h, [a * f.pull[0], a * f.pull[1], 0]);
+        interaction.setTarget(g.hand.target, g.slot);
+        interaction.setPinch(g.hand.pinch, g.slot);
       }
       const enc = device.createCommandEncoder();
-      solver.encodeSubstep(enc);
+      solver.encodeSubstep(enc, refine-- > 0 ? RELEASE_REFINEMENT.newtonIterations : 0);
       acoustic?.record(enc);
       device.queue.submit([enc.finish()]);
     }
@@ -198,7 +188,7 @@ export default async function main(args: string[]): Promise<void> {
     const c = new Uint32Array(await readBuffer(device, solver.counters, 64));
     if (c[0] + c[1] !== events) {
       events = c[0] + c[1];
-      await topology.request(interaction.coreNodes);
+      await topology.request();
     }
     let nf = 0;
     for (let q = 0; q < 4 * N; q++) if (!Number.isFinite(xs[q])) nf++;

@@ -10,6 +10,10 @@ import stateWgsl from './wgsl/state.wgsl?raw';
  * patch core. Cloth nodes that no longer reach an anchor become ballistic debris (see state.wgsl).
  * A piece torn out inside the pinch stays in the fingers, whatever its size, until the grip ends.
  * At most one analysis is in flight; requests made meanwhile are coalesced into one rerun.
+ *
+ * The anchors are taken when an analysis applies its result, not when it was requested: a grip that
+ * attached while the connectivity readback was pending keeps what it holds. (The read connectivity
+ * may be older than that; cuts only remove spans, so a stale graph frees less, never more.)
  */
 export class Topology {
   private readonly device: GPUDevice;
@@ -30,16 +34,20 @@ export class Topology {
   private readonly column: Int32Array;
   private readonly row: Int32Array;
   private tail = 0;
-  private busy = false;
+  /** The analysis in flight (it reruns while requests arrive), or null. */
+  private running: Promise<void> | null = null;
   /** Bumped by reset(): an analysis started before it must not apply its result. */
   private epoch = 0;
   private again = false;
   private anchors: readonly number[] = [];
+  /** Current grip anchors, when the owner supplies them (read at apply time). */
+  private readonly anchorSource: (() => readonly number[]) | null;
   /** Nodes made ballistic so far (development statistics). */
   freedCount = 0;
 
-  constructor(device: GPUDevice, solver: GpuSolver, scene: CompiledScene) {
+  constructor(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, anchors: (() => readonly number[]) | null = null) {
     this.device = device;
+    this.anchorSource = anchors;
     this.solver = solver;
     this.scene = scene;
     const N = scene.nodeCount;
@@ -66,14 +74,22 @@ export class Topology {
     }
   }
 
-  /** Request an analysis with the given extra anchors (grip patch nodes; empty when not gripping). */
-  request(anchors: readonly number[]): Promise<void> {
+  /**
+   * Request an analysis. Extra anchors (grip patch cores) come from the anchor source when there is
+   * one, else from `anchors`. Resolves once an analysis that started after this request has applied.
+   */
+  request(anchors: readonly number[] = []): Promise<void> {
     this.anchors = anchors;
-    if (this.busy) {
+    if (this.running) {
       this.again = true;
-      return Promise.resolve();
+      return this.running;
     }
-    return this.run();
+    this.running = this.run().finally(() => (this.running = null));
+    return this.running;
+  }
+
+  private currentAnchors(): readonly number[] {
+    return this.anchorSource ? this.anchorSource() : this.anchors;
   }
 
   /** Clear all dynamic state (reset). */
@@ -89,38 +105,33 @@ export class Topology {
   }
 
   private async run(): Promise<void> {
-    this.busy = true;
-    try {
-      do {
-        this.again = false;
-        const epoch = this.epoch;
-        const anchors = this.anchors;
-        const enc = this.device.createCommandEncoder({ label: 'state.pack' });
-        const pass = enc.beginComputePass();
-        pass.setBindGroup(0, this.group);
-        pass.setPipeline(this.packPipe);
-        pass.dispatchWorkgroups(Math.ceil(this.scene.nodeCount / 128));
-        pass.end();
-        enc.copyBufferToBuffer(this.packed, 0, this.staging, 0, 4 * this.scene.nodeCount);
-        this.device.queue.submit([enc.finish()]);
-        await this.staging.mapAsync(GPUMapMode.READ);
-        const bits = new Uint32Array(this.staging.getMappedRange()).slice();
-        this.staging.unmap();
-        if (epoch !== this.epoch) continue;
-        if (this.search(bits, anchors) > 0) {
-          this.device.queue.writeBuffer(this.freedBuf, 0, this.freed);
-          const e2 = this.device.createCommandEncoder({ label: 'state.apply' });
-          const p2 = e2.beginComputePass();
-          p2.setBindGroup(0, this.group);
-          p2.setPipeline(this.applyPipe);
-          p2.dispatchWorkgroups(Math.ceil(this.scene.nodeCount / 128));
-          p2.end();
-          this.device.queue.submit([e2.finish()]);
-        }
-      } while (this.again);
-    } finally {
-      this.busy = false;
-    }
+    do {
+      this.again = false;
+      const epoch = this.epoch;
+      const enc = this.device.createCommandEncoder({ label: 'state.pack' });
+      const pass = enc.beginComputePass();
+      pass.setBindGroup(0, this.group);
+      pass.setPipeline(this.packPipe);
+      pass.dispatchWorkgroups(Math.ceil(this.scene.nodeCount / 128));
+      pass.end();
+      enc.copyBufferToBuffer(this.packed, 0, this.staging, 0, 4 * this.scene.nodeCount);
+      this.device.queue.submit([enc.finish()]);
+      await this.staging.mapAsync(GPUMapMode.READ);
+      const bits = new Uint32Array(this.staging.getMappedRange()).slice();
+      this.staging.unmap();
+      if (epoch !== this.epoch) continue;
+      // anchors as they are now: the result is submitted before any other task can change them
+      if (this.search(bits, this.currentAnchors()) > 0) {
+        this.device.queue.writeBuffer(this.freedBuf, 0, this.freed);
+        const e2 = this.device.createCommandEncoder({ label: 'state.apply' });
+        const p2 = e2.beginComputePass();
+        p2.setBindGroup(0, this.group);
+        p2.setPipeline(this.applyPipe);
+        p2.dispatchWorkgroups(Math.ceil(this.scene.nodeCount / 128));
+        p2.end();
+        this.device.queue.submit([e2.finish()]);
+      }
+    } while (this.again);
   }
 
   /**

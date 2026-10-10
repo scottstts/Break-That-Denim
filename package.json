@@ -13,7 +13,7 @@
     "check": "npm run lint && npm run typecheck && npm run test",
     "gpu:render": "node tools/gpu/run.mjs tools/gpu/scripts/render.ts",
     "gpu:drape": "node tools/gpu/run.mjs tools/gpu/scripts/drape.ts",
-    "test:gpu": "node tools/gpu/run.mjs tests/gpu/correctness.ts"
+    "test:gpu": "node tools/gpu/run.mjs tests/gpu/correctness.ts && node tools/gpu/run.mjs tests/gpu/interaction.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

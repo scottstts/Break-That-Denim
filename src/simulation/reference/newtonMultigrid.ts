@@ -156,11 +156,23 @@ function geomStiff(f: number): number {
   return HESSIAN.absProjection ? Math.abs(f) : Math.max(f, 0);
 }
 
+/**
+ * A span links its nodes for the connectivity-aware prolongation while it carries load: active, and
+ * with more than this share of its yarns' capacity intact. A span whose yarns have all softened through
+ * but not yet separated carries next to nothing; tying the node to the far side's coarse unknowns
+ * through it drags a nearly free crack-tip node with that side (huge Newton directions, rejected line
+ * searches).
+ */
+export const LINK_MIN_INTACT = 0.02;
+
 /** Assemble the projected Hessian of the reference solver's incremental potential at its current dx. */
 export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
   const layers: LatticeLayer[] = S.scene.layers.map((L: LayerInfo) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
   const A = new StencilOperator(layers);
-  A.link = (n, di, dj) => S.segActive(S.seg(n, di !== 0 ? 0 : 1, di + dj > 0 ? 1 : -1));
+  A.link = (n, di, dj) => {
+    const s = S.seg(n, di !== 0 ? 0 : 1, di + dj > 0 ? 1 : -1);
+    return S.segActive(s) && S.intact[s] > LINK_MIN_INTACT;
+  };
   const h = S.params.h;
   for (let n = 0; n < S.N; n++) {
     if (S.scene.pinned[n]) {
