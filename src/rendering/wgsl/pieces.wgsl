@@ -190,11 +190,6 @@ fn edgeDrawArgs() {
   atomicStore(&piecesArgs[8], (n + 63u) / 64u);
   atomicStore(&piecesArgs[9], 1u);
   atomicStore(&piecesArgs[10], 1u);
-  // aggregate fringe (fuzz.wgsl vsEdgeTuft): a quad per side of each edge crossing
-  atomicStore(&piecesArgs[12], 4u);
-  atomicStore(&piecesArgs[13], 4u * n);
-  atomicStore(&piecesArgs[14], 0u);
-  atomicStore(&piecesArgs[15], 0u);
   edgeList[MAX_EDGES] = n;
 }
 

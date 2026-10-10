@@ -57,8 +57,10 @@ const MAX_FINE = 32768;
 /** Nodes with a connection field (pieces.wgsl) and the free-edge crossings (edge fibres). */
 const KAPPA_SLOTS = 16384;
 const MAX_EDGES = 262144;
-/** Fibres and yarn-end tufts rooted per free-edge crossing (fuzz.wgsl). */
-const FIBERS_PER_EDGE = 18;
+/** Edge-fibre strands per free-edge crossing, dealt round its open sides (fuzz.wgsl). */
+const FIBERS_PER_EDGE = 12;
+/** Linear density of a cotton fibre (1.8 dtex, micronaire ~4.2), kg/m: a yarn holds its linear density over this many fibres. */
+const COTTON_FIBRE_DENSITY = 0.18e-6;
 /**
  * Connection of a crossing to a node from the ratio of rest to material path distance (pieces.wgsl):
  * a smoothstep from KAPPA_LO (cut off) to KAPPA_HI (joined). With the node about a cell from a crack,
@@ -139,6 +141,8 @@ export class Renderer {
   /** Where the key's cone is aimed, relative to the camera target, and the cosine where its soft edge starts. */
   keyAim: Vec3 = [0.0, 0.12, 0];
   keyCone = 0.9;
+  /** Radiance behind the cloth (the void seen through openings). */
+  background: Vec3 = [0.002, 0.002, 0.003];
 
   private readonly frameU: GPUBuffer;
   private readonly renderU: GPUBuffer;
@@ -396,9 +400,9 @@ export class Renderer {
     const VF = V | F;
     const ro = (binding: number, visibility = V): GPUBindGroupLayoutEntry => ({ binding, visibility, buffer: { type: 'read-only-storage' } });
     const uni = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility: VF, buffer: { type: 'uniform' } });
-    const shadowEntries = (b: number): GPUBindGroupLayoutEntry[] => [
-      { binding: b, visibility: F, texture: { sampleType: 'depth' } },
-      { binding: b + 1, visibility: F, sampler: { type: 'comparison' } },
+    const shadowEntries = (b: number, visibility = F): GPUBindGroupLayoutEntry[] => [
+      { binding: b, visibility, texture: { sampleType: 'depth' } },
+      { binding: b + 1, visibility, sampler: { type: 'comparison' } },
     ];
     const surfaceLayout = device.createBindGroupLayout({
       label: 'surface',
@@ -423,7 +427,8 @@ export class Renderer {
     });
     const fuzzLayout = device.createBindGroupLayout({
       label: 'fuzz',
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9)],
+      // fibre strands are lit per vertex
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9, VF)],
     });
     const threadLayout = device.createBindGroupLayout({
       label: 'thread',
@@ -437,7 +442,7 @@ export class Renderer {
     const strip: GPUPrimitiveState = { topology: 'triangle-strip', cullMode: 'none' };
     const list: GPUPrimitiveState = { topology: 'triangle-list', cullMode: 'none' };
     // fibres far thinner than a pixel cover a fraction of it: blended over what is behind (depth
-    // tested, not written; loose fibres of one material, so their order hardly changes the result).
+    // tested, not written; a crossing's edge-fibre strands are drawn back to front, fuzz.wgsl).
     // Alpha to coverage would quantise their sub-pixel coverage to 0 or 1 of 4 samples (speckle).
     const blended: GPUBlendState = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
     const pipe = (label: string, layout: GPUBindGroupLayout, module: GPUShaderModule, vs: string, fs: string | null, prim: GPUPrimitiveState, msaa: GPUMultisampleState | null, blend?: GPUBlendState) =>
@@ -457,7 +462,6 @@ export class Renderer {
     this.pipes.fineShadow = pipe('fine.shadow', surfaceLayout, surfaceModule, 'vsFineShadow', null, list, null);
     const fuzzModule = shaderModule(device, 'fuzz', common + lightWgsl + fuzzWgsl);
     this.pipes.edgeFuzz = pipe('edgeFuzz', fuzzLayout, fuzzModule, 'vsEdgeFuzz', 'fsFuzz', strip, ms, blended);
-    this.pipes.edgeTuft = pipe('edgeTuft', fuzzLayout, fuzzModule, 'vsEdgeTuft', 'fsEdgeTuft', strip, ms, blended);
     const threadModule = shaderModule(device, 'thread', common + lightWgsl + threadGeomWgsl + threadWgsl);
     this.pipes.thread = pipe('thread', threadLayout, threadModule, 'vsThread', 'fsThread', strip, coverage);
     this.pipes.threadShadow = pipe('thread.shadow', threadLayout, threadModule, 'vsThreadShadow', null, strip, null);
@@ -621,9 +625,9 @@ export class Renderer {
       f.set([this.edgeRows[l] ?? 0, 0, this.edgeSize[0], this.edgeSize[1]], b + 24);
       const F = s.field[l];
       u.set([F.offset, F.K, F.M, 0], b + 28);
-      // a freed yarn rounds up: radius from its linear density at loose packing
+      // a freed yarn rounds up: radius from its linear density at loose packing; and its fibre count
       const looseR = (y: { linearDensity: number }) => Math.sqrt(y.linearDensity / (LOOSE_YARN_DENSITY * Math.PI));
-      f.set([looseR(weft), looseR(warp), 0, 0], b + 32);
+      f.set([looseR(weft), looseR(warp), weft.linearDensity / COTTON_FIBRE_DENSITY, warp.linearDensity / COTTON_FIBRE_DENSITY], b + 32);
       cellOffset += (L.nx - 1) * (L.ny - 1);
       refinedOffset += rnx * ((L.ny - 1) * REFINE + 1);
     });
@@ -755,7 +759,7 @@ export class Renderer {
     const mp = encoder.beginRenderPass({
       label: 'main',
       timestampWrites: tw(2),
-      colorAttachments: [{ view: this.msaaColor.createView(), resolveTarget: this.hdr.createView(), clearValue: { r: 0.002, g: 0.002, b: 0.003, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
+      colorAttachments: [{ view: this.msaaColor.createView(), resolveTarget: this.hdr.createView(), clearValue: { r: this.background[0], g: this.background[1], b: this.background[2], a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
       depthStencilAttachment: { view: this.msaaDepth.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' },
     });
     mp.setBindGroup(0, this.groups.surface);
@@ -769,8 +773,6 @@ export class Renderer {
     mp.setPipeline(this.pipes.threadFuzz);
     mp.drawIndirect(this.threadDraw, 16);
     mp.setBindGroup(0, this.groups.fuzz);
-    mp.setPipeline(this.pipes.edgeTuft);
-    mp.drawIndirect(this.piecesArgs, 48);
     mp.setPipeline(this.pipes.edgeFuzz);
     mp.drawIndirect(this.piecesArgs, 16);
     mp.end();

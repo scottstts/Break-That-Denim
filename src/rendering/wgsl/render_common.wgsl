@@ -36,7 +36,7 @@ struct LayerR {
   edge: vec4<f32>,
   // yarn damage field: first crossing, warps K, picks M, unused
   field: vec4<u32>,
-  // loose (freed, round) yarn radius of a pick and of a warp (m), unused, unused
+  // loose (freed, round) yarn radius of a pick and of a warp (m), fibres per pick and per warp
   loose: vec4<f32>,
 };
 
