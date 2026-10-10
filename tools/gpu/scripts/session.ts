@@ -331,13 +331,13 @@ export default async function main(args: string[]): Promise<void> {
     }
     await drain(device);
     t += perFrame * h;
-    // the product's grip slip (worker.ts SLIP_EXCESS / SLIP_TIME): pulled 4 cm beyond what the bounded grip
+    // the product's grip slip (worker.ts SLIP_EXCESS / SLIP_TIME): pulled 3 cm beyond what the bounded grip
     // force can make the cloth follow for 0.2 s, the cloth slips out of the fingers
     if (handle && !process.env.NOSLIP) {
       const excess = await interaction.gripExcess();
-      if (excess !== null && excess >= 0.04) {
+      if (excess !== null && excess >= 0.03) {
         slipFor += perFrame * h;
-        if (slipFor >= 0.3) {
+        if (slipFor >= 0.25) {
           console.log(`  slip at t=${(t + perFrame * h).toFixed(2)}`);
           interaction.release();
           handle = null;
@@ -439,6 +439,18 @@ export default async function main(args: string[]): Promise<void> {
       const enc = device.createCommandEncoder();
       renderer.encode(enc, { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.CAMERA ?? "{}") as object) }, t, tex.createView());
       device.queue.submit([enc.finish()]);
+    }
+    if (process.env.FRAMES) {
+      // FRAMES=dir: every presented frame at SNAPSIZE / SNAPCAMERA into artifacts/captures/<dir>/
+      // (ffmpeg -framerate 30 -i %05d.png for a clip)
+      const dir = resolve(CAPTURES, process.env.FRAMES);
+      mkdirSync(dir, { recursive: true });
+      renderer.resize(snapW, snapH);
+      const enc = device.createCommandEncoder();
+      renderer.encode(enc, { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.SNAPCAMERA ?? '{}') as object) }, t, snapTex.createView());
+      device.queue.submit([enc.finish()]);
+      writeFileSync(resolve(dir, `${String(frame).padStart(5, '0')}.png`), encodePng(snapW, snapH, await pixels(device, snapTex)));
+      renderer.resize(W, Hh);
     }
     if (snaps.length > 0 && t >= snaps[0] - 1e-6) {
       // SNAPS='1.2,3.4': full-size stills at those times (SNAPSIZE, SNAPCAMERA; reference framing by
