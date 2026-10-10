@@ -101,12 +101,16 @@ export const RECOIL_MAX = 12;
  * J-curve). T and W are the yarn's share of the bundle law at the local strain (area / B of it), and
  * f = mu (n0 + wrap T_cross) / pitch is the crossing friction along the yarn: compaction plus the wrap
  * force of the crossing yarn's tension, one crossing per pitch. A yarn end in slack or unloaded cloth
- * does not move; an end in strained, loosened (worn) weave slides out of several crossings.
+ * does not move; an end in strained, loosened (worn) weave slides out of a crossing or two.
+ *
+ * The bundle strain near a crack includes the crack's opening, which no yarn carries: the far tension
+ * is capped at the yarn's own peak tension `peak` (N), the most it holds before it breaks too.
  */
-export function recoilLength(y: YarnMaterialLaw, B: number, area: number, eps: number, mu: number, n0: number, wrap: number, tCross: number, pitch: number): number {
+export function recoilLength(y: YarnMaterialLaw, B: number, area: number, peak: number, eps: number, mu: number, n0: number, wrap: number, tCross: number, pitch: number): number {
   if (!(eps > 0)) return 0;
   const share = area / B;
-  const comp = share * (axialTension(y, eps) * eps - axialEnergyDensity(y, eps));
+  const e = Math.min(eps, strainAtTension(y, peak / share));
+  const comp = share * (axialTension(y, e) * e - axialEnergyDensity(y, e));
   return (comp * pitch) / (mu * (n0 + wrap * Math.max(0, tCross)));
 }
 
@@ -118,7 +122,7 @@ export function recoilLength(y: YarnMaterialLaw, B: number, area: number, eps: n
  * snapshot `strain` (per span, NaN where none), so ends move out progressively as the cloth around them
  * is loaded. Mirrored by pullMark / pullApply in yarnfield.wgsl. Returns the number of crossings pulled out.
  */
-export function pullOut(layers: readonly LayerInfo[], fls: readonly FieldLayer[], area: Uint8Array, damage: Uint8Array, strain: ArrayLike<number>, crossingNormal0: ArrayLike<number>): number {
+export function pullOut(layers: readonly LayerInfo[], fls: readonly FieldLayer[], strength: Float32Array, area: Uint8Array, damage: Uint8Array, strain: ArrayLike<number>, crossingNormal0: ArrayLike<number>): number {
   const marked: number[] = [];
   layers.forEach((L, l) => {
     const fl = fls[l];
@@ -137,7 +141,7 @@ export function pullOut(layers: readonly LayerInfo[], fls: readonly FieldLayer[]
           const tCross = Number.isFinite(ec) ? (Math.max(0, axialTension(mat.yarns[g], ec)) * areaOf(area[2 * c + g])) / bundleOf(fl, g) : 0;
           const n = nodeOfCrossing(L, fl, k, m);
           const pitch = f === 1 ? L.weave.pitchV : L.weave.pitchU;
-          const delta = recoilLength(mat.yarns[f], bundleOf(fl, f), areaOf(area[2 * c + f]), eps, mat.crossingFriction, crossingNormal0[n] / (fl.bu * fl.bv), mat.crossingWrap, tCross, pitch);
+          const delta = recoilLength(mat.yarns[f], bundleOf(fl, f), areaOf(area[2 * c + f]), strength[2 * c + f], eps, mat.crossingFriction, crossingNormal0[n] / (fl.bu * fl.bv), mat.crossingWrap, tCross, pitch);
           if (delta >= (d - 0.5) * pitch) marked.push(2 * c + f);
         }
       }

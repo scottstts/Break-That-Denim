@@ -8,6 +8,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { acquireGpu } from '../../src/gpu/device';
+import { defaultSceneSpecs, type LayerSpec } from '../../src/simulation/scene';
 
 export const ROOT = resolve(import.meta.dirname, '../..');
 export const CAPTURES = resolve(ROOT, 'artifacts/captures');
@@ -114,4 +115,22 @@ export async function saveTexture(device: GPUDevice, tex: GPUTexture, name: stri
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, encodePng(w, h, rgba));
   return path;
+}
+
+/**
+ * The default scene's specs with development overrides: SCENE (JSON) is merged into the first layer's
+ * spec (wear fields merged into its wear spec). Experiments only; the product uses defaultSceneSpecs.
+ */
+export function experimentSpecs(): LayerSpec[] {
+  const specs = defaultSceneSpecs();
+  const o = JSON.parse(process.env.SCENE ?? '{}') as Partial<LayerSpec> & { wear?: Partial<LayerSpec['wear']> };
+  const { wear, ...rest } = o;
+  Object.assign(specs[0], rest);
+  if (wear) Object.assign(specs[0].wear, wear);
+  return specs;
+}
+
+/** Drape file for the experiment scene (DRAPE, default public/drape.bin). */
+export function drapeFile(): string {
+  return resolve(ROOT, process.env.DRAPE ?? 'public/drape.bin');
 }

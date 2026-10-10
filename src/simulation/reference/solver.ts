@@ -647,7 +647,7 @@ export class ReferenceSolver {
     for (let q = 0; q < 2 * this.N; q++) this.strain[q] = active(q) ? this.segLength(q) / this.restLength[q] - 1 : NaN;
     const spans = { restLength: this.restLength, softening: this.scene.softening, segFlags: this.segFlags, intact: this.intact, cutMask: this.cutMask, failSite: this.failSite, tails: this.tails };
     updateField(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, spans, this.strain, active, this.scene.crossingNormal0);
-    pullOut(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, this.strain, this.scene.crossingNormal0);
+    pullOut(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, this.strain, this.scene.crossingNormal0);
     this.brokenCount += coupleSpans(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, spans, active, SEG_BROKEN);
   }
 

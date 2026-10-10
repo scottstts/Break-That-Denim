@@ -296,10 +296,12 @@ fn rimAt(d: f32, dir: vec2<f32>, rest: vec2<f32>, layer: u32, density: f32) -> R
   // a few wide, wandering along the edge from nearly bare stretches to tufted ones
   let n = 0.65 * noise2(4441u + layer, rest / 0.0065) + 0.35 * noise2(4447u + layer, rest / 0.0022);
   let edge = smoothstep(0.03, 0.22, density);
-  let w = clamp(1.3 + 1.2 * n, 0.35, 2.6) * mix(0.5, 1.0, edge);
+  // calibrated to the reference's torn denim edges: a pale fibrous band of 1-4 mm inside an abraded
+  // halo of about 1 cm (the hole opened where the cloth was most worn)
+  let w = clamp(2.2 + 1.6 * n, 0.8, 4.0) * mix(0.55, 1.0, edge);
   let x = d / w;
-  o.rim = (1.0 - smoothstep(0.0, 1.0, x)) * mix(0.3, 1.0, edge);
-  o.halo = (1.0 - smoothstep(0.0, 6.5, d)) * edge;
+  o.rim = (1.0 - smoothstep(0.0, 1.0, x)) * mix(0.35, 1.0, edge);
+  o.halo = (1.0 - smoothstep(0.0, EDGE_RMAX, d)) * edge;
   // a loosened edge does not roll into a lip: its relief is the fibre itself (no normal tilt)
   o.slope = 0.0;
   o.dir = dir;
@@ -352,7 +354,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   // weakened (partly separated) yarns around the damage are abraded and pale
   let weak = 1.0 - min(ef.y, 1.0);
 
-  var wearF = min(1.0, in.wearV + 0.4 * rim.halo * rim.halo + 0.35 * weak);
+  var wearF = min(1.0, in.wearV + 0.6 * rim.halo + 0.35 * weak);
   let ls = length(in.dPs);
   let lt = length(in.dPt);
   let Tu = in.dPs / ls;
@@ -418,6 +420,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     var hit = w2.a;
     var wb = w2.wb;
     var dmg = 0.0;
+    var loose = 0.0;
     var present = w2.a.covered;
     if (present) {
       let fs = hash11(rotSeed + 977u * k + 13u);
@@ -436,6 +439,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
             // no longer in the groove under a float: exposed to the light, near the face of the weave
             hit.h = sgn * 0.45 * (LR.warp.z + 0.5 * LR.warp.y);
             hit.slope *= 0.5;
+            loose = 1.0;
             present = true;
           }
         }
@@ -448,7 +452,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     }
     if (present) { mask |= (1u << k); }
     if (!present) { continue; }
-    let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, min(1.0, wearF + 0.7 * dmg), pix);
+    let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, min(1.0, wearF + 0.7 * dmg), pix, loose);
     var albedo = look.albedo;
     var slope = hit.slope;
     var h = hit.h;
@@ -503,8 +507,8 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let kk = i32(round(in.uv.x));
     let m = i32(round(in.uv.y));
     let fl = i32(round((in.uv.y - warpUnderDist(LR, kk, in.uv.y)) / rep));
-    let lw = yarnLook(LR, in.layer, 1u, kk, fl, in.uv.y * LR.pitch.y, 0.3, wearF, pix);
-    let lf = yarnLook(LR, in.layer, 0u, m, 0, in.uv.x * LR.pitch.x, 0.3, wearF, pix);
+    let lw = yarnLook(LR, in.layer, 1u, kk, fl, in.uv.y * LR.pitch.y, 0.3, wearF, pix, 0.0);
+    let lf = yarnLook(LR, in.layer, 0u, m, 0, in.uv.x * LR.pitch.x, 0.3, wearF, pix, 1.0 - warpP);
     let albedo = mix(mix(lf.albedo, lw.albedo, wf), rimAlb, rimPale);
     let ao = mix(tex.y, 0.8, rim.rim) * rim.ao;
     let tw = mix(LR.weft.w, LR.warp.w, wf);
@@ -518,8 +522,9 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
       // coverage of the filtered cloth: holes where both families are gone, dithered over the samples
       let cover = 1.0 - (1.0 - warpP) * (1.0 - pickP);
       mask = 0u;
+      // ordered thresholds: a fixed coverage gives a fixed sample count (no per-pixel noise)
       for (var k = 0u; k < 4u; k++) {
-        if (cover > (f32(k) + hashf(rotSeed + 31u * k)) * 0.25) { mask |= 1u << k; }
+        if (cover > (f32(k) + 0.5) * 0.25) { mask |= 1u << k; }
       }
     }
   }

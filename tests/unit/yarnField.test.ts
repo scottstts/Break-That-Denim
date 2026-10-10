@@ -113,7 +113,7 @@ describe('yarn damage field', () => {
     damage[2 * c0] = DAMAGE_CUT;
     const pullAll = (strain: Float64Array) => {
       let total = 0;
-      for (let n = pullOut(s.layers, s.field, s.fieldArea, damage, strain, s.crossingNormal0); n > 0; n = pullOut(s.layers, s.field, s.fieldArea, damage, strain, s.crossingNormal0)) total += n;
+      for (let n = pullOut(s.layers, s.field, s.fieldStrength, s.fieldArea, damage, strain, s.crossingNormal0); n > 0; n = pullOut(s.layers, s.field, s.fieldStrength, s.fieldArea, damage, strain, s.crossingNormal0)) total += n;
       return total;
     };
     // slack cloth: the end carries nothing and stays where it broke
@@ -127,7 +127,11 @@ describe('yarn damage field', () => {
     const comp = (axialTension(y, 0.06) * 0.06 - axialEnergyDensity(y, 0.06)) / B;
     const p = L.weave.pitchU;
     const delta = (comp * p) / (L.material.crossingFriction * (s.crossingNormal0[0] / (fl.bu * fl.bv)));
-    expect(recoilLength(y, B, 1, 0.06, L.material.crossingFriction, s.crossingNormal0[0] / (fl.bu * fl.bv), L.material.crossingWrap, 0, p)).toBeCloseTo(delta, 12);
+    expect(recoilLength(y, B, 1, 1e3, 0.06, L.material.crossingFriction, s.crossingNormal0[0] / (fl.bu * fl.bv), L.material.crossingWrap, 0, p)).toBeCloseTo(delta, 12);
+    // the far tension never exceeds the yarn's peak: an opening crack's apparent strain changes nothing
+    const peak = s.fieldStrength[2 * c0];
+    const capped = recoilLength(y, B, 1, peak, 0.6, L.material.crossingFriction, s.crossingNormal0[0] / (fl.bu * fl.bv), L.material.crossingWrap, 0, p);
+    expect(capped).toBeCloseTo(recoilLength(y, B, 1, peak, 0.2, L.material.crossingFriction, s.crossingNormal0[0] / (fl.bu * fl.bv), L.material.crossingWrap, 0, p), 12);
     const run = Math.min(12, Math.floor(delta / p + 0.5));
     expect(run).toBeGreaterThan(0);
     for (const dir of [-1, 1]) {

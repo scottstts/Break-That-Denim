@@ -34,7 +34,7 @@
 // surface (drawn as a thread, a fragment, or departed); then, from word words16(), 1 bit per crossing:
 // its material belongs to a falling piece (debrisBit, render_common.wgsl)
 @group(0) @binding(2) var<storage, read_write> threadBits: array<atomic<u32>>;
-// [0] runs, [1] chunks, [2] retired nodes (this frame), [3] simulated thread points
+// [0] runs, [1] chunks, [2] retired nodes (this frame), [3] unused
 @group(0) @binding(3) var<storage, read_write> threadCount: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> runs: array<vec4<u32>>;
 @group(0) @binding(5) var<storage, read_write> chunks: array<u32>;
@@ -62,7 +62,6 @@ fn threadClear(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (w == 0u) {
     atomicStore(&threadCount[0], 0u);
     atomicStore(&threadCount[1], 0u);
-    atomicStore(&threadCount[3], 0u);
   }
   if (w < words16() + (words16() + 1u) / 2u) { atomicStore(&threadBits[w], 0u); }
 }
@@ -293,9 +292,7 @@ fn threadScan(@builtin(global_invocation_id) gid: vec3<u32>) {
       let r = atomicAdd(&threadCount[0], 1u);
       if (r >= MAX_RUNS) { continue; }
       let yarn = select(t.k, t.m, f == 0u);
-      let base = atomicAdd(&threadCount[3], n + 2u);
-      if (base + n + 2u > MAX_PTS) { continue; }
-      runs[r] = vec4<u32>(t.l | (f << 4u) | (endA << 5u) | (endB << 7u), yarn | (pos << 16u), n, base);
+      runs[r] = vec4<u32>(t.l | (f << 4u) | (endA << 5u) | (endB << 7u), yarn | (pos << 16u), n, 0u);
       // drawn over n + 1 crossings: half a crossing beyond each end (into the weave, or to the cut)
       let nc = n / CHUNK + 1u;
       let c0 = atomicAdd(&threadCount[1], nc);

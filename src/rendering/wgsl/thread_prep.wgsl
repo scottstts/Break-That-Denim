@@ -1,6 +1,5 @@
 // Per frame, per thread run (threads.wgsl): where its held ends are (the cloth they come out of,
-// material_map.wgsl), whether the lattice chain carries it (thread_geom.wgsl RunGeo), and the length
-// of its centre line over the drawn range, which the yarn's own slack is measured against.
+// material_map.wgsl) and whether the lattice chain carries it (thread_geom.wgsl RunGeo).
 
 @group(0) @binding(0) var<uniform> R: RenderU;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -75,14 +74,7 @@ fn threadPrep(@builtin(global_invocation_id) gid: vec3<u32>) {
     g.pB = e[0];
     g.tB = e[1];
   }
-  var prev = runCenter(ri, g, cA, cB, ri.drawA).p;
-  let K = 8u;
-  for (var k = 1u; k <= K; k++) {
-    let c = runCenter(ri, g, cA, cB, mix(ri.drawA, ri.drawB, f32(k) / f32(K))).p;
-    g.arc += length(c - prev);
-    prev = c;
-  }
-  runGeo[RUN_GEO * r] = vec4<f32>(g.arc, select(0.0, 1.0, g.chain), 0.0, 0.0);
+  runGeo[RUN_GEO * r] = vec4<f32>(select(0.0, 1.0, g.chain), 0.0, 0.0, 0.0);
   runGeo[RUN_GEO * r + 1u] = vec4<f32>(g.pA, 0.0);
   runGeo[RUN_GEO * r + 2u] = vec4<f32>(g.pB, 0.0);
   runGeo[RUN_GEO * r + 3u] = vec4<f32>(g.tA, 0.0);

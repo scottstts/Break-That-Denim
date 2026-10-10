@@ -255,7 +255,7 @@ fn fieldTotalY() -> u32 {
 
 // Pull-out of free yarn ends (yarnField.ts pullOut, recoilLength): a crossing still interlaced leaves
 // the weave once the nearest cut along its yarn (through crossings already pulled out) lies within the
-// end's shear-lag retraction (T eps - W) / f at the local strain.
+// end's shear-lag retraction (T eps - W) / f at the local strain, its tension capped at the yarn's peak.
 const RECOIL_MAX: i32 = 12;
 
 fn breakDistance(F: vec4<u32>, f: u32, k: u32, m: u32) -> i32 {
@@ -298,7 +298,10 @@ fn pullsOut(l: u32, F: vec4<u32>, c: u32, f: u32, k: u32, m: u32) -> bool {
   let pitch = select(mat.a.w / f32(bu), mat.b.x / f32(bv), f == 1u);
   let B = select(bv, bu, f == 1u);
   let y = mat.yarn[f];
-  let comp = areaAt(c, f) / f32(B) * (axialTension(y, eps) * eps - axialEnergyDensity(y, eps));
+  // no yarn carries more than its own peak tension (the bundle strain near a crack includes its opening)
+  let share = areaAt(c, f) / f32(B);
+  let e = min(eps, strainAtTension(y, strength[c][f] / share));
+  let comp = share * (axialTension(y, e) * e - axialEnergyDensity(y, e));
   let fric = mat.a.y * (nodes[n].n0 / f32(bu * bv) + mat.a.z * tCross);
   return comp * pitch >= (f32(d) - 0.5) * pitch * fric;
 }

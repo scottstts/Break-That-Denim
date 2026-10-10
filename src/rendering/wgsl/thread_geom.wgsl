@@ -2,11 +2,14 @@
 // fibre passes. Requires module-scope R (RenderU), nodes, x, segw, tframe and nrm.
 //
 // A thread follows the mechanical lattice: its bundle (the lattice row of a pick, the column of a
-// warp) is a chain of nodes that carries the yarns' load, and the thread is that chain's Catmull-Rom
-// curve through the spans that still hold, offset across the bundle to the yarn's own place in it.
-// Where it is held in the weave a yarn keeps its woven place; away from it, freed of the crossing
-// yarns, it wanders across by about a pitch (some neighbours pair up, a few stray) and hangs by its
-// own slack. Near a free end the yarn droops and curls and thins as it untwists.
+// warp) is a chain of nodes that carries the yarns' load and moves with it, and the thread is that
+// chain's Catmull-Rom curve through the spans that still hold. The chain is a one-dimensional strand:
+// mechanics resolves the bundle's motion, not where its yarns lie across it. Where a yarn is held in
+// the weave it keeps its woven place; away from it, freed of the crossing yarns, the bundle's yarns lie
+// together as one twisted cord (two in some bundles) of their combined cross-section around the chain.
+// No shape is added that the chain does not have: a thread swings, sags and settles as its strand does.
+// Near a free end (a few millimetres at most: the bundle span beyond its last node) the yarn untwists
+// out of the cord and droops.
 
 struct RunInfo {
   layer: u32,
@@ -21,9 +24,6 @@ struct RunInfo {
   // drawn parameter range (crossings along the yarn)
   drawA: f32,
   drawB: f32,
-  // first of its n + 2 simulated points (thread_sim.wgsl): the end A anchor, one per lone crossing,
-  // the end B anchor
-  base: u32,
 };
 
 fn runInfo(rec: vec4<u32>) -> RunInfo {
@@ -35,7 +35,6 @@ fn runInfo(rec: vec4<u32>) -> RunInfo {
   o.yarn = rec.y & 0xFFFFu;
   o.pos = f32(rec.y >> 16u);
   o.n = f32(rec.z);
-  o.base = rec.w;
   o.drawA = o.pos - select(0.5, 1.0, o.heldA);
   o.drawB = o.pos + o.n - 1.0 + select(0.5, 1.0, o.heldB);
   return o;
@@ -129,7 +128,6 @@ fn cmrdT(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> 
 // (a falling piece, a separated bundle) it runs straight between its held ends, or hangs from its one
 // held end along tA, the yarn's direction there.
 struct RunGeo {
-  arc: f32,
   chain: bool,
   pA: vec3<f32>,
   pB: vec3<f32>,
@@ -192,7 +190,6 @@ fn runCenter(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Ce
 
 fn runGeoZero() -> RunGeo {
   var g: RunGeo;
-  g.arc = 0.0;
   g.chain = true;
   g.pA = vec3<f32>(0.0);
   g.pB = vec3<f32>(0.0);
@@ -211,12 +208,10 @@ struct ThreadPoint {
   valid: bool,
 };
 
-// Point of the thread of run ri at parameter p; g.arc is the current length of its centre line over
-// the drawn range (threadPrep), which the yarn's own slack is measured against; cA, cB are the chain
-// points at the drawn ends (centerAt), when g.chain.
+// Point of the thread of run ri at parameter p; cA, cB are the chain points at the drawn ends
+// (centerAt), when g.chain.
 fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> ThreadPoint {
   var o: ThreadPoint;
-  let arc = g.arc;
   let c = runCenter(ri, g, cA, cB, p);
   o.valid = c.valid;
   if (!c.valid) { return o; }
@@ -233,49 +228,47 @@ fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Thr
   let q = ri.yarn % Bcr;
   let seedY = hash11((ri.layer * 7919u + ri.yarn) * 2u + f + 0x51ed27u);
   let seedB = hash11((ri.layer * 7919u + b) * 2u + f + 0x2c1b3cu);
-  o.radius = select(LR.loose.y, LR.loose.x, f == 0u) * (0.88 + 0.24 * hashf(seedY + 5u));
+  let rY = select(LR.loose.y, LR.loose.x, f == 0u) * (0.88 + 0.24 * hashf(seedY + 5u));
+  o.radius = rY;
   let along = p * pitchAl;
   // distance (crossings) to where the yarn is held in the weave
   let eA = select(1e6, p - ri.pos + 0.5, ri.heldA);
   let eB = select(1e6, ri.pos + ri.n - 0.5 - p, ri.heldB);
   let e = max(min(eA, eB), 0.0);
-  let stray = hashf(seedY + 9u) < 0.08;
-  // A freed yarn stays near its own place in the weave: nothing gathers a bundle (the lattice's unit
-  // of mechanics, not of the cloth), so threads never line up on the lattice. Away from where it is
-  // held it wanders across by up to about a pitch, and now and then two neighbours lie together
-  // (pairs per yarn pair, not per bundle).
+  // freed of the crossing yarns within about a crossing of the weave, the yarns gather
+  let gather = 1.0 - exp(-e / 1.2);
+  let dGather = select(0.0, exp(-e / 1.2) / 1.2, e > 0.0 && e < 1e5) * select(1.0, -1.0, eA > eB);
   let woven = (f32(q) - 0.5 * f32(Bcr - 1u)) * pitchCr;
-  let loose = 1.0 - exp(-e / 2.5);
-  let pairSeed = hash11((ri.layer * 7919u + (ri.yarn >> 1u)) * 2u + f + 0x7a3c11u);
-  let paired = hashf(pairSeed) < 0.35;
-  let pairC = (f32(i32(q & ~1u)) + 0.5 - 0.5 * f32(Bcr - 1u)) * pitchCr;
-  let wander = (0.06e-3 + select(0.45, 1.2, stray) * pitchCr * loose) * (0.6 * noise1(seedY + 3u, along / 3.5e-3) + 0.4 * noise1(seedY + 13u, along / 1.2e-3));
-  let lat = mix(woven, pairC + select(-0.4, 0.4, (q & 1u) == 1u) * o.radius, select(0.0, loose, paired)) + wander;
-  let up = 0.6 * o.radius * loose * noise1(seedY + 17u, along / 2.0e-3);
+  // the cord: the whole bundle, or one of its halves in some bundles; packed yarns of radius rY
+  let split = Bcr >= 4u && hashf(seedB) < 0.3;
+  let half = Bcr / 2u;
+  let second = split && q >= half;
+  let cordN = select(Bcr, select(half, Bcr - half, second), split);
+  let slot = select(q, q - half, second);
+  let cordLat = select(0.0, select(-0.28, 0.28, second) * f32(Bcr) * pitchCr, split);
+  // packed side by side: each yarn about one yarn radius off the cord's axis (a few yarns lie around
+  // the axis, not on a wide helix)
+  let rc = select(0.0, rY * min(1.0, 0.45 * sqrt(f32(cordN))), cordN > 1u);
+  // loosely twisted together (pitch 10-20 mm, either hand), each yarn at its own angle
+  let twist = (10e-3 + 10e-3 * hashf(seedB + 3u)) * select(-1.0, 1.0, hashf(seedB + 4u) < 0.5);
+  let phi = 6.2831853 * (f32(slot) / f32(max(cordN, 1u)) + along / twist + hashf(seedB + 5u));
+  let dPhi = 6.2831853 * pitchAl / twist;
+  let inCord = vec2<f32>(cos(phi), sin(phi)) * rc;
+  let dInCord = vec2<f32>(-sin(phi), cos(phi)) * (rc * dPhi);
+  let lat = mix(woven, cordLat + inCord.x, gather);
+  let up = gather * inCord.y;
   var P = c.p + S * lat + N * up;
-  var dP = c.d;
-  // the yarn's own slack between its held ends: a parabolic hang below the bundle
-  let down = vec3<f32>(0.0, 0.0, -1.0);
-  var sagDir = down - dot(down, T) * T;
-  sagDir = normalize(sagDir + S * (0.5 * (hashf(seedY + 2u) - 0.5)) + vec3<f32>(0.0, 0.0, -1e-6));
-  let span = ri.drawB - ri.drawA;
-  let tr = clamp((p - ri.drawA) / span, 0.0, 1.0);
-  let sl = hashf(seedY + 1u);
-  let slack = (0.002 + 0.03 * sl * sl * sl) * select(1.0, 2.5, stray);
-  let rest = span * pitchAl;
-  if (ri.heldA && ri.heldB) {
-    let hang = sqrt(max(0.375 * arc * (rest * (1.0 + slack) - arc), 0.0));
-    P += sagDir * (4.0 * hang * tr * (1.0 - tr));
-    dP += sagDir * (4.0 * hang * (1.0 - 2.0 * tr) / span);
-  }
-  // a free end droops and curls over its last millimetre or two
+  var dP = c.d + S * (gather * dInCord.x + dGather * (cordLat + inCord.x - woven)) + N * (gather * dInCord.y + dGather * inCord.y);
+  // a free end leaves the cord over its last millimetre or two: it splays a little away from the
+  // other yarns and droops under its own weight (no stiffness to hold it straight once untwisted)
   o.tip = 0.0;
   if (!ri.heldA || !ri.heldB) {
     let lt = (0.6e-3 + 1.8e-3 * hashf(seedY + 6u)) / pitchAl;
     let u = clamp(select(p - (ri.drawB - lt), (ri.drawA + lt) - p, !ri.heldA) / lt, 0.0, 1.0);
-    let curl = vec3<f32>(hashf(seedY + 7u) - 0.5, hashf(seedY + 8u) - 0.5, -0.8) * (0.9 * lt * pitchAl);
-    P += curl * (u * u) + S * (0.3 * lt * pitchAl * (hashf(seedY + 10u) - 0.5) * u * u);
-    dP += curl * (2.0 * u / lt) * select(1.0, -1.0, !ri.heldA);
+    let splay = S * (0.35 * (hashf(seedY + 10u) - 0.5)) + N * (0.2 * (hashf(seedY + 11u) - 0.5)) + vec3<f32>(0.0, 0.0, -0.25);
+    let off = splay * (lt * pitchAl);
+    P += off * (u * u);
+    dP += off * (2.0 * u / lt) * select(1.0, -1.0, !ri.heldA);
     o.tip = u;
     o.radius *= 1.0 - 0.45 * u;
   }
@@ -283,4 +276,17 @@ fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Thr
   o.t = normalize(dP + vec3<f32>(1e-9, 0.0, 0.0));
   o.n = N;
   return o;
+}
+
+// The per-frame geometry of run r written by threadPrep (RUN_GEO vec4 per run). Requires module-scope
+// runGeo.
+fn runGeoAt(r: u32) -> RunGeo {
+  var g: RunGeo;
+  let h = runGeo[RUN_GEO * r];
+  g.chain = h.x > 0.5;
+  g.pA = runGeo[RUN_GEO * r + 1u].xyz;
+  g.pB = runGeo[RUN_GEO * r + 2u].xyz;
+  g.tA = runGeo[RUN_GEO * r + 3u].xyz;
+  g.tB = runGeo[RUN_GEO * r + 4u].xyz;
+  return g;
 }

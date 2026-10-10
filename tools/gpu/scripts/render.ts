@@ -4,18 +4,17 @@
  *   node tools/gpu/run.mjs tools/gpu/scripts/render.ts <name> [width height] [distance pitch]
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
 import { loadDrape } from '../../../src/simulation/gpu/settle';
 import { GpuSolver, GPU_DEFAULTS, type GpuSolverParams } from '../../../src/simulation/gpu/solver';
-import { compileScene, defaultSceneSpecs } from '../../../src/simulation/scene';
-import { gpuDevice, ROOT, saveTexture } from '../env';
+import { compileScene } from '../../../src/simulation/scene';
+import { drapeFile, experimentSpecs, gpuDevice, saveTexture } from '../env';
 
 /** Solver on the app's validated settled drape (public/drape.bin; regenerate with npm run gpu:drape). */
 export async function settledSolver(device: GPUDevice, params: Partial<GpuSolverParams> = {}): Promise<{ solver: GpuSolver; scene: ReturnType<typeof compileScene> }> {
-  const scene = compileScene(defaultSceneSpecs());
+  const scene = compileScene(experimentSpecs());
   const solver = new GpuSolver(device, scene, { ...GPU_DEFAULTS, ...params });
-  const file = resolve(ROOT, 'public/drape.bin');
+  const file = drapeFile();
   const data = existsSync(file) ? readFileSync(file) : null;
   if (!data || !loadDrape(solver, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))) {
     throw new Error('public/drape.bin is missing or stale: run npm run gpu:drape');

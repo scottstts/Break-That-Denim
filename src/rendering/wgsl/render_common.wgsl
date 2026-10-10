@@ -240,7 +240,7 @@ fn debrisWord(c: u32, fieldTotal: u32) -> u32 { return (fieldTotal + 15u) / 16u 
 fn fieldTotalOf(last: LayerR) -> u32 { return last.field.x + last.field.y * last.field.z; }
 
 // Largest stored distance (mm); everything beyond is intact cloth.
-const EDGE_RMAX: f32 = 7.0;
+const EDGE_RMAX: f32 = 10.0;
 const CUT_R: u32 = 255u;
 // pulled out of the weave at the crossing: the end has slid back toward where the yarn is held, so
 // the crossing no longer has this yarn (drawn like a cut, yarnField.ts DAMAGE_PULLED)
@@ -339,8 +339,10 @@ struct Look {
 };
 
 // Ring-dyed indigo warp and undyed weft. `pix` is the pixel footprint in metres (filters fibre-scale
-// detail to its mean), `wear` the abrasion field, `crown` the exposure of this point on its yarn.
-fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f32, x: f32, wear: f32, pix: f32) -> Look {
+// detail to its mean), `wear` the abrasion field, `crown` the exposure of this point on its yarn,
+// `loose` 1 for a yarn freed of the crossing yarns (a thread, a pick across a ladder): no longer
+// compacted under the warp floats, it shows its own fibre all round, untwisted and fluffed.
+fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f32, x: f32, wear: f32, pix: f32, loose: f32) -> Look {
   var o: Look;
   let seedY = bitcast<u32>(yarn) * 2u + fam + 977u * layerIdx;
   let crown = sqrt(max(0.0, 1.0 - x * x));
@@ -362,9 +364,10 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     // exposure of the pale core: abrasion acts on the crowns of the floats
     let abr = clamp(wear * (0.35 + 0.65 * crown) * (0.6 + 0.8 * floatV) + 0.1 * floatV * crown, 0.0, 1.0);
     let dye = clamp(yarnDye * (1.0 + 0.12 * slub) * (1.0 - 0.75 * abr), 0.0, 1.5);
-    // washed indigo: the dyed sheath is a greyish blue, the exposed core a cool off-white
+    // washed indigo: the dyed sheath is a deep blue, abraded fibre a light blue with the off-white
+    // core showing through
     let deep = vec3<f32>(0.03, 0.05, 0.13);
-    let pale = vec3<f32>(0.42, 0.45, 0.55);
+    let pale = vec3<f32>(0.36, 0.44, 0.6);
     // fibre clumps and uneven ring dyeing mottle the surface: elongated along the warp (slub-like,
     // ~3 mm long, ~0.5 mm wide) plus fine isotropic clumps; faded below the pixel footprint
     let pc = vec2<f32>(f32(yarn) * L.pitch.x + across, along);
@@ -379,14 +382,17 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     // twill reads as a pebbly run of separate floats along each wale, not a printed stripe
     let floatB = 0.78 + 0.44 * floatV;
     o.albedo = mix(deep * (0.75 + 0.5 * min(dye, 1.2)), pale, paleFrac) * floatB;
-    o.fuzz = 0.25 + 0.6 * wear;
+    // a freed warp untwists: its pale core shows between the dyed surface fibres
+    o.albedo = mix(o.albedo, mix(pale, vec3<f32>(0.6, 0.62, 0.66), 0.5), 0.45 * loose);
+    o.fuzz = 0.25 + 0.6 * wear + 0.3 * loose;
   } else {
     let v = 0.85 + 0.2 * hash2f(seedY, 5u) + 0.08 * noise1(seedY + 3u, along / 0.004);
     let fib = mix(1.0, 0.85 + 0.3 * fiberRnd, fiberVis);
-    // undyed weft picks up indigo from neighbouring warps in washing; it is greyish, not white, until
-    // abrasion and loosening expose fresh, fluffy cotton
-    o.albedo = mix(vec3<f32>(0.26, 0.27, 0.28), vec3<f32>(0.5, 0.5, 0.49), 0.8 * wear * wear) * v * fib;
-    o.fuzz = 0.35;
+    // undyed weft picks up indigo from neighbouring warps in washing; it is greyish while compacted
+    // under the floats, until abrasion and loosening expose its raw, fluffy ecru cotton
+    let woven = mix(vec3<f32>(0.26, 0.27, 0.28), vec3<f32>(0.5, 0.5, 0.49), 0.8 * wear * wear);
+    o.albedo = mix(woven, vec3<f32>(0.64, 0.61, 0.55), loose) * v * fib;
+    o.fuzz = 0.35 + 0.35 * loose;
   }
   o.ao = 1.0;
   return o;

@@ -123,7 +123,7 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
     let lift = 0.1 + 0.45 * hashf(sb + 4u);
     let dir = normalize(outW + acrossW * spread + N * lift);
     let r = hashf(sb + 5u);
-    let len = (0.35e-3 + 1.6e-3 * r * r) * (0.55 + 0.9 * density);
+    let len = (0.6e-3 + 2.4e-3 * r * r) * (0.55 + 0.9 * density);
     let droop = vec3<f32>(0.0, 0.0, -0.3 * len) - N * (0.25 * len * lift);
     let curl = (acrossW * (hashf(sb + 6u) - 0.5) + N * (hashf(sb + 7u) - 0.5)) * (0.45 * len);
     let yw = select(LR.loose.y, LR.loose.x, fam == 0u) * (1.1 + 0.5 * hashf(sb + 8u));
@@ -152,7 +152,7 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
     // fibre of the loosened rim: rooted up to a few millimetres behind the edge, lying out over it;
     // thinner where the edge is bare
     if (hashf(seed + 19u) > 0.3 + 0.6 * density) { return hidden(); }
-    let back = (0.3e-3 + 2.2e-3 * pow(hashf(seed + 17u), 1.5)) / pitchOut;
+    let back = (0.4e-3 + 3.0e-3 * pow(hashf(seed + 17u), 1.5)) / pitchOut;
     let root = atSide - (dU * outR.x + dV * outR.y) * back;
     let spread = (hashf(seed + 3u) - 0.5) * 1.2;
     let lift = 0.03 + 0.15 * hashf(seed + 4u);
@@ -168,8 +168,8 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let lift = 0.1 + 0.7 * hashf(seed + 4u);
   let dir = normalize(outW + acrossW * spread + N * lift);
   let r = hashf(seed + 5u);
-  var len = 0.3e-3 + 1.6e-3 * r * r;
-  if (hashf(seed + 6u) < 0.08) { len += 0.8e-3 + 2.0e-3 * hashf(seed + 7u); }
+  var len = 0.5e-3 + 2.0e-3 * r * r;
+  if (hashf(seed + 6u) < 0.12) { len += 1.0e-3 + 2.5e-3 * hashf(seed + 7u); }
   let droop = clamp(len / 1.5e-3, 0.0, 1.0);
   let bend = cv * (1.1 * len) - N * (0.6 * len * lift * droop) + vec3<f32>(0.0, 0.0, -0.3 * len * droop);
   return strand(atSide, dir, len, bend, wv * (0.45 * len), 2.0 + 4.0 * hashf(seed + 16u), width, width, vi, acrossW, vec4<u32>(0u, famId, l, seed));

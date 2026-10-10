@@ -1,5 +1,5 @@
 // Edge field (render_common.wgsl): per crossing the distance to the nearest opening (a crossing
-// where neither yarn is part of the cloth), the intact fraction of its warp and pick, and the density of separated yarn ends around it,
+// where neither yarn is part of the cloth), the intact fraction of its warp and pick, and the density of separated yarn ends around that opening,
 // written to an rgba16float texture at crossing resolution. Distances come from jump flooding over the crossing grid with physical (anisotropic)
 // pitches: nearest seeds are propagated over steps 16, 8, 4, 2, 1, 1 crossings, enough for EDGE_RMAX.
 // Rebuilt only when the yarn field changed (edgeArgsMain consumes the solver's field event flag) or a
@@ -133,16 +133,19 @@ fn edgeWrite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let tb = threadBitsE[c >> 4u] >> (2u * (c & 15u));
   let warp = select(1.0 - f32(yarnCode(w, 1u)) / 255.0, 0.0, (tb & 2u) != 0u || yarnCode(w, 1u) >= PULLED_R);
   let pick = select(1.0 - f32(yarnCode(w, 0u)) / 255.0, 0.0, (tb & 1u) != 0u || yarnCode(w, 0u) >= PULLED_R);
-  // separated yarn segments within about 1.2 mm (7 warps x 5 picks), where the rim needs it
+  // how much of an edge the nearest opening is: separated yarn segments within about 1.2 mm of it
+  // (7 warps x 5 picks). Every point of its rim and halo takes the character of that edge, not of the
+  // few crossings around the point itself
   var density = 0.0;
-  if (d < EDGE_RMAX) {
+  let seed = seedIn[c];
+  if (d < EDGE_RMAX && seed != NO_SEED) {
     let F = LR.field;
     var cuts = 0u;
     var n = 0u;
     for (var dm = -2; dm <= 2; dm++) {
       for (var dk = -3; dk <= 3; dk++) {
-        let k = i32(t.k) + dk;
-        let m = i32(t.m) + dm;
+        let k = i32(seed & 0xFFFFu) + dk;
+        let m = i32(seed >> 16u) + dm;
         if (k < 0 || m < 0 || k >= i32(F.y) || m >= i32(F.z)) { continue; }
         let ww = field[F.x + u32(m) * F.y + u32(k)];
         cuts += select(0u, 1u, yarnCode(ww, 0u) >= PULLED_R) + select(0u, 1u, yarnCode(ww, 1u) >= PULLED_R);

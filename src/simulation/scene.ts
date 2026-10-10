@@ -201,9 +201,9 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): [num
   // Fine correlated abrasion variation.
   w *= (0.82 + 0.18 * fbm(seed + 7, x / (0.3 * S), y / (0.3 * S), 3)) * spec.amount;
   const clamp = (v: number) => Math.min(1, Math.max(0, v));
-  // visible abrasion is concentrated where the cloth is most worn (around the damage), not spread
-  // over the whole zone the structural wear weakens
-  return [clamp(w * (0.12 + 0.88 * cells)), clamp(Math.pow(w, 1.8) * (0.65 + 0.35 * cells))];
+  // visible abrasion has the structural wear's cause: it is concentrated where the cloth is most
+  // worn (the cells' interiors, where holes open), not spread over the whole zone the wear weakens
+  return [clamp(w * (0.12 + 0.88 * cells)), clamp(Math.pow(w, 2.2) * (0.35 + 0.65 * cells))];
 }
 
 export function compileLayer(spec: LayerSpec, index: number, nodeOffset: number): { info: LayerInfo } {

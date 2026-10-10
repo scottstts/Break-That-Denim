@@ -11,7 +11,6 @@ import piecesWgsl from './wgsl/pieces.wgsl?raw';
 import threadsWgsl from './wgsl/threads.wgsl?raw';
 import threadGeomWgsl from './wgsl/thread_geom.wgsl?raw';
 import threadPrepWgsl from './wgsl/thread_prep.wgsl?raw';
-import threadSimWgsl from './wgsl/thread_sim.wgsl?raw';
 import threadWgsl from './wgsl/thread.wgsl?raw';
 import fuzzWgsl from './wgsl/fuzz.wgsl?raw';
 import postWgsl from './wgsl/post.wgsl?raw';
@@ -51,9 +50,6 @@ const REFINE = 2;
 /** Loose-thread runs and their draw chunks (threads.wgsl). */
 const MAX_RUNS = 65536;
 const MAX_CHUNKS = 262144;
-/** Simulated thread points (thread_sim.wgsl): per frame, and the persistent hash table's capacity. */
-const MAX_PTS = 524288;
-const SIM_CAP = 1 << 19;
 /** Apparent density of a loose cotton yarn (fibre density 1520 kg/m^3 at 0.6 packing), kg/m^3. */
 const LOOSE_YARN_DENSITY = 1520 * 0.6;
 /** Cells drawn per crossing (refine.wgsl list from FINE_BASE). */
@@ -118,8 +114,6 @@ function prelude(scene: CompiledScene): string {
     ['FINE_QM', 'u32', `${bv + 1}u`],
     ['MAX_EDGES', 'u32', `${MAX_EDGES}u`],
     ['FIBERS_PER_EDGE', 'u32', `${FIBERS_PER_EDGE}u`],
-    ['MAX_PTS', 'u32', `${MAX_PTS}u`],
-    ['SIM_CAP', 'u32', `${SIM_CAP}u`],
   ];
   return lines.map(([n, t, v]) => `const ${n}: ${t} = ${v};`).join('\n') + '\n';
 }
@@ -164,9 +158,6 @@ export class Renderer {
   private readonly chunks: GPUBuffer;
   private readonly runGeo: GPUBuffer;
   private readonly threadDraw: GPUBuffer;
-  /** Thread dynamics: persistent state (hash table) and the points of the frame (thread_sim.wgsl). */
-  private readonly simState: GPUBuffer;
-  private readonly runPts: GPUBuffer;
   /** Material connectivity (pieces.wgsl): slots and connection fields, dirty cells, args, free edges. */
   private readonly kappa: GPUBuffer;
   private readonly cellDirty: GPUBuffer;
@@ -260,8 +251,6 @@ export class Renderer {
     this.chunks = createBuffer(device, 'threadChunks', 4 * MAX_CHUNKS);
     this.runGeo = createBuffer(device, 'threadRunGeo', 7 * 16 * MAX_RUNS);
     this.threadDraw = createBuffer(device, 'threadDraw', 48, STORAGE | GPUBufferUsage.INDIRECT);
-    this.simState = createBuffer(device, 'threadSimState', 4 * (8 + SIM_CAP + 8 * SIM_CAP));
-    this.runPts = createBuffer(device, 'threadPts', 16 * MAX_PTS);
     // slot table initialised to "no field" so the first frame before a rebuild draws everything intact
     const kappaInit = new Uint32Array(4 + N + KAPPA_SLOTS + KAPPA_SLOTS * kappaWords);
     kappaInit.fill(0xffffffff, 4, 4 + N);
@@ -316,21 +305,6 @@ export class Renderer {
     });
     // kappaSolve is dispatched from piecesArgs, which it must not have bound for writing
     this.groups.piecesSolve = pieces.bindGroup('pieces.solve', { 0: this.renderU, 1: solver.field, 2: this.threadBits, 3: solver.nodes, 4: solver.x, 5: this.kappa });
-    const threadSim = new ComputeModule(device, 'threadSim', common + threadGeomWgsl + threadSimWgsl);
-    for (const e of ['threadSimBegin', 'threadSimClear', 'threadSim']) this.cpipes[e] = threadSim.pipeline(e);
-    this.groups.threadSim = threadSim.bindGroup('threadSim', {
-      0: this.renderU,
-      1: solver.x,
-      2: solver.segs,
-      3: this.tframe,
-      4: this.nrm,
-      5: this.runs,
-      6: this.threadCount,
-      7: this.runGeo,
-      8: this.simState,
-      9: this.runPts,
-      10: this.frameU,
-    });
     const edgeRoots = new ComputeModule(device, 'edgeRoots', common + materialMapWgsl + edgeRootsWgsl);
     this.cpipes.edgeRootsMain = edgeRoots.pipeline('edgeRootsMain');
     this.groups.edgeRoots = edgeRoots.bindGroup('edgeRoots', { 0: this.renderU, 1: solver.x, 2: this.tframe, 3: this.rsurf, 4: this.kappa, 5: this.edgeList, 6: this.edgeRoots });
@@ -456,14 +430,18 @@ export class Renderer {
     const coverage: GPUMultisampleState = { count: SAMPLES, alphaToCoverageEnabled: true };
     const strip: GPUPrimitiveState = { topology: 'triangle-strip', cullMode: 'none' };
     const list: GPUPrimitiveState = { topology: 'triangle-list', cullMode: 'none' };
-    const pipe = (label: string, layout: GPUBindGroupLayout, module: GPUShaderModule, vs: string, fs: string | null, prim: GPUPrimitiveState, msaa: GPUMultisampleState | null) =>
+    // fibres far thinner than a pixel cover a fraction of it: blended over what is behind (depth
+    // tested, not written; loose fibres of one material, so their order hardly changes the result).
+    // Alpha to coverage would quantise their sub-pixel coverage to 0 or 1 of 4 samples (speckle).
+    const blended: GPUBlendState = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
+    const pipe = (label: string, layout: GPUBindGroupLayout, module: GPUShaderModule, vs: string, fs: string | null, prim: GPUPrimitiveState, msaa: GPUMultisampleState | null, blend?: GPUBlendState) =>
       device.createRenderPipeline({
         label,
         layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         vertex: { module, entryPoint: vs },
-        fragment: fs ? { module, entryPoint: fs, targets: [{ format: HDR_FORMAT }] } : undefined,
+        fragment: fs ? { module, entryPoint: fs, targets: [{ format: HDR_FORMAT, blend }] } : undefined,
         primitive: prim,
-        depthStencil: msaa ? depth : shadowDepth,
+        depthStencil: msaa ? (blend ? { ...depth, depthWriteEnabled: false } : depth) : shadowDepth,
         multisample: msaa ?? undefined,
       });
     const surfaceModule = shaderModule(device, 'surface', common + lightWgsl + materialMapWgsl + surfaceWgsl);
@@ -472,11 +450,11 @@ export class Renderer {
     this.pipes.fine = pipe('fine', surfaceLayout, surfaceModule, 'vsFine', 'fsMain', list, ms);
     this.pipes.fineShadow = pipe('fine.shadow', surfaceLayout, surfaceModule, 'vsFineShadow', null, list, null);
     const fuzzModule = shaderModule(device, 'fuzz', common + lightWgsl + fuzzWgsl);
-    this.pipes.edgeFuzz = pipe('edgeFuzz', fuzzLayout, fuzzModule, 'vsEdgeFuzz', 'fsFuzz', strip, coverage);
+    this.pipes.edgeFuzz = pipe('edgeFuzz', fuzzLayout, fuzzModule, 'vsEdgeFuzz', 'fsFuzz', strip, ms, blended);
     const threadModule = shaderModule(device, 'thread', common + lightWgsl + threadGeomWgsl + threadWgsl);
     this.pipes.thread = pipe('thread', threadLayout, threadModule, 'vsThread', 'fsThread', strip, coverage);
     this.pipes.threadShadow = pipe('thread.shadow', threadLayout, threadModule, 'vsThreadShadow', null, strip, null);
-    this.pipes.threadFuzz = pipe('threadFuzz', threadLayout, threadModule, 'vsThreadFuzz', 'fsThreadFuzz', strip, coverage);
+    this.pipes.threadFuzz = pipe('threadFuzz', threadLayout, threadModule, 'vsThreadFuzz', 'fsThreadFuzz', strip, ms, blended);
 
     const tileView = this.weaveTile.createView({ dimension: '2d-array' });
     const edgeView = this.edgeTex.createView();
@@ -518,7 +496,7 @@ export class Renderer {
           { binding: 5, resource: { buffer: this.nrm } },
           { binding: 6, resource: { buffer: this.runs } },
           { binding: 7, resource: { buffer: this.chunks } },
-          { binding: 8, resource: { buffer: this.runPts } },
+          { binding: 8, resource: { buffer: this.runGeo } },
           { binding: 9, resource: shadow },
           { binding: 10, resource: this.shadowSampler },
         ],
@@ -744,10 +722,6 @@ export class Renderer {
     run('refine', Math.ceil(this.refinedCount / 128));
     cp.setBindGroup(0, this.groups.threadPrep);
     runIndirect('threadPrep', this.threadDraw, 32);
-    cp.setBindGroup(0, this.groups.threadSim);
-    run('threadSimBegin', 1);
-    run('threadSimClear', SIM_CAP / 256);
-    runIndirect('threadSim', this.threadDraw, 32);
     cp.setBindGroup(0, this.groups.edgeRoots);
     runIndirect('edgeRootsMain', this.piecesArgs, 32);
     cp.end();

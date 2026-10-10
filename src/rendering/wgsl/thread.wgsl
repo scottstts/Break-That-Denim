@@ -12,7 +12,8 @@
 @group(0) @binding(5) var<storage, read> nrm: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> runs: array<vec4<u32>>;
 @group(0) @binding(7) var<storage, read> chunks: array<u32>;
-@group(0) @binding(8) var<storage, read> runPts: array<vec4<f32>>;
+// per run, RUN_GEO vec4 (thread_prep.wgsl)
+@group(0) @binding(8) var<storage, read> runGeo: array<vec4<f32>>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 
@@ -57,36 +58,12 @@ fn chunkRef(ii: u32) -> ChunkRef {
   return o;
 }
 
-// Point of the simulated thread (thread_sim.wgsl) of chunk ch at drawn parameter p: Catmull-Rom over
-// its points, with the yarn's loose radius, thinning toward a free end as it untwists.
+// Point of the thread of chunk ch at drawn parameter p, from its strand's chain (thread_geom.wgsl).
 fn threadOf(ch: ChunkRef, p: f32) -> ThreadPoint {
-  var o: ThreadPoint;
-  let ri = ch.ri;
-  let n = min(u32(ri.n), 70u);
-  let u = clamp(p - (ri.pos - 1.0), 0.0, f32(n + 1u));
-  let i1 = min(u32(floor(u)), n);
-  let t = u - f32(i1);
-  let b = ri.base;
-  let P1 = runPts[b + i1].xyz;
-  let P2 = runPts[b + i1 + 1u].xyz;
-  let P0 = select(2.0 * P1 - P2, runPts[b + i1 - 1u].xyz, i1 > 0u);
-  let P3 = select(2.0 * P2 - P1, runPts[b + i1 + 2u].xyz, i1 + 2u <= n + 1u);
-  o.p = cmrT(P0, P1, P2, P3, t);
-  o.t = normalize(cmrdT(P0, P1, P2, P3, t) + vec3<f32>(1e-9, 0.0, 0.0));
-  o.n = normalize(cross(o.t, cross(vec3<f32>(0.0, 0.0, 1.0), o.t)) + vec3<f32>(0.0, 0.0, 1e-6));
-  o.valid = runPts[b].w > 0.5;
-  let LR = R.layers[ri.layer];
-  let seedY = hash11((ri.layer * 7919u + ri.yarn) * 2u + ri.fam + 0x51ed27u);
-  o.radius = select(LR.loose.y, LR.loose.x, ri.fam == 0u) * (0.88 + 0.24 * hashf(seedY + 5u));
-  // untwisting toward a free end over its last millimetre or two
-  let pitchAl = select(LR.pitch.y, LR.pitch.x, ri.fam == 0u);
-  let lt = (0.6e-3 + 1.8e-3 * hashf(seedY + 6u)) / pitchAl;
-  var tip = 0.0;
-  if (!ri.heldA) { tip = max(tip, clamp((ri.drawA + lt - p) / lt, 0.0, 1.0)); }
-  if (!ri.heldB) { tip = max(tip, clamp((p - (ri.drawB - lt)) / lt, 0.0, 1.0)); }
-  o.tip = tip;
-  o.radius *= 1.0 - 0.45 * tip;
-  return o;
+  let g = runGeoAt(ch.r);
+  let cA = runGeo[RUN_GEO * ch.r + 5u].xyz;
+  let cB = runGeo[RUN_GEO * ch.r + 6u].xyz;
+  return threadAt(ch.ri, g, cA, cB, p);
 }
 
 fn threadVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
@@ -143,7 +120,7 @@ fn fsThread(in: VOut) -> @location(0) vec4<f32> {
   let pix = F.camPos.w * length(F.camPos.xyz - in.world);
   // a yarn freed from the weave is abraded and loosened: its pale core shows, more toward an
   // untwisting end
-  let look = yarnLook(LR, in.id.z, fam, yarn, i32(floor(in.c / f32(LR.twill.x))), along, s, min(1.0, 0.8 + 0.2 * in.tip), pix);
+  let look = yarnLook(LR, in.id.z, fam, yarn, i32(floor(in.c / f32(LR.twill.x))), along, s, min(1.0, 0.8 + 0.2 * in.tip), pix, 1.0);
   let tw = select(LR.weft.w, LR.warp.w, fam == 1u) * (1.0 - in.tip);
   let Tf = normalize(cos(tw) * T + sin(tw) * cross(N, T));
   let key = keyLight(in.world);
