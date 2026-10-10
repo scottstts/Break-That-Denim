@@ -1,20 +1,22 @@
 # Handoff (rolling)
 
-Session acting on `artifacts/assessment/assessment.md`. Commits so far:
-
-- `31783f2` mechanics corrections (bending of unequal spans, consistent line search, force-derived
-  pull-out, wear-independent cohesive opening). `MECHANICS_VERSION` 10, drape regenerated.
+Session acting on `artifacts/assessment/assessment.md`. Decisions: `docs/decisions/2026-10-10-assessment-response.md`.
 
 ## Verified
 
-- `npm run check`: lint, typecheck, 32 unit tests.
-- `npm run test:gpu`: 26/26 (torn fixture now perturbs rest lengths and cut masks, and compares rhs).
-- `tools/studies/lsprobe.ts`: gradient and line-search energy agree to 7 digits per term; 118/120
-  Newton iterations take the full step on the test coupon (before: ~half were uphill).
-- Substep 8.19 ms (`bench.ts`), unchanged.
+- `npm run check` (32 unit), `npm run test:gpu` (26/26).
+- `MECHANICS_VERSION` 10; `public/drape.bin` regenerated.
 
-## In progress / next
+## Reproduce
 
-1. Threads drawn from the mechanical chains (replace `thread_sim.wgsl` one-way dynamics).
-2. Worn-material calibration against several gestures (holes now open larger but angular; pieces drop).
-3. Rendering: surface saturation/contrast, rims, fray, bridges.
+- `node tools/gpu/run.mjs tools/gpu/scripts/session.ts cells NAME 30` with `DUMP=1 SNAPS=...`;
+  `AUTOLIFT=1` with the `drag` script emulates a mouse drag.
+- `still.ts` with `CAMERA`, `LIGHT` overrides; `tools/compare/sbs.zsh` for reference crops.
+- `SCENE` / `DRAPE` env overrides for material experiments (drape.ts, render.ts).
+- `frameloop.ts`: product frame wall time; `accuracy.ts conv 2x2-lean` for solver accuracy.
+
+## Next
+
+1. Real-time speed (sim/wall ~0.9): fused coarse V-cycle kernel.
+2. Debris and thread contact (pieces fall through the cloth).
+3. Rendering: rim texture, hole-edge translucent zones, thread fuzz at far view.
