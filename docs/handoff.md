@@ -1,6 +1,9 @@
 # Handoff (rolling)
 
-Latest round: `docs/decisions/2026-10-10-tear-sound.md` (tear sound, multi-touch, page UI; uncommitted).
+Latest round: `docs/decisions/2026-10-10-tear-sound-sample.md` (tear sound: the recording's tearing passages
+played back; the mechanics control only tearing on/off, loudness and place; fall-off on stop/release; uncommitted).
+Before: `docs/decisions/2026-10-10-tear-sound-structure.md` (the procedural voice it replaced).
+Before: `docs/decisions/2026-10-10-tear-sound.md` (records, transport, multi-touch, page UI).
 Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/2026-10-10-edge-fibre-population.md`,
 `docs/decisions/2026-10-10-interaction-round.md`.
 
@@ -20,9 +23,9 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
 
 ## Verified
 
-- Tear sound: side-by-side waveforms vs the recording at 1 s / 200 ms / 40 ms / 10 ms
-  (`tools/audio/compare.mjs`); 50 ms kurtosis 4.4-5.1 / crest 13.5-14.6 dB vs 5.1 / 14.3. Not yet
-  confirmed by the user by ear in the app after the last rework (dense fibre-bundle events).
+- Tear sound: renders of haul / pluck / drag / rip sessions keep the recording's texture (fine texture
+  distance 2.8, the recording's own tears 3.0-7.6); silent unless yarns part; falls off 60 dB in 0.3 s on
+  stop or release (unit tests). Not yet confirmed by the user by ear.
 - Multi-touch: `twohand.ts` apart/shear/overlap/adjacent/three clean; `npm run check` 45 unit.
 
 - `npm run check` (33 unit), `npm run test:gpu` (26/26).
@@ -34,9 +37,9 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
 
 ## Reproduce
 
-- Sound: `AUDIO=f.json node tools/gpu/run.mjs tools/gpu/scripts/session.ts rip` (or `twohand.ts`),
-  then `tools/audio/render.ts f.json out.wav` (`VOICE`, `JITTER` overrides), `tools/audio/analyze.mjs`,
-  `tools/audio/compare.mjs ref 0.70 out.wav 0.15 cmp.png`; refit spectra with `tools/audio/fit.ts`.
+- Sound: `AUDIO=f.json node tools/gpu/run.mjs tools/gpu/scripts/session.ts rip` (or `twohand.ts`), then
+  `tools/audio/render.ts f.json out.wav` (`VOICE` overrides TEAR_SAMPLE); compare with
+  `tools/audio/spectrograms.mjs`, `texture.mjs`, `events.mjs`, `compare.mjs`, `analyze.mjs`.
 
 - `node tools/gpu/run.mjs tools/gpu/scripts/session.ts <script> NAME 30` (`DUMP=1`, `SNAPS=t,...`,
   `FRAMES=dir`, `STATS=1`, `TRACK=n`, `LSPROBE=t`); `haul` with `GRAB`, `PULL`, `HOLD`, `AUTOLIFT=1`.
@@ -53,9 +56,9 @@ Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/202
 
 ## Open
 
-0. Sound: verify by ear in the browser; the pre-tear quiet passages of the recording carry a
-   continuous low rustle (handling) that ours lacks (only friction from crossing slip, quiet by
-   design). Mouse wheel depth applies to all held grips.
+0. Sound: verify by ear in the browser (reload: the worklet loads once per page). Loudness follows the
+   mechanics' release rate (swells within a tear are the simulated cloth's); the slices come from 2 s of
+   recording, so a long tear repeats material at random places. Mouse wheel depth applies to all grips.
 
 1. Shape plan: measurement, rim volume (edge fibre) and fold diagnosis done. Folds buckle correctly and
    are converged in resolution; their depth follows the mount (taut along the warp) and the pull. Thread

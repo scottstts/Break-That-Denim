@@ -442,7 +442,6 @@ export class GpuSolver {
       9: this.delta,
       10: this.counters,
       11: this.contact.meta,
-      12: this.acousticSources,
     };
     const group = (key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod.step.bindGroup(key, entries);

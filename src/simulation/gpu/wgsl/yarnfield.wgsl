@@ -256,10 +256,11 @@ fn emitFracture(c: u32, f: u32, B: u32, y: Yarn, c0: u32, c1: u32, at: vec3<f32>
   atomicAdd(&counters[acousticSlot(s, 0u)], e);
   let w = i32(c1 - c0);
   let mm = vec3<i32>(round(at * 1000.0)) * w;
-  atomicAdd(&counters[acousticSlot(s, 4u)], bitcast<u32>(mm.x));
-  atomicAdd(&counters[acousticSlot(s, 5u)], bitcast<u32>(mm.y));
-  atomicAdd(&counters[acousticSlot(s, 6u)], bitcast<u32>(mm.z));
-  atomicAdd(&counters[acousticSlot(s, 7u)], u32(w));
+  atomicAdd(&counters[acousticSlot(s, 1u)], bitcast<u32>(mm.x));
+  atomicAdd(&counters[acousticSlot(s, 2u)], bitcast<u32>(mm.y));
+  atomicAdd(&counters[acousticSlot(s, 3u)], bitcast<u32>(mm.z));
+  atomicAdd(&counters[acousticSlot(s, 4u)], u32(w));
+  if (c1 == CUT) { atomicAdd(&counters[acousticSlot(s, 5u)], 1u); }
 }
 
 @compute @workgroup_size(128)
@@ -302,12 +303,11 @@ fn breakDistance(F: vec4<u32>, f: u32, k: u32, m: u32) -> i32 {
   return best;
 }
 
-// Friction work (J) of the end sliding through the crossing when it pulls out, else a negative value.
-fn pullsOut(l: u32, F: vec4<u32>, c: u32, f: u32, k: u32, m: u32) -> f32 {
+fn pullsOut(l: u32, F: vec4<u32>, c: u32, f: u32, k: u32, m: u32) -> bool {
   let d = breakDistance(F, f, k, m);
-  if (d < 0) { return -1.0; }
+  if (d < 0) { return false; }
   let eps = interpolatedStrain(l, f, k, m);
-  if (eps >= 0.5 * NO_STRAIN || eps <= 0.0) { return -1.0; }
+  if (eps >= 0.5 * NO_STRAIN || eps <= 0.0) { return false; }
   let mat = P.layers[l];
   let g = 1u - f;
   let ec = interpolatedStrain(l, g, k, m);
@@ -326,7 +326,7 @@ fn pullsOut(l: u32, F: vec4<u32>, c: u32, f: u32, k: u32, m: u32) -> f32 {
   let e = min(eps, strainAtTension(y, strength[c][f] / share));
   let comp = share * (axialTension(y, e) * e - axialEnergyDensity(y, e));
   let fric = mat.a.y * (nodes[n].n0 / f32(bu * bv) + mat.a.z * tCross);
-  return select(-1.0, pitch * fric, comp * pitch >= (f32(d) - 0.5) * pitch * fric);
+  return comp * pitch >= (f32(d) - 0.5) * pitch * fric;
 }
 
 // One invocation per 16 crossings: which ends pull out of their next crossing this substep.
@@ -336,8 +336,6 @@ fn pullMark(@builtin(global_invocation_id) gid: vec3<u32>) {
   let total = fieldTotalY();
   if (w >= (total + 15u) / 16u || P.counts.z == 0u) { return; }
   var bits = 0u;
-  var work = vec4<f32>(0.0);
-  var count = vec4<u32>(0u);
   for (var e = 0u; e < 16u; e++) {
     let c = 16u * w + e;
     if (c >= total) { break; }
@@ -350,26 +348,10 @@ fn pullMark(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = (c - F.x) / F.y;
     for (var f = 0u; f < 2u; f++) {
       if (damageAt(c, f) >= PULLED) { continue; }
-      let wk = pullsOut(l, F, c, f, k, m);
-      if (wk >= 0.0) {
-        bits |= 1u << (2u * e + f);
-        let bu = bundleF(l, 1u);
-        let bv = bundleF(l, 0u);
-        let L = latticeOf(l);
-        let s = nearestSource(x[L.x + min(L.z - 1u, m / bv) * L.y + min(L.y - 1u, k / bu)].xyz, SRC);
-        work[s] += wk;
-        count[s] += 1u;
-      }
+      if (pullsOut(l, F, c, f, k, m)) { bits |= 1u << (2u * e + f); }
     }
   }
   pullBits[w] = bits;
-  if (bits != 0u) {
-    for (var s = 0u; s < 4u; s++) {
-      if (count[s] == 0u) { continue; }
-      atomicAdd(&counters[acousticSlot(s, 1u)], count[s]);
-      atomicAdd(&counters[acousticSlot(s, 2u)], u32(round(work[s] * 1e8)));
-    }
-  }
 }
 
 @compute @workgroup_size(128)

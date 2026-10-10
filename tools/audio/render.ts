@@ -1,16 +1,18 @@
 /**
  * Offline rendering of the tear voice from recorded acoustic records (session.ts AUDIO=file.json):
  * records arrive in frame batches as in the product (one batch per 1/30 s, after a readback delay)
- * and the voice renders them in 128-sample blocks into a 16-bit stereo WAV.
+ * and the voice renders them in 128-sample blocks into a 16-bit stereo WAV. The recording that carries
+ * the sound is decoded with ffmpeg at the output rate, as the browser decodes it.
  *
  *   node tools/gpu/run.mjs tools/audio/render.ts <records.json> <out.wav> [sampleRate]
  *
  * Compare with the recording: node tools/audio/analyze.mjs <out.wav>
- * VOICE='{"fracture":{"centre":1500}}' overrides TEAR_VOICE constants (calibration).
+ * VOICE='{"tail":0.4}' overrides TEAR_SAMPLE constants.
  */
+import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { RECORD_FLOATS, SOURCES, SRC, sourceAt } from '../../src/audio/record';
-import { TEAR_VOICE, TearVoice } from '../../src/audio/tearVoice';
+import { TEAR_SAMPLE, TearVoice, prepareSource } from '../../src/audio/tearVoice';
 
 const FRAME = 1 / 30;
 const READBACK = 0.015;
@@ -25,7 +27,7 @@ function merge(into: Record<string, unknown>, from: Record<string, unknown>): vo
 }
 
 export default async function main(args: string[]): Promise<void> {
-  merge(TEAR_VOICE as unknown as Record<string, unknown>, JSON.parse(process.env.VOICE ?? '{}') as Record<string, unknown>);
+  merge(TEAR_SAMPLE as unknown as Record<string, unknown>, JSON.parse(process.env.VOICE ?? '{}') as Record<string, unknown>);
   const [input, output] = args;
   const fs = Number(args[2] ?? 48000);
   const { h, records } = JSON.parse(readFileSync(input, 'utf8')) as { h: number; records: number[][] };
@@ -33,6 +35,8 @@ export default async function main(args: string[]): Promise<void> {
   const J = Number(process.env.JITTER ?? 0);
   const jitter = (frame: number) => J * ((Math.sin(frame * 12.9898) * 43758.5453) % 1 + 1) % 1;
   const voice = new TearVoice(fs, Number(process.env.SEED ?? 1));
+  const raw = execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', 'refs/fabric_tear_sound_sample.mp3', '-ar', String(fs), '-ac', '1', '-f', 'f32le', '-acodec', 'pcm_f32le', '-'], { maxBuffer: 1 << 28 });
+  voice.setSource(prepareSource(new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4).slice(), fs));
   const total = records.length * h + 0.5;
   const N = Math.ceil((total * fs) / 128) * 128;
   const L = new Float32Array(N);

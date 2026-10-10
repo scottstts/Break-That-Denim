@@ -261,6 +261,7 @@ class Engine {
     const forward = normalize(sub(this.camera.target, m.eye));
     const g: GripState = { slot, node: hit.node, plane: p, normal: forward, handle: p, target: p, depth: 0, engageTime: performance.now() };
     this.grips.set(c.id, g);
+    this.audioPort?.postMessage({ grip: slot, held: true });
     this.wake();
     send({ type: 'cursor', cursor: 'grabbing' });
     this.updateGripTarget(g, this.down.get(c.id) ?? c);
@@ -279,6 +280,8 @@ class Engine {
     if (!g) return;
     this.interaction.release(g.slot);
     this.grips.delete(id);
+    // a released finger is silent at once (only a held tear is heard)
+    this.audioPort?.postMessage({ grip: g.slot, held: false });
     // pieces held only by this grip are free now
     void this.topology.request(this.interaction.coreNodes);
     if (this.grips.size === 0) send({ type: 'cursor', cursor: 'grab' });

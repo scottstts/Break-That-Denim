@@ -1,485 +1,305 @@
 import { RECORD_FLOATS, SOURCES, SRC, sourceAt } from './record';
 
 /**
- * Procedural tear sound driven by the mechanics (record.ts): acoustic emission of what the cloth
- * releases, per sound source (one per finger).
+ * The tear sound: the recorded denim tear (refs/fabric_tear_sound_sample.mp3) carries the sound; the
+ * mechanics only say, per sound source (one per finger), whether the cloth is tearing there, how hard,
+ * and where (docs/decisions/2026-10-10-tear-sound-sample.md).
  *
- * A recorded denim tear (refs/fabric_tear_sound_sample.mp3), looked at as a waveform, is a continuous,
- * zero-mean, band-limited oscillation centred around 1.5-3 kHz in which short wavelets of one to two
- * cycles overlap densely, some standing out; there are no steps and no silent gaps between events
- * (tools/audio/compare.mjs; docs/decisions/2026-10-10-tear-sound.md). That is the sound of many small
- * emission events: fibre bundles snapping inside the yarns that fail. So:
- *
- * - fibre fracture: the strain energy the yarns release (J/m) breaks fibres in bundles; each bundle
- *   is one event, its size drawn from the fibre bundle avalanche law (P(s) ~ s^-5/2), thousands per
- *   second while the cloth tears;
- * - crossing slip (yarns rubbing over each other): events from the friction work times slip speed,
- *   so creep under a held load stays silent;
- * - pull-out (a yarn end dragged through a crossing): a short stick-slip chatter.
- *
- * Released energy flows through a two-stage reservoir and events fire from it as a Poisson process:
- * the lattice resolves failure per substep and per bundle of 9 x 6 yarns, while the fibres give one
- * after another. Each event is one wavelet: an impulse into one band of a third-octave bank of
- * resonators (one to two cycles), the band drawn from its mechanism's spectral distribution, fitted
- * to the recording (fracture: its loud tearing passages; friction: the quiet stretching before them;
- * tools/audio/fit.ts). Band responses have unit energy, so an event of acoustic energy e adds e to
- * the output whatever its band.
+ * - Content: the recording's tearing passages, played as long overlapping slices (`grain`, power-
+ *   complementary windows) from random places, at their own speed and pitch. Their slow loudness (the
+ *   recording hand's swells) is divided out so that loudness is the mechanics' alone; everything faster
+ *   (the rasp, the events, the treble, the room) is the recording's.
+ * - Tearing: a source sounds while it is held and its yarns have been cut within `tearWindow`.
+ * - Loudness: acoustic power follows the strain energy the tear releases per second, so the amplitude
+ *   is sqrt(rate / referenceRate) (the recording's own level at the reference), averaged over
+ *   `rateTime`, bounded by `maxGain`.
+ * - Stopping (the tear stops, or the finger lets go): the level falls off like the recording's room
+ *   tail, 60 dB in `tail` seconds.
  */
-export const TEAR_VOICE = {
-  /** Length of yarn over which a fracture releases its strain energy (m): J/m to J. */
-  recoilLength: 1e-3,
-  fracture: {
-    /**
-     * Strain energy one cotton fibre holds when its yarn fails (J/m): the denim yarns' energy density
-     * at peak tension over their fibre count (linear density / 1.8 dtex; tests/unit/tearVoice.test.ts).
-     */
-    fibreEnergy: 7.6e-4,
-    /**
-     * Fibres in the smallest audible event (a strand of the yarn snapping together, about 8 % of its
-     * fibres): with it the tear's spikiness matches the recording (kurtosis 5.0 against 5.1, crest
-     * 14.4 dB against 14.3 per 50 ms window; tools/audio/analyze.mjs).
-     */
-    bundle: 32,
-    /** Avalanche size exponent of a fibre bundle under global load sharing, and the largest event (in bundles). */
-    exponent: 2.5,
-    largest: 30,
-  },
-  pullout: {
-    /** Acoustic share of the friction work of a pull-out. */
-    efficiency: 0.03,
-    /** Stick-slip chatter of one pull-out: impulses and their period (s). */
-    impulses: [3, 6],
-    period: [0.25e-3, 0.6e-3],
-  },
-  slip: {
-    /** Acoustic share of slip work at the reference slip speed (m/s); it scales with the speed. */
-    efficiency: 0.006,
-    refSpeed: 0.01,
-    /** Mean acoustic energy per event (J): a dense rasp (some 10^4 events/s at a hard pull's slip). */
-    quantum: 1e-6,
-  },
-  /** Time constant of each of the two reservoir stages (s). */
-  smoothing: 0.008,
-  /** Quality of the resonator bands. */
-  q: 3,
-  /** Digital energy per acoustic joule (full-scale squared). */
-  gain: 1.6e3,
-  /** Start delay after silence (s) and the queue lengths that make playback catch up (s). */
-  preroll: 0.03,
-  catchUp: 0.08,
-  rush: 0.16,
+export const TEAR_SAMPLE = {
+  /** The recording's tearing passages (s): its handling before each tear is not tearing. */
+  segments: [
+    [0.58, 1.13],
+    [2.4, 2.75],
+    [3.87, 5.02],
+  ] as [number, number][],
+  /** Slice length (s): long enough to carry the recording's rasp and events whole. */
+  grain: 0.1,
+  /** Time over which the recording's own loudness is measured and divided out (s). */
+  levelTime: 0.06,
+  /**
+   * Strain energy released per second (J/m/s) heard at the recording's level: a hand tear of intact
+   * denim at about 200 yarns/s (its rasp) times 0.3 J/m per yarn (400 fibres x 7.6e-4 J/m).
+   */
+  referenceRate: 60,
+  /** Loudest a tear may be heard, re the recording (amplitude). */
+  maxGain: 2,
+  /** Averaging time of the release rate (s): longer than the lattice's span-by-span parting. */
+  rateTime: 0.08,
+  /** A source is tearing while a yarn was cut within this time (s). */
+  tearWindow: 0.1,
+  /** Onset time constant (s). */
+  attack: 0.02,
+  /** Fall-off: 60 dB in this time (s), the recording's room tail after its tears stop. */
+  tail: 0.3,
 };
 
-/** Band centres (Hz): 125 Hz to 10 kHz in third octaves. */
-export const BAND_BASE = 125;
-export const BAND_STEP = 2 ** (1 / 3);
-export const BANDS = 20;
-/**
- * Share of each mechanism's events in each band (sum 1), fitted to the recording by
- * tools/audio/fit.ts: fracture to its loud passages, friction to the quiet ones.
- */
-export const SPECTRA = {
-  fracture: [0.0362, 0.0326, 0.0298, 0.0289, 0.0294, 0.0316, 0.0364, 0.0462, 0.0629, 0.0887, 0.1184, 0.1346, 0.1163, 0.0786, 0.0484, 0.0311, 0.0212, 0.0143, 0.0090, 0.0053],
-  friction: [0.2971, 0.1557, 0.0841, 0.0513, 0.0370, 0.0308, 0.0300, 0.0330, 0.0376, 0.0442, 0.0513, 0.0530, 0.0428, 0.0261, 0.0134, 0.0066, 0.0033, 0.0016, 0.0008, 0.0004],
-};
-
-const PENDING = 2048;
-const MAX_EVENTS_PER_SAMPLE = 4;
-const QUEUE = 512;
-/** After this long without excitation (s) the bank has rung out: processing stops. */
-const RING_OUT = 0.15;
+/** Stereo: the screen's width spans this much of the pan range; a tear's place glides over this time (s). */
+const PAN_WIDTH = 0.5;
+const PAN_GLIDE = 0.06;
 /** Limiter: threshold, attack and release (s). */
 const LIMIT = 0.7;
 const LIMIT_ATTACK = 0.0008;
 const LIMIT_RELEASE = 0.25;
+/** Below this gain a source has fallen silent. */
+const SILENT = 1e-4;
 
-export interface BandFilter {
-  a1: number;
-  a2: number;
-  a3: number;
-  /** Scale giving the band's impulse response unit energy. */
-  norm: number;
+/** The recording prepared for playback: mono, high-passed, its slow loudness divided out. */
+export interface TearSource {
+  pcm: Float32Array;
+  /** Slice start ranges [first, last] (samples): a slice starting there stays inside its passage. */
+  starts: [number, number][];
+  /** RMS of the recording's tearing passages (the level heard at gain 1). */
+  level: number;
 }
 
-/** TPT state-variable band-pass of band b at sample rate fs, normalised to a unit-energy response. */
-export function bandFilter(fs: number, b: number): BandFilter {
-  const f = Math.min(BAND_BASE * BAND_STEP ** b, 0.45 * fs);
-  const g = Math.tan((Math.PI * f) / fs);
-  const a1 = 1 / (1 + g * (g + 1 / TEAR_VOICE.q));
-  const a2 = g * a1;
-  const a3 = g * a2;
-  const ir = bandImpulse({ a1, a2, a3, norm: 1 }, fs);
-  let e = 0;
-  for (const v of ir) e += v * v;
-  return { a1, a2, a3, norm: 1 / Math.sqrt(e) };
-}
-
-/** Impulse response of a band filter (until it has decayed by 200 dB, at most n samples). */
-export function bandImpulse(F: BandFilter, n: number): Float64Array {
-  const out = new Float64Array(n);
-  let s1 = 0;
-  let s2 = 0;
-  let e = 0;
-  let len = n;
-  for (let i = 0; i < n; i++) {
-    const v3 = (i === 0 ? 1 : 0) - s2;
-    const v1 = F.a1 * s1 + F.a2 * v3;
-    const v2 = s2 + F.a2 * s1 + F.a3 * v3;
-    s1 = 2 * v1 - s1;
-    s2 = 2 * v2 - s2;
-    out[i] = v1 * F.norm;
-    e += v1 * v1;
-    if (i > 64 && v1 * v1 < 1e-20 * e) {
-      len = i + 1;
-      break;
-    }
+/**
+ * Prepare the decoded recording (mono, at the output sample rate): 2nd-order high-pass at 70 Hz
+ * (hand-handling rumble), loudness flattened over `levelTime`, tearing passages only.
+ */
+export function prepareSource(mono: Float32Array, sampleRate: number): TearSource {
+  const S = TEAR_SAMPLE;
+  // high-pass (RBJ, Q 0.707)
+  const w = (2 * Math.PI * 70) / sampleRate;
+  const al = Math.sin(w) / (2 * Math.SQRT1_2);
+  const cw = Math.cos(w);
+  const a0 = 1 + al;
+  const b0 = (1 + cw) / 2 / a0;
+  const b1 = -(1 + cw) / a0;
+  const a1 = (-2 * cw) / a0;
+  const a2 = (1 - al) / a0;
+  const x = new Float32Array(mono.length);
+  let z1 = 0;
+  let z2 = 0;
+  for (let i = 0; i < mono.length; i++) {
+    const v = mono[i];
+    const y = b0 * v + z1;
+    z1 = b1 * v - a1 * y + z2;
+    z2 = b0 * v - a2 * y;
+    x[i] = y;
   }
-  return out.subarray(0, len);
+  // slow loudness: RMS over levelTime (centred)
+  const half = Math.round((S.levelTime * sampleRate) / 2);
+  const pre = new Float64Array(x.length + 1);
+  for (let i = 0; i < x.length; i++) pre[i + 1] = pre[i] + x[i] * x[i];
+  const grain = Math.round(S.grain * sampleRate);
+  const starts: [number, number][] = [];
+  let e = 0;
+  let n = 0;
+  for (const [t0, t1] of S.segments) {
+    const a = Math.round(t0 * sampleRate);
+    const b = Math.min(x.length, Math.round(t1 * sampleRate));
+    if (b - a > grain) starts.push([a, b - grain]);
+    e += pre[b] - pre[a];
+    n += Math.max(0, b - a);
+  }
+  const level = Math.sqrt(e / Math.max(1, n));
+  const pcm = new Float32Array(x.length);
+  for (let i = 0; i < x.length; i++) {
+    const a = Math.max(0, i - half);
+    const b = Math.min(x.length, i + half);
+    const rms = Math.sqrt((pre[b] - pre[a]) / Math.max(1, b - a));
+    pcm[i] = x[i] / Math.max(rms, 0.1 * level);
+  }
+  return { pcm, starts, level };
 }
 
-/** Cumulative distribution of a spectrum (for drawing an event's band). */
-function cumulative(S: readonly number[]): Float64Array {
-  const c = new Float64Array(S.length);
-  const total = S.reduce((a, v) => a + v, 0);
-  let s = 0;
-  S.forEach((v, i) => (c[i] = s += v / total));
-  c[S.length - 1] = 1;
-  return c;
+/** One finger's tear: its slices, loudness and place. */
+interface Voice {
+  held: boolean;
+  /** Release rate averaged over rateTime (J/m/s); time since the last cut (s, audio time). */
+  rate: number;
+  idle: number;
+  target: number;
+  gain: number;
+  pan: number;
+  panTarget: number;
+  panSet: boolean;
+  /** Two overlapping slices: their read positions (-1: not playing), and the age of the first (samples). */
+  pos: [number, number];
+  age: number;
 }
 
-/** One emission stream of a source: released energy in two reservoir stages, and its event phase. */
-interface Stream {
-  inflow: number;
-  r1: number;
-  r2: number;
-  phase: number;
-  threshold: number;
-}
-
-const stream = (): Stream => ({ inflow: 0, r1: 0, r2: 0, phase: 0, threshold: 1 });
+const voice = (held: boolean): Voice => ({ held, rate: 0, idle: Infinity, target: 0, gain: 0, pan: 0, panTarget: 0, panSet: false, pos: [-1, -1], age: 0 });
 
 export class TearVoice {
   readonly sampleRate: number;
   private seed: number;
-  private spare = NaN;
-  private readonly bands: BandFilter[] = [];
-  private readonly cdf = { fracture: cumulative(SPECTRA.fracture), friction: cumulative(SPECTRA.friction) };
-  // band filter states, two channels
-  private readonly s1 = new Float64Array(2 * BANDS);
-  private readonly s2 = new Float64Array(2 * BANDS);
-  private exc = new Float32Array(2 * BANDS * 128);
-  // pending pull-out impulses: absolute sample time, energy, band, pan
-  private readonly evT = new Float64Array(PENDING);
-  private readonly evE = new Float32Array(PENDING);
-  private readonly evB = new Uint8Array(PENDING);
-  private readonly evP = new Float32Array(PENDING);
-  private pending = 0;
-  // record queue (ring)
-  private readonly queue = new Float32Array(QUEUE * RECORD_FLOATS);
-  private qHead = 0;
-  private qCount = 0;
-  private queued = 0;
-  private waiting = 0;
-  private playing = false;
-  private recLeft = 0;
-  // per source: fracture (J/m) and slip (acoustic J) streams, and pan
-  private readonly fracture: Stream[] = Array.from({ length: SOURCES }, stream);
-  private readonly slip: Stream[] = Array.from({ length: SOURCES }, stream);
-  private readonly pan = new Float64Array(SOURCES);
-  private readonly drain: number;
-  /** Mean avalanche size (bundles). */
-  private readonly meanSize: number;
-  private clock = 0;
-  private quiet = Infinity;
+  private source: TearSource | null = null;
+  private total = 0;
+  private readonly voices: Voice[];
+  private readonly grain: number;
+  private readonly window: Float32Array;
+  private readonly attackK: number;
+  private readonly tailK: number;
+  private readonly panK: number;
   private env = 0;
   private limGain = 1;
-  private readonly attack: number;
-  private readonly release: number;
+  private readonly limAttack: number;
+  private readonly limRelease: number;
 
-  constructor(sampleRate: number, seed = 0x9e3779b9) {
+  /**
+   * `held`: whether the sources start held. The product starts with none and follows each finger's grab
+   * and release (`grip`); offline tools hear every record.
+   */
+  constructor(sampleRate: number, seed = 0x9e3779b9, held = true) {
     this.sampleRate = sampleRate;
     this.seed = seed >>> 0 || 1;
-    for (let b = 0; b < BANDS; b++) this.bands.push(bandFilter(sampleRate, b));
-    this.attack = Math.exp(-1 / (LIMIT_ATTACK * sampleRate));
-    this.release = Math.exp(-1 / (LIMIT_RELEASE * sampleRate));
-    this.drain = 1 - Math.exp(-1 / (TEAR_VOICE.smoothing * sampleRate));
-    // mean of the truncated power law avalanche() draws from: a = exponent - 1 on [1, L]
-    const F = TEAR_VOICE.fracture;
-    const a = F.exponent - 1;
-    const L = F.largest;
-    this.meanSize = a === 1 ? Math.log(L) / (1 - 1 / L) : ((a / (a - 1)) * (1 - L ** (1 - a))) / (1 - L ** -a);
-    for (const st of [...this.fracture, ...this.slip]) st.threshold = this.exponential();
+    this.voices = Array.from({ length: SOURCES }, () => voice(held));
+    this.grain = 2 * Math.round((TEAR_SAMPLE.grain * sampleRate) / 2);
+    // power-complementary across the half overlap (sin^2 + cos^2 = 1; the slices are uncorrelated)
+    this.window = Float32Array.from({ length: this.grain }, (_, i) => Math.sin((Math.PI * (i + 0.5)) / this.grain));
+    this.attackK = 1 - Math.exp(-1 / (TEAR_SAMPLE.attack * sampleRate));
+    this.tailK = 1 - Math.exp(-Math.log(1000) / (TEAR_SAMPLE.tail * sampleRate));
+    this.panK = 1 - Math.exp(-1 / (PAN_GLIDE * sampleRate));
+    this.limAttack = Math.exp(-1 / (LIMIT_ATTACK * sampleRate));
+    this.limRelease = Math.exp(-1 / (LIMIT_RELEASE * sampleRate));
   }
 
-  /** Nothing queued, nothing pending or held back, and the bank has rung out. */
+  /** The prepared recording (prepareSource); silent until it is set. */
+  setSource(source: TearSource): void {
+    this.total = source.starts.reduce((s, [a, b]) => s + b - a + 1, 0);
+    this.source = this.total > 0 ? source : null;
+  }
+
+  /** Nothing sounding. */
   get idle(): boolean {
-    return this.qCount === 0 && !this.active() && this.quiet > RING_OUT * this.sampleRate;
+    return this.voices.every((v) => v.pos[0] < 0 && v.target === 0);
   }
 
-  private active(): boolean {
-    if (this.pending > 0 || this.recLeft > 0) return true;
-    for (let s = 0; s < SOURCES; s++) {
-      if (this.fracture[s].r1 + this.fracture[s].r2 > 0 || this.slip[s].r1 + this.slip[s].r2 > 0) return true;
+  /** A finger grabs (held) or lets go of the cloth for source s; letting go falls off like the room's tail. */
+  grip(s: number, held: boolean): void {
+    const v = this.voices[s];
+    if (!v) return;
+    v.held = held;
+    if (!held) {
+      v.target = 0;
+      v.rate = 0;
+      v.idle = Infinity;
     }
-    return false;
   }
 
-  /** Append records (RECORD_FLOATS each); when the queue is full the oldest are dropped. */
+  /** Acoustic records of one frame (RECORD_FLOATS each): what the mechanics released per source. */
   push(records: Float32Array): void {
-    for (let o = 0; o + RECORD_FLOATS <= records.length; o += RECORD_FLOATS) {
-      if (this.qCount === QUEUE) this.shift();
-      const at = ((this.qHead + this.qCount) % QUEUE) * RECORD_FLOATS;
-      this.queue.set(records.subarray(o, o + RECORD_FLOATS), at);
-      this.queued += records[o];
-      this.qCount++;
+    const S = TEAR_SAMPLE;
+    let dt = 0;
+    for (let o = 0; o + RECORD_FLOATS <= records.length; o += RECORD_FLOATS) dt += records[o];
+    if (!(dt > 0)) return;
+    const a = 1 - Math.exp(-dt / S.rateTime);
+    for (let s = 0; s < SOURCES; s++) {
+      const v = this.voices[s];
+      if (!v.held) continue;
+      let energy = 0;
+      let cuts = 0;
+      let pan = NaN;
+      for (let o = 0; o + RECORD_FLOATS <= records.length; o += RECORD_FLOATS) {
+        const b = o + sourceAt(s);
+        energy += records[b + SRC.fracture];
+        cuts += records[b + SRC.cuts];
+        if (records[b + SRC.fracture] > 0) pan = records[b + SRC.pan];
+      }
+      v.rate += a * (energy / dt - v.rate);
+      // time since the last cut runs with the audio (process): records stop when the cloth rests
+      if (cuts > 0) v.idle = 0;
+      if (!Number.isNaN(pan)) {
+        v.panTarget = PAN_WIDTH * Math.max(-1, Math.min(1, pan));
+        if (!v.panSet) v.pan = v.panTarget;
+        v.panSet = true;
+      }
+      const tearing = v.idle < S.tearWindow;
+      v.target = tearing ? Math.min(S.maxGain, Math.sqrt(Math.max(0, v.rate) / S.referenceRate)) : 0;
     }
   }
 
-  private shift(): number {
-    const at = this.qHead * RECORD_FLOATS;
-    this.qHead = (this.qHead + 1) % QUEUE;
-    this.qCount--;
-    this.queued = this.qCount === 0 ? 0 : this.queued - this.queue[at];
-    return at;
-  }
-
-  // ---------------------------------------------------------------- random numbers
-
-  private bits(): number {
+  private rand(): number {
     let x = this.seed;
     x ^= x << 13;
     x ^= x >>> 17;
     x ^= x << 5;
     this.seed = x >>> 0;
-    return this.seed;
+    return (this.seed + 0.5) / 4294967296;
   }
 
-  private rand(): number {
-    return (this.bits() + 0.5) / 4294967296;
-  }
-
-  private exponential(): number {
-    return -Math.log(this.rand());
-  }
-
-  private gauss(): number {
-    if (!Number.isNaN(this.spare)) {
-      const s = this.spare;
-      this.spare = NaN;
-      return s;
+  /** A slice start from the tearing passages, chosen at random. */
+  private slice(): number {
+    const starts = this.source!.starts;
+    let r = Math.floor(this.rand() * this.total);
+    for (const [a, b] of starts) {
+      if (r <= b - a) return a + r;
+      r -= b - a + 1;
     }
-    const r = Math.sqrt(-2 * Math.log(this.rand()));
-    const a = 2 * Math.PI * this.rand();
-    this.spare = r * Math.sin(a);
-    return r * Math.cos(a);
-  }
-
-  /** Avalanche size in bundles: P(s > x) ~ x^(1 - exponent) on [1, largest]. */
-  private avalanche(): number {
-    const F = TEAR_VOICE.fracture;
-    const a = F.exponent - 1;
-    return (1 - this.rand() * (1 - F.largest ** -a)) ** (-1 / a);
-  }
-
-  private band(cdf: Float64Array): number {
-    const u = this.rand();
-    let b = 0;
-    while (b < BANDS - 1 && cdf[b] < u) b++;
-    return b;
-  }
-
-  // ---------------------------------------------------------------- events
-
-  /** Add a wavelet of acoustic energy e (J) in band b at block sample i. */
-  private wavelet(exc: Float32Array, n: number, i: number, e: number, b: number, pan: number): void {
-    const v = (this.rand() < 0.5 ? -1 : 1) * Math.sqrt(TEAR_VOICE.gain * e) * this.bands[b].norm;
-    // equal-power pan
-    const a = (Math.max(-1, Math.min(1, pan)) + 1) * 0.25 * Math.PI;
-    exc[2 * b * n + i] += v * Math.cos(a) * Math.SQRT2;
-    exc[(2 * b + 1) * n + i] += v * Math.sin(a) * Math.SQRT2;
-  }
-
-  /** Schedule the pull-out chatter of source s (record block at o) over [start, start + length) samples. */
-  private pullouts(r: Float32Array, o: number, s: number, start: number, length: number): void {
-    const P = TEAR_VOICE.pullout;
-    const pulls = r[o + SRC.pullouts];
-    if (!(pulls > 0)) return;
-    const n = Math.min(32, pulls);
-    const each = (P.efficiency * r[o + SRC.pulloutWork]) / n;
-    const decay = 0.75;
-    for (let q = 0; q < n && this.pending < PENDING - 8; q++) {
-      const imp = P.impulses[0] + Math.floor(this.rand() * (P.impulses[1] - P.impulses[0] + 1));
-      const period = (P.period[0] + this.rand() * (P.period[1] - P.period[0])) * this.sampleRate;
-      const b = this.band(this.cdf.friction);
-      const p = this.pan[s] + 0.15 * this.gauss();
-      let t = start + this.rand() * length;
-      // decaying chatter: weights 1, 0.75, 0.56, ... normalised to the pull-out's energy
-      const sum = (1 - decay ** imp) / (1 - decay);
-      for (let i = 0; i < imp; i++) {
-        const k = this.pending++;
-        this.evT[k] = t;
-        this.evE[k] = (each * decay ** i) / sum;
-        this.evB[k] = b;
-        this.evP[k] = p;
-        t += period * (0.85 + 0.3 * this.rand());
-      }
-    }
-  }
-
-  /** Start the next queued record at block offset `pos`; false when none may start yet. */
-  private nextRecord(pos: number, n: number): boolean {
-    const V = TEAR_VOICE;
-    const fs = this.sampleRate;
-    if (!this.playing) {
-      if (this.qCount === 0) {
-        this.waiting = 0;
-        return false;
-      }
-      // after silence, start once a cushion is queued or the first record has waited for it
-      this.waiting += n - pos;
-      if (this.queued < V.preroll && this.waiting < V.preroll * fs) return false;
-      this.playing = true;
-    }
-    if (this.qCount === 0) {
-      this.playing = false;
-      this.waiting = 0;
-      return false;
-    }
-    const behind = this.queued;
-    const at = this.shift();
-    // a queue grown beyond the cushion (frame hitches) is played faster until it shrinks
-    const speed = behind > V.rush ? 2 : behind > V.catchUp ? 1.25 : 1;
-    const length = Math.max(1, (this.queue[at] * fs) / speed);
-    for (let s = 0; s < SOURCES; s++) {
-      const o = at + sourceAt(s);
-      this.pan[s] = this.queue[o + SRC.pan];
-      this.fracture[s].inflow = this.queue[o + SRC.fracture] / length;
-      this.slip[s].inflow = (V.slip.efficiency * this.queue[o + SRC.slipRasp]) / V.slip.refSpeed / length;
-      this.pullouts(this.queue, o, s, this.clock + pos, length);
-    }
-    this.recLeft = length;
-    return true;
-  }
-
-  /**
-   * Run one stream over block samples [from, to): energy flows through the two reservoir stages and
-   * events fire as a Poisson process at the drained rate over `unit` (energy per event on average).
-   */
-  private run(st: Stream, exc: Float32Array, n: number, from: number, to: number, unit: number, fracture: boolean, pan: number): boolean {
-    if (st.r1 + st.r2 <= 0 && st.inflow <= 0) return false;
-    const cdf = fracture ? this.cdf.fracture : this.cdf.friction;
-    const toJ = fracture ? TEAR_VOICE.recoilLength : 1;
-    let fired = false;
-    for (let i = from; i < to; i++) {
-      st.r1 += st.inflow;
-      const d1 = st.r1 * this.drain;
-      st.r1 -= d1;
-      st.r2 += d1;
-      const d = st.r2 * this.drain;
-      st.r2 -= d;
-      st.phase += d / unit;
-      for (let k = 0; st.phase >= st.threshold; k++) {
-        // beyond a few events in one sample the rest merge into one (bounded work at any release)
-        const merged = k === MAX_EVENTS_PER_SAMPLE - 1 ? st.phase : 1;
-        st.phase = merged === 1 ? st.phase - st.threshold : 0;
-        st.threshold = this.exponential();
-        // fracture: an avalanche of fibre bundles; friction: exponentially distributed energies
-        const e = merged * (fracture ? (this.avalanche() / this.meanSize) * unit : this.exponential() * unit);
-        this.wavelet(exc, n, i, e * toJ, this.band(cdf), pan + 0.12 * this.gauss());
-        fired = true;
-      }
-    }
-    // a negligible remainder (below a millionth of an event) is dropped so the voice can go idle
-    if (st.inflow === 0 && st.r1 + st.r2 < 1e-6 * unit) st.r1 = st.r2 = 0;
-    return fired;
+    return starts[0][0];
   }
 
   /** Render one block into L and R (equal lengths). */
   process(L: Float32Array, R: Float32Array): void {
-    const n = L.length;
-    if (this.qCount === 0 && !this.active() && this.quiet > RING_OUT * this.sampleRate) {
-      L.fill(0);
-      R.fill(0);
-      this.clock += n;
-      this.quiet += n;
-      this.waiting = 0;
-      return;
-    }
-    if (this.exc.length < 2 * BANDS * n) this.exc = new Float32Array(2 * BANDS * n);
-    const exc = this.exc;
-    exc.fill(0, 0, 2 * BANDS * n);
-    let excited = false;
-    const F = TEAR_VOICE.fracture;
-    const fractureUnit = this.meanSize * F.bundle * F.fibreEnergy;
-    for (let pos = 0; pos < n; ) {
-      if (this.recLeft <= 0 && !this.nextRecord(pos, n)) {
-        for (let s = 0; s < SOURCES; s++) this.fracture[s].inflow = this.slip[s].inflow = 0;
-      }
-      const take = this.recLeft > 0 ? Math.min(n - pos, Math.ceil(this.recLeft)) : n - pos;
-      for (let s = 0; s < SOURCES; s++) {
-        if (this.run(this.fracture[s], exc, n, pos, pos + take, fractureUnit, true, this.pan[s])) excited = true;
-        if (this.run(this.slip[s], exc, n, pos, pos + take, TEAR_VOICE.slip.quantum, false, this.pan[s])) excited = true;
-      }
-      this.recLeft = Math.max(0, this.recLeft - take);
-      pos += take;
-    }
-    // pull-out impulses due in this block (compacting the pending list)
-    const end = this.clock + n;
-    let keep = 0;
-    for (let k = 0; k < this.pending; k++) {
-      const t = this.evT[k];
-      if (t >= end) {
-        if (keep !== k) {
-          this.evT[keep] = t;
-          this.evE[keep] = this.evE[k];
-          this.evB[keep] = this.evB[k];
-          this.evP[keep] = this.evP[k];
-        }
-        keep++;
-        continue;
-      }
-      this.wavelet(exc, n, Math.max(0, Math.floor(t - this.clock)), this.evE[k], this.evB[k], this.evP[k]);
-      excited = true;
-    }
-    this.pending = keep;
-    this.quiet = excited ? 0 : this.quiet + n;
-    // band bank
     L.fill(0);
     R.fill(0);
-    for (let b = 0; b < BANDS; b++) {
-      const { a1, a2, a3 } = this.bands[b];
-      for (let ch = 0; ch < 2; ch++) {
-        const out = ch === 0 ? L : R;
-        const off = (2 * b + ch) * n;
-        let s1 = this.s1[2 * b + ch];
-        let s2 = this.s2[2 * b + ch];
-        for (let i = 0; i < n; i++) {
-          const v3 = exc[off + i] - s2;
-          const v1 = a1 * s1 + a2 * v3;
-          const v2 = s2 + a2 * s1 + a3 * v3;
-          s1 = 2 * v1 - s1;
-          s2 = 2 * v2 - s2;
-          out[i] += v1;
+    const src = this.source;
+    if (!src) return;
+    const n = L.length;
+    const G = this.grain;
+    const H = G / 2;
+    const win = this.window;
+    const pcm = src.pcm;
+    let any = false;
+    for (const v of this.voices) {
+      if (v.pos[0] < 0) {
+        if (v.target === 0) continue;
+        // a tear starting: two slices, the second half way through
+        v.pos[0] = this.slice();
+        v.pos[1] = this.slice();
+        v.age = 0;
+        v.gain = 0;
+      }
+      any = true;
+      v.idle += n / this.sampleRate;
+      if (v.idle >= TEAR_SAMPLE.tearWindow) v.target = 0;
+      for (let i = 0; i < n; i++) {
+        v.gain += (v.target > v.gain ? this.attackK : this.tailK) * (v.target - v.gain);
+        v.pan += this.panK * (v.panTarget - v.pan);
+        const a0 = v.age;
+        const a1 = a0 < H ? a0 + H : a0 - H;
+        const y = (pcm[v.pos[0] + a0] * win[a0] + pcm[v.pos[1] + a1] * win[a1]) * v.gain * src.level;
+        const ang = (v.pan + 1) * 0.25 * Math.PI;
+        L[i] += y * Math.cos(ang) * Math.SQRT2;
+        R[i] += y * Math.sin(ang) * Math.SQRT2;
+        // every half slice one of the two ends and a new one starts in its place
+        if (++v.age === H) v.pos[1] = this.slice();
+        else if (v.age === G) {
+          v.age = 0;
+          v.pos[0] = this.slice();
         }
-        // flush denormals once the band has rung out
-        this.s1[2 * b + ch] = Math.abs(s1) < 1e-15 ? 0 : s1;
-        this.s2[2 * b + ch] = Math.abs(s2) < 1e-15 ? 0 : s2;
+      }
+      if (v.target === 0 && v.gain < SILENT) {
+        v.pos[0] = -1;
+        if (!v.held) v.panSet = false;
       }
     }
-    // peak limiter (fast attack, slow release) and a soft knee near full scale
+    if (!any) return;
+    // peak limiter (fast attack, slow release) and a soft knee near full scale: several hands at once
     let env = this.env;
     let g = this.limGain;
     for (let i = 0; i < n; i++) {
       const p = Math.max(Math.abs(L[i]), Math.abs(R[i]));
-      env = p > env ? p : env * this.release + p * (1 - this.release);
+      env = p > env ? p : env * this.limRelease + p * (1 - this.limRelease);
       const target = env > LIMIT ? LIMIT / env : 1;
-      g = target < g ? target + (g - target) * this.attack : target + (g - target) * this.release;
+      g = target < g ? target + (g - target) * this.limAttack : target + (g - target) * this.limRelease;
       L[i] = softClip(L[i] * g);
       R[i] = softClip(R[i] * g);
     }
     this.env = env;
     this.limGain = g;
-    this.clock += n;
   }
 }
 

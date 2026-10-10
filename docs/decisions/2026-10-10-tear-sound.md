@@ -1,5 +1,8 @@
 # Tear sound, multi-touch, page UI (2026-10-10)
 
+The sound model below was replaced the same day: `2026-10-10-tear-sound-structure.md`. Records,
+transport, multi-touch and UI still hold.
+
 ## Sound: what the recording is
 
 `refs/fabric_tear_sound_sample.mp3` (three tears, 24 kHz mp3) is not used at runtime; it is the

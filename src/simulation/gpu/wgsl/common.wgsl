@@ -328,11 +328,11 @@ fn bracketOf(i: u32, n: u32) -> Bracket {
 // substep (the engine copies and clears them after every substep; decoded by src/audio/record.ts).
 // One block of ACOUSTIC_STRIDE slots per sound source (one per finger: an emission belongs to the
 // nearest held grip, interaction.ts), at ACOUSTIC + ACOUSTIC_STRIDE * source:
-// +0 strain energy released by fibre fracture (1e-5 J/m), +1 yarn ends pulled out of a crossing
-// (count), +2 their friction work (1e-8 J), +3 crossing slip work times slip speed (1e-8 J mm/s),
-// +4..6 fracture-weighted position sum (mm x damage code, i32), +7 its weight (damage codes).
+// +0 strain energy released by fibre fracture (1e-5 J/m), +1..3 fracture-weighted position sum
+// (mm x damage code, i32), +4 its weight (damage codes), +5 yarns cut through (count). Only tearing is
+// heard: no slip, pull-out or settling sound.
 const ACOUSTIC: u32 = 16u;
-const ACOUSTIC_STRIDE: u32 = 8u;
+const ACOUSTIC_STRIDE: u32 = 6u;
 
 // Sound source of an emission at p: the nearest anchor in use (w > 0), else the first.
 fn nearestSource(p: vec3<f32>, anchors: array<vec4<f32>, 4>) -> u32 {
