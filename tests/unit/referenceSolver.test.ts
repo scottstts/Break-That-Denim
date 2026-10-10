@@ -15,7 +15,7 @@ function coupon(nu: number, nv: number, overrides: Partial<LayerSpec> = {}): Lay
     compressV: 0.005,
     shear: 0.01,
     collarRows: 1,
-    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0 },
+    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0, sparseFrom: 2 },
     wearStrengthLoss: [0, 0],
     seed: 7,
     perturbation: 0.2e-3,

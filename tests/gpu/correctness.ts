@@ -35,7 +35,7 @@ function coupon(nu: number, nv: number, extra: Partial<LayerSpec> = {}): LayerSp
     compressV: 0.02,
     shear: 0.02,
     collarRows: 2,
-    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0 },
+    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0, sparseFrom: 2 },
     wearStrengthLoss: [0, 0],
     seed: 7,
     perturbation: 0.4e-3,
@@ -172,7 +172,8 @@ async function correctness(device: GPUDevice): Promise<void> {
   const N = scene.nodeCount;
   const { xs, vs } = copyState(cpu, N);
   gpu.setState(xs, vs);
-  gpu.setSegments(cpu.restLength, cpu.maxExt, cpu.segFlags, cpu.tails);
+  gpu.setSegments(cpu, cpu.tails);
+  gpu.setField(cpu.fieldDamage);
 
   cpu.predict();
   await submit(device, (p) => {
@@ -240,7 +241,8 @@ async function dynamics(device: GPUDevice, scene: ReturnType<typeof compileScene
   const N = scene.nodeCount;
   const { xs, vs } = copyState(cpu, N);
   gpu.setState(xs, vs);
-  gpu.setSegments(cpu.restLength, cpu.maxExt, cpu.segFlags, cpu.tails);
+  gpu.setSegments(cpu, cpu.tails);
+  gpu.setField(cpu.fieldDamage);
   const steps = 60;
   for (let k = 0; k < steps; k++) cpu.substep();
   for (let k = 0; k < steps; k += 4) {
@@ -291,7 +293,8 @@ async function torn(device: GPUDevice): Promise<void> {
   const N = scene.nodeCount;
   const { xs, vs } = copyState(cpu, N);
   gpu.setState(xs, vs);
-  gpu.setSegments(cpu.restLength, cpu.maxExt, cpu.segFlags, cpu.tails);
+  gpu.setSegments(cpu, cpu.tails);
+  gpu.setField(cpu.fieldDamage);
   cpu.predict();
   await submit(device, (p) => {
     gpu.encodePredict(p);

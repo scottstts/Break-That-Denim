@@ -18,7 +18,7 @@ struct LayerMat {
   yarn: array<Yarn, 2>,
   // shearStiffness, crossingFriction, crossingWrap, pitchU
   a: vec4<f32>,
-  // pitchV, normal air drag (N s / m^3), failure strands per span of family u, of family v
+  // pitchV, normal air drag (N s / m^3), unused, unused
   b: vec4<f32>,
 };
 
@@ -43,22 +43,22 @@ struct NodeStatic {
 
 struct Seg {
   rest: f32,
-  // bundle peak tension (yarn k peaks at peak * multiplier k)
-  peak: f32,
+  // fraction of the span's yarn load capacity that is intact (yarn damage field, yarnfield.wgsl)
+  intact: f32,
+  // softening opening of its yarns past their peak (m)
   soft: f32,
-  // packed u8 strength multiplier per bundled yarn (0 = absent), see axial.ts unpackYarnPeak
-  yarnPeaks: u32,
-  maxExt: f32,
-  // bits 0..2 SEG_*, bits 8..11 yarn k absent or separated
+  // bit q: bundled yarn q has separated within the span
+  cutMask: u32,
+  spare0: f32,
+  // bits 0..2 SEG_*
   flags: u32,
+  // where a separated span split into tails (fraction from the owner)
   failSite: f32,
-  // packed u8 failure site per bundled yarn (fraction from the owning node, /255; render only)
-  yarnSites: u32,
+  spare1: u32,
 };
 
 const SEG_EXISTS: u32 = 1u;
 const SEG_BROKEN: u32 = 2u;
-const SEG_YARN_SHIFT: u32 = 8u;
 const NODE_PINNED: u32 = 1u;
 
 struct LevelInfo {
@@ -95,60 +95,21 @@ fn strainAtTension(y: Yarn, t: f32) -> f32 {
   return 2.0 * t / (y.eaLow + sqrt(y.eaLow * y.eaLow + 4.0 * a * t));
 }
 
-fn envelopeTension(peak: f32, peakExt: f32, soft: f32, ext: f32) -> f32 {
-  if (ext <= peakExt) { return peak; }
-  return max(0.0, peak * (1.0 - (ext - peakExt) / soft));
+// Damage of one yarn of a bundled span (axial.ts yarnDamage): triangular cohesive law on the yarn's
+// own tension (peak peakY, softening over softStrain); y is the bundle law of B yarns, the yarn keeps
+// the fraction area of its fibres.
+fn yarnDamage(y: Yarn, B: f32, area: f32, peakY: f32, softStrain: f32, eps: f32) -> f32 {
+  let ep = strainAtTension(y, peakY * B / area);
+  if (eps <= ep) { return 0.0; }
+  if (eps >= ep + softStrain) { return 1.0; }
+  let tEnv = peakY * (1.0 - (eps - ep) / softStrain);
+  let tEl = area * axialTension(y, eps) / B;
+  return clamp(1.0 - tEnv / max(tEl, 1e-12), 0.0, 1.0);
 }
 
-// Damaged tension and PSD solver tangent of one yarn law (peak tension `peak`) for committed history
-// maxExt. Returns (T, K).
-fn damagedResponse(y: Yarn, L: f32, peak: f32, soft: f32, maxExt: f32, eps: f32) -> vec2<f32> {
-  let peakExt = strainAtTension(y, peak) * L;
-  let ext = eps * L;
-  let tEl = axialTension(y, eps);
-  let kEl = axialStiffness(y, eps);
-  var f = 1.0;
-  if (maxExt > peakExt) {
-    let tAtMax = axialTension(y, maxExt / L);
-    f = select(0.0, envelopeTension(peak, peakExt, soft, maxExt) / tAtMax, tAtMax > 0.0);
-  }
-  let tSec = f * tEl;
-  if (ext > peakExt) {
-    let tEnv = envelopeTension(peak, peakExt, soft, ext);
-    if (tEnv < tSec) {
-      return vec2<f32>(tEnv, select(0.0, tEnv / tEl * kEl, tEl > 0.0));
-    }
-  }
-  return vec2<f32>(tSec, f * kEl);
-}
-
-fn yarnPeakMultiplier(packed: u32, k: u32) -> f32 {
-  let u = (packed >> (8u * k)) & 0xFFu;
-  return select(0.4 + 1.2 * f32(u - 1u) / 254.0, 0.0, u == 0u);
-}
-
-fn strandsOf(mat: LayerMat, f: u32) -> u32 { return u32(select(mat.b.z, mat.b.w, f == 1u)); }
-
-// Strand-level damage in a bundled span of b strands (axial.ts bundleResponse): mean of the
-// per-strand responses.
-fn bundleResponse(y: Yarn, b: u32, L: f32, s: Seg, eps: f32) -> vec2<f32> {
-  var r = vec2<f32>(0.0);
-  for (var k = 0u; k < b; k++) {
-    let m = yarnPeakMultiplier(s.yarnPeaks, k);
-    if (m == 0.0) { continue; }
-    r += damagedResponse(y, L, s.peak * m, s.soft, s.maxExt, eps);
-  }
-  return r / f32(b);
-}
-
-// Bit k: strand k of the bundle (of b strands) is absent or fully separated.
-fn bundleBrokenMask(y: Yarn, b: u32, L: f32, s: Seg) -> u32 {
-  var mask = 0u;
-  for (var k = 0u; k < b; k++) {
-    let m = yarnPeakMultiplier(s.yarnPeaks, k);
-    if (m == 0.0 || s.maxExt >= strainAtTension(y, s.peak * m) * L + s.soft) { mask |= 1u << k; }
-  }
-  return mask;
+// Tension and tangent of a span with intact yarn fraction s.intact (axial.ts spanResponse).
+fn spanResponse(y: Yarn, s: Seg, eps: f32) -> vec2<f32> {
+  return s.intact * vec2<f32>(axialTension(y, eps), axialStiffness(y, eps));
 }
 
 // Finiteness by bit pattern (immune to fast-math assumptions about NaN).

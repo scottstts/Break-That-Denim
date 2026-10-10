@@ -26,7 +26,9 @@ export default async function main(args: string[]): Promise<void> {
   const sBytes = solver.segs.size;
   device.queue.writeBuffer(solver.x, 0, buf, 0, xBytes);
   device.queue.writeBuffer(solver.segs, 0, buf, xBytes, sBytes);
-  if (buf.byteLength >= xBytes + sBytes + solver.tails.size) device.queue.writeBuffer(solver.tails, 0, buf, xBytes + sBytes, solver.tails.size);
+  const tBytes = solver.tails.size;
+  if (buf.byteLength >= xBytes + sBytes + tBytes) device.queue.writeBuffer(solver.tails, 0, buf, xBytes + sBytes, tBytes);
+  if (buf.byteLength >= xBytes + sBytes + tBytes + solver.field.size) device.queue.writeBuffer(solver.field, 0, buf, xBytes + sBytes + tBytes, solver.field.size);
   const format: GPUTextureFormat = 'rgba8unorm';
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(width, height);

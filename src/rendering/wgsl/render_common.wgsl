@@ -32,8 +32,10 @@ struct LayerR {
   twill: vec4<u32>,
   // refined-vertex offset, refined row length, cell offset, material id
   refine: vec4<u32>,
-  // edge field: first texel row, texel size (m), texture width, texture height (texels)
+  // edge field: first texel row, unused, texture width, texture height (texels)
   edge: vec4<f32>,
+  // yarn damage field: first crossing, warps K, picks M, unused
+  field: vec4<u32>,
 };
 
 struct RenderU {
@@ -56,10 +58,6 @@ const PI: f32 = 3.14159265;
 // Yarns carried by one lattice span of family f (1 = warp spans: warps per column; 0 = picks per row).
 fn bundleOf(L: LayerR, f: u32) -> u32 { return select((L.lattice.w >> 8u) & 0xFFu, L.lattice.w & 0xFFu, f == 1u); }
 fn bundleMax(L: LayerR) -> u32 { return max((L.lattice.w >> 8u) & 0xFFu, L.lattice.w & 0xFFu); }
-// Yarns per failure strand of family f's spans.
-fn yarnsPerStrand(L: LayerR, f: u32) -> u32 {
-  return bundleOf(L, f) / select(L.lattice.w >> 24u, (L.lattice.w >> 16u) & 0xFFu, f == 1u);
-}
 
 // ---------------------------------------------------------------- hashing and noise
 
@@ -191,33 +189,45 @@ fn weftHit(L: LayerR, m: i32, U: f32, V: f32, su: f32, sv: f32) -> Hit {
   return o;
 }
 
-// ---------------------------------------------------------------- torn cells: groups and cracks
+// ---------------------------------------------------------------- torn cells: yarn-level ownership
 //
-// A torn cell (one with a separated span) splits into groups of corners still joined by its intact
-// spans. Edges in counter-clockwise order: 0 bottom (c0-c1), 1 right (c1-c3), 2 top (c3-c2), 3 left
-// (c2-c0); the corner before edge k in that order is ccwCorner(k). Each broken edge is crossed by the
-// crack where its yarns failed. A crack leaves every crossing at right angles to the yarns it cut, so
-// it continues smoothly into the neighbouring cell instead of following the lattice; a two-way split
-// joins its two crossings directly, three or more cracks meet at a junction, and a lone broken edge is
-// a crack tip ending inside the cell. Each group owns the part of the cell on its side of the cracks
-// and carries it away when it separates: the crack is the free edge, not a lattice line.
-// Geometry is in metres in the cell's rest frame (origin at c0, +u along s, +v along t).
+// A torn cell has crossing edges: spans that no longer join two live corners (separated, or leading
+// to debris that fell away) and still have a live end. Its live corners split into groups joined by
+// intact spans (the lattice's coarse topology). Which yarns each group carries is decided at the
+// yarn level from the damage field: the cell's crossings are flooded from each group's corners through
+// uncut yarn segments (a warp links a crossing to the next pick, a pick to the next warp), so the
+// boundary between groups runs exactly where the yarns separated, at the real yarn pitch and in any
+// direction. Only woven crossings (both yarns present) are flooded, plus two crossings of yarn end
+// beyond them; a yarn running on alone is a thread (yarn_geom.wgsl), and material no group reaches
+// has fallen away. Each group draws the whole cell on its own control net and keeps its
+// crossings, so a separating group carries its yarns away with it.
+//
+// Positions k = 0..3 run counter-clockwise over the corners (ccwCorner); edge k joins positions k and
+// k + 1: 0 bottom (c0-c1), 1 right (c1-c3), 2 top (c3-c2), 3 left (c2-c0).
 
-// tornGeo record per torn cell (torn.wgsl): info (cell, broken mask, packed crossings, layer as bits);
-// the cell's cracks (TORN_CRACKS + 2 i: Bezier lo, hi in metres from c0, up to four); then per corner a
-// 16-point control net (w < 0: the corner does not lead a group) followed by its group's free-edge
-// curves (groupCurves: four vec4).
-const TORN_STRIDE: u32 = 89u;
-const TORN_CRACKS: u32 = 1u;
-fn tornSlot(k: u32, c: u32) -> u32 { return k * TORN_STRIDE + 9u + 20u * c; }
-// Edge fibres rooted along the cracks of one torn cell (fuzz.wgsl).
+// tornGeo record per torn cell (torn.wgsl): info (cell, cm, unused, layer as bits); crossing labels
+// (TORN_LABELS: 4 vec4 = 128 4-bit labels, the leader corner of the owning group or 0xF); then per
+// corner a 16-point control net (w < 0: the corner does not lead a group).
+const TORN_STRIDE: u32 = 69u;
+const TORN_LABELS: u32 = 1u;
+fn tornSlot(k: u32, c: u32) -> u32 { return k * TORN_STRIDE + 5u + 16u * c; }
+// Crossings of a cell's label grid: at most 16 columns x 8 rows.
+const CELL_MAX_K: u32 = 16u;
+const CELL_MAX_M: u32 = 8u;
+const NO_LABEL: u32 = 0xFu;
+// Edge fibres rooted along the free edges of one torn cell (fuzz.wgsl).
 const FIBERS_PER_CELL: u32 = 96u;
 
 fn tornInfo(geo: vec4<f32>) -> vec4<u32> { return bitcast<vec4<u32>>(geo); }
 
-// Corner index (bit 0: +i, bit 1: +j) at counter-clockwise position k.
+// Cell meta word: crossing edges (bits 0-3), dead corners (4-7, by corner index).
+fn makeMeta(mask: u32, dead: u32) -> u32 { return mask | (dead << 4u); }
+fn metaMask(m: u32) -> u32 { return m & 0xFu; }
+fn metaDead(m: u32) -> u32 { return (m >> 4u) & 0xFu; }
+
+// Corner index (bit 0: +i, bit 1: +j) at counter-clockwise position k (an involution: it also maps a
+// corner index to its position).
 fn ccwCorner(k: u32) -> u32 { return (k & 3u) ^ ((k & 3u) >> 1u); }
-fn cornerPos(c: u32, size: vec2<f32>) -> vec2<f32> { return vec2<f32>(f32(c & 1u), f32(c >> 1u)) * size; }
 
 // Span (2 * owner + family) of edge e of the cell whose lower-left node is n00, in a lattice of row
 // length nx.
@@ -230,129 +240,8 @@ fn edgeSpan(n00: u32, nx: u32, e: u32) -> u32 {
   }
 }
 
-// Where the crack crosses a broken span (fraction from its owning node): the yarns' failure site,
-// drawn a little toward the middle so neighbouring crossings do not zigzag.
-fn crossingOf(failSite: f32) -> f32 { return 0.5 + 0.7 * (clamp(failSite, 0.0, 1.0) - 0.5); }
-
-fn edgeCross(e: u32, c: f32, size: vec2<f32>) -> vec2<f32> {
-  switch e {
-    case 0u: { return vec2<f32>(c, 0.0) * size; }
-    case 1u: { return vec2<f32>(1.0, c) * size; }
-    case 2u: { return vec2<f32>(c, 1.0) * size; }
-    default: { return vec2<f32>(0.0, c) * size; }
-  }
-}
-
-fn edgeInward(e: u32) -> vec2<f32> {
-  switch e {
-    case 0u: { return vec2<f32>(0.0, 1.0); }
-    case 1u: { return vec2<f32>(-1.0, 0.0); }
-    case 2u: { return vec2<f32>(0.0, -1.0); }
-    default: { return vec2<f32>(1.0, 0.0); }
-  }
-}
-
-struct Torn {
-  // broken edges (bit e)
-  mask: u32,
-  // rest cell size (m)
-  size: vec2<f32>,
-  // crack crossings of the edges (m from c0; meaningful for broken edges)
-  P: array<vec2<f32>, 4>,
-  // junction of three or more cracks, or the end of a lone crack (tip)
-  J: vec2<f32>,
-};
-
-// Crossing fractions are packed as u8 per edge (bits 8e).
-fn makeTorn(mask: u32, crossings: u32, size: vec2<f32>) -> Torn {
-  var o: Torn;
-  o.mask = mask;
-  o.size = size;
-  var sum = vec2<f32>(0.0);
-  for (var e = 0u; e < 4u; e++) {
-    o.P[e] = edgeCross(e, f32((crossings >> (8u * e)) & 0xFFu) / 255.0, size);
-    if (((mask >> e) & 1u) == 1u) { sum += o.P[e]; }
-  }
-  let k = countOneBits(mask);
-  if (k == 1u) {
-    let e = firstTrailingBit(mask);
-    o.J = mix(o.P[e], 0.5 * size, 0.8);
-  } else {
-    o.J = sum / f32(max(k, 1u));
-  }
-  return o;
-}
-
-// Edge of the i-th set bit of mask.
-fn nthEdge(mask: u32, i: u32) -> u32 {
-  var seen = 0u;
-  for (var e = 0u; e < 4u; e++) {
-    if (((mask >> e) & 1u) == 1u) {
-      if (seen == i) { return e; }
-      seen++;
-    }
-  }
-  return 0u;
-}
-
-// Number of cracks: one for a two-way split, else one per broken edge (to the junction or tip).
-fn crackCount(t: Torn) -> u32 {
-  let k = countOneBits(t.mask);
-  return select(k, 1u, k == 2u);
-}
-
-// Cubic Bezier control points of crack i. A two-way split runs from its lower to its higher edge;
-// otherwise crack i runs from the i-th broken edge to the junction.
-fn crackBezier(t: Torn, i: u32) -> array<vec2<f32>, 4> {
-  if (countOneBits(t.mask) == 2u) {
-    let a = firstTrailingBit(t.mask);
-    let b = firstLeadingBit(t.mask);
-    let al = 0.39 * distance(t.P[a], t.P[b]);
-    return array<vec2<f32>, 4>(t.P[a], t.P[a] + al * edgeInward(a), t.P[b] + al * edgeInward(b), t.P[b]);
-  }
-  let e = nthEdge(t.mask, i);
-  let b1 = t.P[e] + 0.45 * distance(t.P[e], t.J) * edgeInward(e);
-  return array<vec2<f32>, 4>(t.P[e], b1, mix(t.J, b1, 0.35), t.J);
-}
-
-
-// Segments per crack when its curve is evaluated as a polyline.
-const CRACK_SEGS: u32 = 6u;
-
-fn segmentDistance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
-  let ab = b - a;
-  let h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-20), 0.0, 1.0);
-  return length(p - a - h * ab);
-}
-
-// Cubic Bezier packed as (b0, b1) and (b2, b3), evaluated without private arrays (per-fragment code).
-fn bezierP(lo: vec4<f32>, hi: vec4<f32>, s: f32) -> vec2<f32> {
-  let r = 1.0 - s;
-  return r * r * r * lo.xy + 3.0 * r * r * s * lo.zw + 3.0 * r * s * s * hi.xy + s * s * s * hi.zw;
-}
-fn bezierTangentP(lo: vec4<f32>, hi: vec4<f32>, s: f32) -> vec2<f32> {
-  let r = 1.0 - s;
-  return 3.0 * r * r * (lo.zw - lo.xy) + 6.0 * r * s * (hi.xy - lo.zw) + 3.0 * s * s * (hi.zw - hi.xy);
-}
-
-fn bezierDistance(lo: vec4<f32>, hi: vec4<f32>, p: vec2<f32>) -> f32 {
-  var d = 1e9;
-  var a = lo.xy;
-  for (var k = 1u; k <= CRACK_SEGS; k++) {
-    let b = bezierP(lo, hi, f32(k) / f32(CRACK_SEGS));
-    d = min(d, segmentDistance(p, a, b));
-    a = b;
-  }
-  return d;
-}
-
-fn packBezier(B: array<vec2<f32>, 4>, reverse: bool) -> array<vec4<f32>, 2> {
-  if (reverse) { return array<vec4<f32>, 2>(vec4<f32>(B[3], B[2]), vec4<f32>(B[1], B[0])); }
-  return array<vec4<f32>, 2>(vec4<f32>(B[0], B[1]), vec4<f32>(B[2], B[3]));
-}
-
-// Group of the corner at counter-clockwise position k: the broken edges entering (a) and leaving (b)
-// its run of corners, packed a | b << 2. With fewer than two broken edges the cell is one group.
+// Group of the corner at counter-clockwise position k: the crossing edges entering (a) and leaving (b)
+// its run of corners, packed a | b << 2. With fewer than two crossing edges the cell is one group.
 fn groupOf(mask: u32, k: u32) -> u32 {
   var a = (k + 3u) & 3u;
   for (var q = 0u; q < 4u; q++) {
@@ -373,105 +262,50 @@ fn groupLeader(mask: u32, g: u32) -> u32 {
   return ccwCorner((g & 3u) + 1u);
 }
 
-// Free edge of group g (a | b << 2) as two Beziers (lo, hi, lo, hi): from crossing b back to
-// crossing a. A two-way split has one curve (the second unused); three or more cracks give b's crack
-// out to the junction and a's crack back from it. A crack tip is the first curve alone.
-fn groupCurves(t: Torn, g: u32) -> array<vec4<f32>, 4> {
-  let k = countOneBits(t.mask);
-  if (k < 2u) {
-    let c = packBezier(crackBezier(t, 0u), false);
-    return array<vec4<f32>, 4>(c[0], c[1], c[0], c[1]);
-  }
-  let a = g & 3u;
-  let b = g >> 2u;
-  if (k == 2u) {
-    // the crack runs from the lower edge: forward when that is b
-    let c = packBezier(crackBezier(t, 0u), firstTrailingBit(t.mask) != b);
-    return array<vec4<f32>, 4>(c[0], c[1], c[0], c[1]);
-  }
-  var ib = 0u;
-  var ia = 0u;
-  for (var e = 0u; e < 4u; e++) {
-    if (((t.mask >> e) & 1u) == 0u) { continue; }
-    if (e < b) { ib++; }
-    if (e < a) { ia++; }
-  }
-  let cb = packBezier(crackBezier(t, ib), false);
-  let ca = packBezier(crackBezier(t, ia), true);
-  return array<vec4<f32>, 4>(cb[0], cb[1], ca[0], ca[1]);
+// Crossing grid of cell (ci, cj): first warp and pick (fine indices) and the counts inside the cell
+// (crossings on its edge lines included).
+fn cellGrid(L: LayerR, ci: u32, cj: u32) -> vec4<u32> {
+  let bu = f32(bundleOf(L, 1u));
+  let bv = f32(bundleOf(L, 0u));
+  let ua = f32(ci) * bu + 0.5 * (bu - 1.0);
+  let va = f32(cj) * bv + 0.5 * (bv - 1.0);
+  let k0 = u32(ceil(ua - 1e-3));
+  let m0 = u32(ceil(va - 1e-3));
+  let nk = min(u32(floor(ua + bu + 1e-3)) - k0 + 1u, CELL_MAX_K);
+  let nm = min(u32(floor(va + bv + 1e-3)) - m0 + 1u, CELL_MAX_M);
+  return vec4<u32>(k0, m0, nk, nm);
 }
 
-// Edge a -> b crosses the +x ray from p.
-fn rayCross(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> u32 {
-  if ((a.y > p.y) != (b.y > p.y)) {
-    if (p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y)) { return 1u; }
-  }
-  return 0u;
+// Label of crossing idx from the label vec4 holding it (tornGeo[base + TORN_LABELS + idx / 32]).
+fn labelIn(words: vec4<u32>, idx: u32) -> u32 { return (words[(idx >> 3u) & 3u] >> (4u * (idx & 7u))) & 0xFu; }
+
+// Index of the crossing of fine point (U, V) in cell grid g (nearest, clamped into the cell).
+fn gridIndex(g: vec4<u32>, U: f32, V: f32) -> u32 {
+  let kc = u32(clamp(i32(round(U)) - i32(g.x), 0, i32(g.z) - 1));
+  let mc = u32(clamp(i32(round(V)) - i32(g.y), 0, i32(g.w) - 1));
+  return mc * CELL_MAX_K + kc;
 }
 
-// Signed distance (m) from cell point p to the free edge of group g, positive on the group's side,
-// from its boundary curves (groupCurves). The region (crossing a, its corners, crossing b, back along
-// the curves) is streamed edge by edge for the inside test: no private arrays in per-fragment code.
-fn groupSd(mask: u32, g: u32, size: vec2<f32>, c1lo: vec4<f32>, c1hi: vec4<f32>, c2lo: vec4<f32>, c2hi: vec4<f32>, p: vec2<f32>) -> f32 {
-  let k = countOneBits(mask);
-  if (k < 2u) { return bezierDistance(c1lo, c1hi, p); }
-  let a = g & 3u;
-  let b = g >> 2u;
-  let pb = c1lo.xy;
-  let pa = select(c2hi.zw, c1hi.zw, k == 2u);
-  var n = 0u;
-  var prev = pa;
-  var idx = (a + 1u) & 3u;
-  for (var q = 0u; q < 4u; q++) {
-    let cur = cornerPos(ccwCorner(idx), size);
-    n += rayCross(p, prev, cur);
-    prev = cur;
-    if (idx == b) { break; }
-    idx = (idx + 1u) & 3u;
-  }
-  n += rayCross(p, prev, pb);
-  var d = 1e9;
-  prev = pb;
-  for (var s = 1u; s <= CRACK_SEGS; s++) {
-    let cur = bezierP(c1lo, c1hi, f32(s) / f32(CRACK_SEGS));
-    n += rayCross(p, prev, cur);
-    d = min(d, segmentDistance(p, prev, cur));
-    prev = cur;
-  }
-  if (k >= 3u) {
-    for (var s = 1u; s <= CRACK_SEGS; s++) {
-      let cur = bezierP(c2lo, c2hi, f32(s) / f32(CRACK_SEGS));
-      n += rayCross(p, prev, cur);
-      d = min(d, segmentDistance(p, prev, cur));
-      prev = cur;
-    }
-  }
-  return select(-d, d, (n & 1u) == 1u);
-}
-
-// ---------------------------------------------------------------- edge field
+// ---------------------------------------------------------------- yarn damage field and edge field
 //
-// Distance (mm) from every material point to the nearest crack, in a texture over the rest chart
-// (edgefield.wgsl draws it). The torn rim, its fringe and the abraded halo around holes are material
-// features at a fixed distance from the free edge, so they follow it smoothly across cells.
+// The yarn damage field (simulation/yarnField.ts) holds per crossing the damage code of its pick (bits
+// 0-7) and warp (bits 8-15) segment, 255 = separated. The edge field is a texture at crossing
+// resolution over each layer's field (layers stacked vertically, LayerR.edge): r = distance (mm) to the
+// nearest crossing with a separated yarn (EDGE_RMAX beyond), g / b = intact fraction of the warp / pick
+// there, a = density of separated yarn segments around it (how much of an edge it is). edgefield.wgsl rebuilds it whenever new yarns separated. The torn rim, its fringe and the
+// abraded halo are material features at a distance from the free edge, so they follow it smoothly;
+// g and b let a weave below the pixel footprint still lose its worn-through yarns.
 
 // Largest stored distance (mm); everything beyond is intact cloth.
 const EDGE_RMAX: f32 = 7.0;
+const CUT_R: u32 = 255u;
 
-// How far a crack has developed, 0..1: a lone crack tip (one broken edge in its cell) is a fresh cut
-// through a few yarns whose sides still hold each other, so its rim is narrow and barely frayed. The
-// edge field stores distances divided by it, which narrows every rim feature around a tip at once.
-fn crackMaturity(mask: u32) -> f32 { return select(1.0, 0.3, countOneBits(mask) < 2u); }
+fn fieldIndexR(L: LayerR, k: u32, m: u32) -> u32 { return L.field.x + m * L.field.y + k; }
+fn yarnCode(word: u32, fam: u32) -> u32 { return (word >> (8u * fam)) & 0xFFu; }
 
-// Cracks of a torn cell from its broken edges alone (crackCount without the geometry).
-fn crackCountOf(mask: u32) -> u32 {
-  let k = countOneBits(mask);
-  return select(k, 1u, k == 2u);
-}
-
-// Edge-field texel of rest point (m) of layer L.
-fn edgeTexel(L: LayerR, rest: vec2<f32>) -> vec2<f32> {
-  return vec2<f32>(rest.x / L.edge.y, rest.y / L.edge.y + L.edge.x);
+// Normalised edge-field texture coordinates of fine yarn coordinates (U, V) of layer L.
+fn edgeUV(L: LayerR, uv: vec2<f32>) -> vec2<f32> {
+  return vec2<f32>((uv.x + 0.5) / L.edge.z, (uv.y + 0.5 + L.edge.x) / L.edge.w);
 }
 
 // Rest-chart point (m) of fine yarn coordinates (U, V): node (i, j) sits at U = i bu + (bu - 1) / 2.
@@ -541,13 +375,6 @@ fn weave2(L: LayerR, U: f32, V: f32, su: f32, sv: f32, front: bool, tau: f32) ->
   return o;
 }
 
-// Failure site of bundled yarn q (strand st) of span s from its packed strand sites: the strand's
-// site, staggered per yarn (the yarns of a strand part a little apart). Used by the tail pass.
-fn yarnSiteOf(sites: u32, s: u32, st: u32, q: u32) -> f32 {
-  let site = f32((sites >> (8u * st)) & 0xFFu) / 255.0;
-  return clamp(site + 0.18 * (hashf(s * 7u + q * 131u + 3u) - 0.5), 0.1, 0.9);
-}
-
 // ---------------------------------------------------------------- appearance
 
 // Occlusion of a point at normalized height hn (0 = bottom of the weave, 1 = top of the floats):
@@ -607,8 +434,9 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
   } else {
     let v = 0.85 + 0.2 * hash2f(seedY, 5u) + 0.08 * noise1(seedY + 3u, along / 0.004);
     let fib = mix(1.0, 0.85 + 0.3 * fiberRnd, fiberVis);
-    // undyed weft picks up indigo from neighbouring warps in washing; it is greyish, not white
-    o.albedo = vec3<f32>(0.26, 0.27, 0.28) * v * fib;
+    // undyed weft picks up indigo from neighbouring warps in washing; it is greyish, not white, until
+    // abrasion and loosening expose fresh, fluffy cotton
+    o.albedo = mix(vec3<f32>(0.26, 0.27, 0.28), vec3<f32>(0.5, 0.5, 0.49), 0.8 * wear * wear) * v * fib;
     o.fuzz = 0.35;
   }
   o.ao = 1.0;

@@ -1,4 +1,4 @@
-// Explicit yarns: loose tails of broken/pulled-out ends beyond the cracks of torn cells.
+// Explicit yarns: loose threads beside torn cells (yarn_geom.wgsl).
 // Each yarn is a camera-facing ribbon around its centreline shaded as a round fibrous cylinder with
 // the same material identity as the intact surface.
 
@@ -8,12 +8,13 @@
 @group(0) @binding(3) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> nrm: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> segw: array<vec4<u32>>;
-@group(0) @binding(6) var<storage, read> tails: array<f32>;
+@group(0) @binding(6) var<storage, read> cellFlagsY: array<u32>;
 @group(0) @binding(7) var<storage, read> lists: array<u32>;
 @group(0) @binding(8) var<storage, read> wearR: array<f32>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 @group(0) @binding(11) var<storage, read> tframe: array<vec4<f32>>;
+@group(0) @binding(13) var<storage, read> fieldY: array<u32>;
 
 override SEGS: u32 = 8u;
 
@@ -61,20 +62,6 @@ fn degenerate() -> VOut {
   return o;
 }
 
-fn tailVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
-  let b = bundleMax(R.layers[0]);
-  let e = tailEntry(ii / b);
-  let q = ii % b;
-  if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u)) { return degenerate(); }
-  // yarns ending inside the torn group's material are drawn by the group alone
-  if (tailLength(e, q) < TAIL_MIN) { return degenerate(); }
-  let t = f32(vi >> 1u) / f32(SEGS - 2u);
-  return ribbon(tailYarn(e, q, t), vi, fromLight);
-}
-
-@vertex fn vsTail(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut { return tailVertex(vi, ii, false); }
-@vertex fn vsTailShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> { return tailVertex(vi, ii, true).pos; }
-
 @fragment
 fn fsYarn(in: VOut) -> @location(0) vec4<f32> {
   let LR = R.layers[in.id.z];
@@ -101,3 +88,17 @@ fn fsYarn(in: VOut) -> @location(0) vec4<f32> {
   let c = fiberShade(N, Tf, V, key.xyz, look.albedo, look.fuzz + 0.15) * (key.w * sh) + amb * look.albedo * ao;
   return vec4<f32>(c, 1.0);
 }
+
+// Loose bundle threads (yarn_geom.wgsl strandPoint): instance = bundle span x (strand, half).
+fn strandVertex(vi: u32, ii: u32, fromLight: bool) -> VOut {
+  let s = bundleEntry(ii / BUNDLE_HALVES);
+  let k = (ii % BUNDLE_HALVES) >> 1u;
+  let half = ii & 1u;
+  let u = f32(vi >> 1u) / f32(STRAND_PTS - 1u);
+  let sp = strandPoint(s, k, half, u);
+  if (!sp.valid) { return degenerate(); }
+  return ribbon(sp.y, vi, fromLight);
+}
+
+@vertex fn vsStrand(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut { return strandVertex(vi, ii, false); }
+@vertex fn vsStrandShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> { return strandVertex(vi, ii, true).pos; }

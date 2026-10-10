@@ -48,11 +48,6 @@ export interface YarnFamily {
   crimpAmplitude: number;
   /** Parallel yarns carried by one lattice span of this family (1 for a yarn-level lattice). */
   yarnsPerSpan?: number;
-  /**
-   * Independent failure units ("strands") of a span: its yarns are split into this many equal groups
-   * (at most MAX_STRANDS), each with its own strength and failure site (axial.ts bundleResponse).
-   */
-  strandsPerSpan?: number;
 }
 
 export interface WeaveMaterial {
@@ -104,7 +99,7 @@ export const DENIM: WeaveMaterial = {
       bendRigidity: 4e-8, // ~7e-5 N m per unit width (1724 picks/m)
       bendViscosity: 2e-2,
       strength: 8.5,
-      softeningOpening: 0.12e-3,
+      softeningOpening: 0.4e-3,
       // in-fabric (flattened) cross-section; the weft lies low under the warp floats
       width: 0.4e-3,
       height: 0.16e-3,
@@ -121,7 +116,7 @@ export const DENIM: WeaveMaterial = {
       bendRigidity: 4.5e-8, // ~1.2e-4 N m per unit width (2632 ends/m)
       bendViscosity: 2e-2,
       strength: 11,
-      softeningOpening: 0.12e-3,
+      softeningOpening: 0.4e-3,
       // flattened in the fabric: warps overlap their neighbours (cover factor above one)
       width: 0.7e-3,
       height: 0.26e-3,
@@ -197,15 +192,6 @@ export const MATERIALS: readonly WeaveMaterial[] = [DENIM, BACKING];
  * law shape, softening opening, crimp, friction coefficients) are unchanged. Optical/visual fields
  * (width, height, crimpAmplitude, twill) keep describing the individual yarns.
  */
-/** Most failure strands per span (4-bit masks and packed u8 strand records). */
-export const MAX_STRANDS = 4;
-
-/** Strands for a bundle of b yarns: the largest divisor of b not above MAX_STRANDS. */
-export function strandsFor(b: number): number {
-  for (let s = Math.min(MAX_STRANDS, b); s > 1; s--) if (b % s === 0) return s;
-  return 1;
-}
-
 export function bundleWeave(m: WeaveMaterial, bu: number, bv: number = bu): WeaveMaterial {
   for (const b of [bu, bv]) if (!Number.isInteger(b) || b < 1) throw new Error(`bundle factors must be positive integers, got ${bu}, ${bv}`);
   if (bu === 1 && bv === 1) return m;
@@ -220,7 +206,6 @@ export function bundleWeave(m: WeaveMaterial, bu: number, bv: number = bu): Weav
     bendRigidity: b * y.bendRigidity,
     strength: b * y.strength,
     yarnsPerSpan: b,
-    strandsPerSpan: strandsFor(b),
   });
   // diagonal spring giving the same in-plane shear modulus scales with (a^2 + c^2) / (a c)
   const shape = (a: number, c: number) => (a * a + c * c) / (a * c);

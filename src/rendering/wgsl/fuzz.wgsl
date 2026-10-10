@@ -10,15 +10,16 @@
 @group(0) @binding(3) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> nrm: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> segw: array<vec4<u32>>;
-@group(0) @binding(6) var<storage, read> tails: array<f32>;
+@group(0) @binding(6) var<storage, read> cellFlagsY: array<u32>;
 @group(0) @binding(7) var<storage, read> lists: array<u32>;
 @group(0) @binding(8) var<storage, read> wearR: array<f32>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 @group(0) @binding(11) var<storage, read> tframe: array<vec4<f32>>;
 @group(0) @binding(12) var<storage, read> tornGeo: array<vec4<f32>>;
+@group(0) @binding(13) var<storage, read> fieldY: array<u32>;
 
-override FUZZ_PER_TAIL: u32 = 12u;
+override FUZZ_PER_TAIL: u32 = 6u;
 const FIBER_PTS: u32 = 7u;
 
 struct VOut {
@@ -63,6 +64,8 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
 
 // ---------------------------------------------------------------- edge fringe
 
+fn tornLabel(base: u32, idx: u32) -> u32 { return labelIn(bitcast<vec4<u32>>(tornGeo[base + (idx >> 5u)]), idx); }
+
 // Point (s, t) of a torn group's surface (its 16-point net in tornGeo at `slot`): position, d/ds, d/dt.
 struct NetPoint {
   p: vec3<f32>,
@@ -95,57 +98,50 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   let base = k * TORN_STRIDE;
   let info = tornInfo(tornGeo[base]);
   let LR = R.layers[info.w];
-  let size = vec2<f32>(f32(bundleOf(LR, 1u)) * LR.pitch.x, f32(bundleOf(LR, 0u)) * LR.pitch.y);
-  let mask = info.y;
-  let nc = crackCountOf(mask);
+  let L = LR.lattice;
+  let local = info.x - LR.refine.z;
+  let ci = local % (L.y - 1u);
+  let cj = local / (L.y - 1u);
+  let g = cellGrid(LR, ci, cj);
   let seed = hash11(info.x * 2654435761u + fi * 97u + 11u);
-  let ci = fi % nc;
-  let blo = tornGeo[base + TORN_CRACKS + 2u * ci];
-  let bhi = tornGeo[base + TORN_CRACKS + 2u * ci + 1u];
-  let tau = hashf(seed + 1u);
-  let pc = bezierP(blo, bhi, tau);
-  let tg = normalize(bezierTangentP(blo, bhi, tau) + vec2<f32>(1e-9, 0.0));
-  var nrm2 = vec2<f32>(-tg.y, tg.x);
-  if (((seed >> 9u) & 1u) == 1u) { nrm2 = -nrm2; }
-  // the corner on this side of the crack picks the group the fibre grows from
-  let kb = countOneBits(mask);
-  var corner = 0u;
-  if (kb >= 2u) {
-    var best = -1e9;
-    var lo = 0u;
-    var hi = 4u;
-    if (kb >= 3u) {
-      // a crack to the junction separates the corners on either side of its own edge
-      let e = nthEdge(mask, ci);
-      lo = e;
-      hi = e + 2u;
-    }
-    for (var q = lo; q < hi; q++) {
-      let c = ccwCorner(q);
-      let d = dot(cornerPos(c, size) - pc, nrm2);
-      if (d > best) {
-        best = d;
-        corner = c;
+  // a crossing on a free edge of its group: one with crossings no longer its group's nearby
+  let col = min(u32(hashf(seed + 1u) * f32(g.z)), g.z - 1u);
+  let row = min(u32(hashf(seed + 2u) * f32(g.w)), g.w - 1u);
+  let lb = base + TORN_LABELS;
+  let own = tornLabel(lb, row * CELL_MAX_K + col);
+  if (own == NO_LABEL) { return hidden(); }
+  // outward normal: toward the crossings around it (5 x 5) that the group does not own
+  var outv = vec2<f32>(0.0);
+  for (var dr = -2; dr <= 2; dr++) {
+    for (var dq = -2; dq <= 2; dq++) {
+      let qq = i32(col) + dq;
+      let rr = i32(row) + dr;
+      if (qq < 0 || rr < 0 || qq >= i32(g.z) || rr >= i32(g.w) || (dq == 0 && dr == 0)) { continue; }
+      if (tornLabel(lb, u32(rr) * CELL_MAX_K + u32(qq)) != own) {
+        let o = vec2<f32>(f32(dq) * LR.pitch.x, f32(dr) * LR.pitch.y);
+        outv += o / dot(o, o);
       }
     }
-    if (dot(cornerPos(corner, size) - pc, nrm2) < 0.0) { nrm2 = -nrm2; }
-    corner = groupLeader(mask, groupOf(mask, ccwCorner(corner)));
   }
-  let slot = tornSlot(k, corner);
+  if (dot(outv, outv) < 1e-12) { return hidden(); }
+  let out = normalize(outv);
+  let slot = tornSlot(k, own);
   if (tornGeo[slot].w < 0.0) { return hidden(); }
-  // rooted a little inside the edge, densest at the very edge
-  let h2 = hashf(seed + 2u);
-  let rootRest = clamp(pc + nrm2 * (h2 * h2 * 0.9e-3), vec2<f32>(0.0), size);
-  let np = netAt(slot, rootRest.x / size.x, rootRest.y / size.y);
+  // rooted on the edge crossing (jittered within it), on the group's own surface
+  let bu = f32(bundleOf(LR, 1u));
+  let bv = f32(bundleOf(LR, 0u));
+  let U = f32(g.x + col) + (hashf(seed + 17u) - 0.5) - 0.2e-3 * out.x / LR.pitch.x;
+  let V = f32(g.y + row) + (hashf(seed + 18u) - 0.5) - 0.2e-3 * out.y / LR.pitch.y;
+  let s = clamp((U - (f32(ci) * bu + 0.5 * (bu - 1.0))) / bu, 0.0, 1.0);
+  let t = clamp((V - (f32(cj) * bv + 0.5 * (bv - 1.0))) / bv, 0.0, 1.0);
+  let np = netAt(slot, s, t);
   let Tu = normalize(np.ds);
   let Tv = normalize(np.dt);
   let N = normalize(cross(np.ds, np.dt));
-  // outward across the crack, drawn toward the cut yarns' direction (the fringe is their ends),
-  // standing up out of the rolled rim
-  let out = -nrm2;
-  let fam = select(vec2<f32>(0.0, sign(out.y + 1e-9)), vec2<f32>(sign(out.x + 1e-9), 0.0), abs(out.x) > abs(out.y));
-  let spread = (hashf(seed + 3u) - 0.5) * 2.2;
-  let d2 = normalize(mix(out, fam, 0.4) + vec2<f32>(-out.y, out.x) * spread);
+  // outward across the crack, splayed around its normal (loose cotton fibres fan out of the edge;
+  // they do not keep to the yarn axes), standing up out of the rolled rim
+  let spread = (hashf(seed + 3u) - 0.5) * 1.6;
+  let d2 = normalize(out + vec2<f32>(-out.y, out.x) * spread);
   let lift = 0.1 + 0.9 * hashf(seed + 4u);
   let dir = normalize(Tu * d2.x + Tv * d2.y + N * lift);
   // lengths: mostly short fibre, a few long untwisted ends that droop
@@ -164,31 +160,32 @@ fn vsEdgeFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
   return strand(np.p, dir, len, bend, wave, waves, width, vi, Tu, vec4<u32>(0u, famId, info.w, seed));
 }
 
-// ---------------------------------------------------------------- frayed tail ends
+// ---------------------------------------------------------------- loose threads
 
+// Fibres standing out of the loose threads (yarn_geom.wgsl strandPoint): instance = bundle span x
+// (yarn, half) x fibre. Freed yarns untwist, so their fibres splay mostly along the thread.
 @vertex
-fn vsTailFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  let b = bundleMax(R.layers[0]);
+fn vsStrandFuzz(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
   let yi = ii / FUZZ_PER_TAIL;
-  let e = tailEntry(yi / b);
-  let q = yi % b;
-  if (q >= bundleOf(R.layers[nodes[e >> 2u].ijl >> 24u], (e & 3u) >> 1u) || tailLength(e, q) < TAIL_MIN) { return hidden(); }
-  let seed = hash11(e * 613u + q * 137u + (ii % FUZZ_PER_TAIL) * 6007u + 3u);
-  // fibres concentrate toward the untwisted free end
-  let r = hashf(seed);
-  let y = tailYarn(e, q, 1.0 - r * r * 0.8);
-  // root on the yarn surface at a random azimuth; untwisted end fibres splay mostly along the yarn
+  let s = bundleEntry(yi / BUNDLE_HALVES);
+  let q = (yi % BUNDLE_HALVES) >> 1u;
+  let half = yi & 1u;
+  let seed = hash11(s * 613u + yi * 137u + (ii % FUZZ_PER_TAIL) * 6007u + 3u);
+  let sp = strandPoint(s, q, half, hashf(seed));
+  if (!sp.valid) { return hidden(); }
+  let y = sp.y;
+  // root on the yarn surface at a random azimuth
   let az = 6.2831853 * hashf(seed + 1u);
   let u1 = normalize(cross(y.t, y.n));
   let u2 = cross(u1, y.t);
   let radial = cos(az) * u1 + sin(az) * u2;
-  let tilt = (hashf(seed + 2u) - 0.5) * 2.2;
-  let dir = normalize(normalize(radial + y.t * tilt) + y.t * 2.2);
+  let tilt = (hashf(seed + 2u) - 0.5) * 2.0;
+  let dir = normalize(normalize(radial + y.t * tilt) + y.t * select(-1.6, 1.6, hashf(seed + 11u) < 0.5));
   let rl = hashf(seed + 3u);
-  let len = 1.8 * (0.12e-3 + 0.75e-3 * rl * rl);
+  let len = 0.15e-3 + 0.9e-3 * rl * rl;
   let bend = vec3<f32>(hashf(seed + 4u) - 0.5, hashf(seed + 5u) - 0.5, hashf(seed + 6u) - 0.8) * (0.9 * len);
   let wave = vec3<f32>(hashf(seed + 7u) - 0.5, hashf(seed + 8u) - 0.5, hashf(seed + 9u) - 0.5) * (0.3 * len);
-  return strand(y.p + radial * y.radius, dir, len, bend, wave, 1.0 + 2.0 * hashf(seed + 10u), 30e-6, vi, u1, vec4<u32>(0u, y.fam, y.layer, seed));
+  return strand(y.p + radial * y.radius, dir, len, bend, wave, 1.0 + 2.0 * hashf(seed + 10u), 25e-6, vi, u1, vec4<u32>(0u, y.fam, y.layer, seed));
 }
 
 @fragment

@@ -43,7 +43,7 @@ fn segForce(a: u32, b: u32, f: u32, mat: LayerMat) -> SegForce {
   let s = segs[2u * a + f];
   let y = mat.yarn[f];
   let L = s.rest;
-  let r = bundleResponse(y, strandsOf(mat, f), L, s, l / L - 1.0);
+  let r = spanResponse(y, s, l / L - 1.0);
   let c = y.axialVisc / (L * P.hg.x);
   let fs = r.x + c * (l - ln);
   return SegForce(fs, max(r.y, 0.0) / L + c, max(fs, 0.0) / l, e / l);

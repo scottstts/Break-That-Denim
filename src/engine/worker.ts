@@ -62,7 +62,7 @@ class Engine {
   private pickToken = 0;
   private pointerDown = false;
   private latestPointer: PointerCommand | null = null;
-  private snapshot: { x: GPUBuffer; segs: GPUBuffer; tails: GPUBuffer } | null = null;
+  private snapshot: { x: GPUBuffer; segs: GPUBuffer; tails: GPUBuffer; field: GPUBuffer } | null = null;
   /** GPU work of the previous frame still executing: never queue more than one frame ahead. */
   private inFlight = false;
   /** Simulation sleeps at rest; it wakes on interaction or reset. */
@@ -131,11 +131,12 @@ class Engine {
     }
     if (!loaded) await settleDrape(this.device, this.solver);
     const copy = (src: GPUBuffer, label: string) => this.device.createBuffer({ label, size: src.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-    this.snapshot = { x: copy(this.solver.x, 'snap.x'), segs: copy(this.solver.segs, 'snap.segs'), tails: copy(this.solver.tails, 'snap.tails') };
+    this.snapshot = { x: copy(this.solver.x, 'snap.x'), segs: copy(this.solver.segs, 'snap.segs'), tails: copy(this.solver.tails, 'snap.tails'), field: copy(this.solver.field, 'snap.field') };
     const enc = this.device.createCommandEncoder();
     enc.copyBufferToBuffer(this.solver.x, 0, this.snapshot.x, 0, this.solver.x.size);
     enc.copyBufferToBuffer(this.solver.segs, 0, this.snapshot.segs, 0, this.solver.segs.size);
     enc.copyBufferToBuffer(this.solver.tails, 0, this.snapshot.tails, 0, this.solver.tails.size);
+    enc.copyBufferToBuffer(this.solver.field, 0, this.snapshot.field, 0, this.solver.field.size);
     this.device.queue.submit([enc.finish()]);
     await this.device.queue.onSubmittedWorkDone();
   }
@@ -148,9 +149,11 @@ class Engine {
     enc.copyBufferToBuffer(this.snapshot.x, 0, this.solver.x, 0, this.solver.x.size);
     enc.copyBufferToBuffer(this.snapshot.segs, 0, this.solver.segs, 0, this.solver.segs.size);
     enc.copyBufferToBuffer(this.snapshot.tails, 0, this.solver.tails, 0, this.solver.tails.size);
+    enc.copyBufferToBuffer(this.snapshot.field, 0, this.solver.field, 0, this.solver.field.size);
     enc.clearBuffer(this.solver.v);
     enc.clearBuffer(this.solver.ext);
     enc.clearBuffer(this.solver.counters);
+    this.renderer.resetTopology(enc);
     this.device.queue.submit([enc.finish()]);
     this.topology.reset();
     void this.topology.request([]);

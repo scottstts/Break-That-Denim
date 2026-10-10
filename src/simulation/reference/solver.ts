@@ -1,13 +1,14 @@
-import { axialEnergyDensity, bundleBrokenMask, bundleResponse } from '../axial';
+import { axialEnergyDensity, spanResponse } from '../axial';
 import { bendPsi, bendPsiDelta, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
-import { SEG_BROKEN, SEG_EXISTS, SEG_YARN_SHIFT, type CompiledScene, type LayerInfo } from '../scene';
+import { SEG_BROKEN, SEG_EXISTS, type CompiledScene, type LayerInfo } from '../scene';
+import { coupleSpans, updateField } from '../yarnField';
 import { newtonStepPCG, resetLaggedLevels, type MGConfig } from './newtonMultigrid';
 
 /**
  * Double-precision reference mechanics: the incremental potential, its gradient, the projected
  * Newton / PCG / Galerkin-multigrid substep (see newtonMultigrid.ts), and the post-step history
- * updates (cohesive damage, rupture, crossing slip). The GPU kernels mirror this file.
+ * updates (yarn damage field and rupture, crossing slip). The GPU kernels mirror this file.
  *
  *   Phi(dx) = sum m/(2h^2) |dx - pred|^2 + E_axial + E_bend + E_shear (+ viscous terms)
  */
@@ -49,7 +50,14 @@ export class ReferenceSolver {
   readonly nbr: Int32Array;
   readonly layerOf: Uint8Array;
   readonly restLength: Float64Array;
-  readonly maxExt: Float64Array;
+  /** Per span: intact yarn fraction, cut-yarn mask and split position (yarnField.ts). */
+  readonly intact: Float64Array;
+  readonly cutMask: Uint32Array;
+  readonly failSite: Float64Array;
+  /** Yarn damage codes, 2 per crossing (CompiledScene.fieldDamage). */
+  readonly fieldDamage: Uint8Array;
+  /** Per span strain snapshot for the field update (NaN: carries none). */
+  private readonly strain: Float64Array;
   readonly segFlags: Uint16Array;
   readonly tails: Float64Array;
   /** History updates (cohesive damage, crossing slip). Off only while settling an authored drape. */
@@ -85,7 +93,11 @@ export class ReferenceSolver {
     this.dx = new Float64Array(3 * N);
     this.pred = new Float64Array(3 * N);
     this.restLength = Float64Array.from(scene.restLength);
-    this.maxExt = Float64Array.from(scene.maxExt);
+    this.intact = Float64Array.from(scene.intact);
+    this.cutMask = Uint32Array.from(scene.cutMask);
+    this.failSite = Float64Array.from(scene.failSite);
+    this.fieldDamage = Uint8Array.from(scene.fieldDamage);
+    this.strain = new Float64Array(2 * N);
     this.segFlags = Uint16Array.from(scene.segFlags);
     this.tails = Float64Array.from(scene.tails);
     this.nbr = new Int32Array(4 * N).fill(-1);
@@ -581,10 +593,10 @@ export class ReferenceSolver {
     return Math.hypot(this.x[3 * b] - this.x[3 * a], this.x[3 * b + 1] - this.x[3 * a + 1], this.x[3 * b + 2] - this.x[3 * a + 2]);
   }
 
-  /** Damaged bundle response (T, dT/deps) of span s at strain eps (yarn-level damage, axial.ts). */
+  /** Response (T, dT/deps) of span s at strain eps with its intact yarn fraction (axial.ts). */
   response(s: number, eps: number): [number, number] {
     const yarn = this.layer(s >> 1).material.yarns[s & 1];
-    return bundleResponse(yarn, yarn.strandsPerSpan ?? 1, this.restLength[s], this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], eps, this.scene.yarnPeaks[s]);
+    return spanResponse(yarn, this.intact[s], eps);
   }
 
   /** Tension of an active segment at committed positions (no viscosity) and dT/dL at fixed length. */
@@ -595,33 +607,16 @@ export class ReferenceSolver {
     return [T, Math.max(K, 0) * (l / (L * L))];
   }
 
+  /**
+   * Yarn damage field update and span coupling (yarnField.ts): strain snapshot, per-yarn damage at
+   * every crossing, then each span's intact fraction and ruptures.
+   */
   updateDamage(): void {
-    for (let s = 0; s < 2 * this.N; s++) {
-      if (!this.segActive(s)) continue;
-      if (Math.max(this.lastUpdate[s >> 1], this.lastUpdate[this.segOther(s)]) > this.historyTolerance) continue;
-      const ext = this.segLength(s) - this.restLength[s];
-      if (ext > this.maxExt[s]) this.maxExt[s] = ext;
-      const yarn = this.layer(s >> 1).material.yarns[s & 1];
-      const b = yarn.strandsPerSpan ?? 1;
-      const mask = bundleBrokenMask(yarn, b, this.restLength[s], this.scene.peakTension[s], this.scene.softening[s], this.maxExt[s], this.scene.yarnPeaks[s]);
-      this.segFlags[s] |= mask << SEG_YARN_SHIFT;
-      if (mask === (1 << b) - 1) {
-        this.rupture(s);
-        this.brokenCount++;
-      }
-    }
-  }
-
-  /** Separate span s at its failure site; its rest length becomes two tails (ledger-preserving). */
-  rupture(s: number): void {
-    const a = s >> 1;
-    const f = s & 1;
-    const b = this.segOther(s);
-    const L = this.restLength[s];
-    const phi = this.scene.failSite[s];
-    this.segFlags[s] |= SEG_BROKEN;
-    this.tails[4 * a + 2 * f + 1] += L * phi;
-    this.tails[4 * b + 2 * f] += L * (1 - phi);
+    const active = (q: number) => this.segActive(q);
+    for (let q = 0; q < 2 * this.N; q++) this.strain[q] = active(q) ? this.segLength(q) / this.restLength[q] - 1 : NaN;
+    const spans = { restLength: this.restLength, softening: this.scene.softening, segFlags: this.segFlags, intact: this.intact, cutMask: this.cutMask, failSite: this.failSite, tails: this.tails };
+    updateField(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, spans, this.strain, active);
+    this.brokenCount += coupleSpans(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, spans, active, SEG_BROKEN);
   }
 
   /** Friction-limited crossing slip in two parity passes per family. */

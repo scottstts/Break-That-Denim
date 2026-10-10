@@ -11,8 +11,11 @@ export const GRIP = {
    * thinly that weak material far along the load path failed first, away from the hand.
    */
   radius: 0.008,
-  /** Maximum total grip force, N (a hard two-finger pull; tears worn and intact denim at the pinch). */
-  maxForce: 300,
+  /**
+   * Maximum total grip force, N: a hard two-finger pull. It opens worn cloth; intact denim (about 50 N
+   * per pick bundle, the pull shared over the pinch) holds unless the pinch sits on a torn edge.
+   */
+  maxForce: 120,
   /** Largest lead of the handle over the patch centroid, m. */
   maxLead: 0.006,
 };

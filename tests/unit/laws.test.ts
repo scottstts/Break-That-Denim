@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bundleBrokenMask, bundleResponse, packYarnPeak, strainAtTension, unpackYarnPeak } from '../../src/simulation/axial';
 import { BEND_S0, bendPsi, bendPsiDelta, SHEAR_JAM, SHEAR_RAMP, shearLaw } from '../../src/simulation/laws';
-import { DENIM } from '../../src/simulation/material';
 
 const fd = (f: (x: number) => number, x: number, h: number) => (f(x + h) - f(x - h)) / (2 * h);
 
@@ -49,28 +47,5 @@ describe('shear locking', () => {
       expect(fd((x) => shearLaw(ks, Ld, x)[2], l, 1e-9) / f).toBeCloseTo(1, 5);
       expect(fd((x) => shearLaw(ks, Ld, x)[0], l, 1e-9) / k).toBeCloseTo(1, 5);
     }
-  });
-});
-
-describe('strand-level bundle damage', () => {
-  const y = DENIM.yarns[1];
-  const L = 1e-3;
-  const peak = 3 * y.strength;
-  const soft = 0.12e-3;
-  it('packs strength multipliers to bytes and back', () => {
-    for (const m of [0.4, 0.73, 1, 1.6]) expect(unpackYarnPeak(packYarnPeak(m))).toBeCloseTo(m, 2);
-    expect(unpackYarnPeak(0)).toBe(0);
-  });
-  it('fails strand by strand, weakest first, keeping load in the survivors', () => {
-    const peaks = packYarnPeak(0.7) | (packYarnPeak(1.0) << 8) | (packYarnPeak(1.3) << 16);
-    const m0 = unpackYarnPeak(peaks & 0xff);
-    // past the weakest strand's separation but before the next one's peak
-    const ext = strainAtTension(y, peak * m0) * L + soft + 1e-6;
-    expect(bundleBrokenMask(y, 3, L, peak, soft, ext, peaks)).toBe(1);
-    const [T] = bundleResponse(y, 3, L, peak, soft, ext, ext / L, peaks);
-    expect(T).toBeGreaterThan(0);
-    // an absent strand never carries load
-    const absent = peaks & ~0xff;
-    expect(bundleResponse(y, 3, L, peak, soft, 0, 0.01, absent)[0]).toBeCloseTo((2 / 3) * bundleResponse(y, 3, L, peak, soft, 0, 0.01, peaks)[0], 12);
   });
 });

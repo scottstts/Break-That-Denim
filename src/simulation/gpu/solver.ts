@@ -11,6 +11,7 @@ import multigridWgsl from './wgsl/multigrid.wgsl?raw';
 import smoothWgsl from './wgsl/smooth.wgsl?raw';
 import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
+import yarnFieldWgsl from './wgsl/yarnfield.wgsl?raw';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
 import dragWgsl from './wgsl/drag.wgsl?raw';
@@ -131,10 +132,24 @@ function simParamsData(scene: CompiledScene, p: GpuSolverParams): ArrayBuffer {
     f[b + 23] = m.pitchU;
     f[b + 24] = m.pitchV;
     f[b + 25] = m.airDrag;
-    f[b + 26] = m.yarns[0].strandsPerSpan ?? 1;
-    f[b + 27] = m.yarns[1].strandsPerSpan ?? 1;
   });
   return buf;
+}
+
+/** Per-span state uploaded to the GPU (CompiledScene and ReferenceSolver both provide it). */
+export interface SpanState {
+  restLength: ArrayLike<number>;
+  intact: ArrayLike<number>;
+  cutMask: ArrayLike<number>;
+  segFlags: ArrayLike<number>;
+  failSite: ArrayLike<number>;
+}
+
+/** Field damage and cross-section codes packed per crossing: damage pick, warp (bits 0-15), area pick, warp (16-31). */
+function packField(damage: Uint8Array, area: Uint8Array): Uint32Array {
+  const out = new Uint32Array(damage.length / 2);
+  for (let c = 0; c < out.length; c++) out[c] = (damage[2 * c] | (damage[2 * c + 1] << 8) | (area[2 * c] << 16) | (area[2 * c + 1] << 24)) >>> 0;
+  return out;
 }
 
 function levelInfoData(layers: LatticeLayer[]): Uint32Array {
@@ -164,6 +179,14 @@ export class GpuSolver {
   readonly segs: GPUBuffer;
   readonly tails: GPUBuffer;
   readonly ext: GPUBuffer;
+  /** Yarn damage field (yarnField.ts): per crossing the damage codes of its pick and warp segments. */
+  readonly field: GPUBuffer;
+  /** Per crossing: peak tension of its pick and warp segment (N). */
+  readonly fieldStrength: GPUBuffer;
+  private readonly fieldU: GPUBuffer;
+  /** [0] = 1 once a damage code changed; cleared by the renderer after rebuilding from the field. */
+  readonly fieldEvents: GPUBuffer;
+  private readonly fieldCount: number;
   /**
    * [0] ruptures, [1] pulled-out spans, [2] max speed since last cleared (f32 bits), [3] line-search
    * step length of the current Newton iteration (f32 bits),
@@ -231,7 +254,14 @@ export class GpuSolver {
     this.v = createBuffer(device, 'v', 16 * N);
     this.dx = createBuffer(device, 'dx', 16 * N);
     this.pred = createBuffer(device, 'pred', 16 * N);
-    this.segs = createBufferWith(device, 'segs', new Uint8Array(this.segData(scene.restLength, scene.maxExt, scene.segFlags)));
+    this.segs = createBufferWith(device, 'segs', new Uint8Array(this.segData(scene)));
+    this.fieldCount = scene.fieldDamage.length / 2;
+    this.field = createBufferWith(device, 'field', packField(scene.fieldDamage, scene.fieldArea));
+    this.fieldStrength = createBufferWith(device, 'fieldStrength', scene.fieldStrength);
+    const fu = new Uint32Array(12);
+    scene.field.forEach((F, l) => fu.set([F.offset, F.K, F.M, 0], 4 * l));
+    this.fieldU = createBufferWith(device, 'fieldU', fu, UNIFORM);
+    this.fieldEvents = createBufferWith(device, 'fieldEvents', new Uint32Array([1, 0, 0, 0]));
     this.tails = createBufferWith(device, 'tails', Float32Array.from(scene.tails));
     this.ext = createBuffer(device, 'ext', 48 * N);
     this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON);
@@ -291,22 +321,18 @@ export class GpuSolver {
     device.queue.writeBuffer(this.slots, 0, this.slotData);
   }
 
-  private segData(restLength: ArrayLike<number>, maxExt: ArrayLike<number>, segFlags: ArrayLike<number>): ArrayBuffer {
+  private segData(spans: SpanState): ArrayBuffer {
     const s = this.scene;
     const buf = new ArrayBuffer(32 * 2 * s.nodeCount);
     const f = new Float32Array(buf);
     const u = new Uint32Array(buf);
     for (let q = 0; q < 2 * s.nodeCount; q++) {
-      const L = s.layers.find((l) => (q >> 1) >= l.nodeOffset && (q >> 1) < l.nodeOffset + l.nodeCount);
-      const yarn = L ? L.material.yarns[q & 1] : null;
-      f[8 * q] = restLength[q];
-      f[8 * q + 1] = s.peakTension[q];
+      f[8 * q] = spans.restLength[q];
+      f[8 * q + 1] = spans.intact[q];
       f[8 * q + 2] = s.softening[q];
-      u[8 * q + 3] = yarn ? s.yarnPeaks[q] : 0;
-      f[8 * q + 4] = maxExt[q];
-      u[8 * q + 5] = segFlags[q];
-      f[8 * q + 6] = s.failSite[q];
-      u[8 * q + 7] = s.yarnSites[q];
+      u[8 * q + 3] = spans.cutMask[q];
+      u[8 * q + 5] = spans.segFlags[q];
+      f[8 * q + 6] = spans.failSite[q];
     }
     return buf;
   }
@@ -344,7 +370,9 @@ export class GpuSolver {
     this.pl.pwCoarse = this.mod.mgCoarse.pipeline('prolongWeights');
     this.pl.prolong = this.mod.mgCoarse.pipeline('prolongAdd');
     for (const e of ['matvecDot', 'dotPartial', 'reduceFinal', 'updateXR', 'updateP', 'clear2']) this.pl[e] = this.mod.pcg.pipeline(e);
-    for (const e of ['predict', 'newtonApply', 'commit', 'damage', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
+    for (const e of ['predict', 'newtonApply', 'commit', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
+    this.mod.yarnField = new ComputeModule(d, 'yarnField', commonWgsl + yarnFieldWgsl);
+    for (const e of ['spanStrain', 'fieldUpdate', 'couple']) this.pl[e] = this.mod.yarnField.pipeline(e);
     this.mod.gate = new ComputeModule(d, 'gate', gateWgsl);
     this.pl.gate = this.mod.gate.pipeline('gate');
     this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + dragWgsl + energyWgsl));
@@ -403,7 +431,21 @@ export class GpuSolver {
     const group = (key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod.step.bindGroup(key, entries);
     };
-    for (const k of ['predict', 'commit', 'damage']) group(k, stepEntries);
+    for (const k of ['predict', 'commit']) group(k, stepEntries);
+    this.bg.yarnField = this.mod.yarnField.bindGroup('yarnField', {
+      0: this.simParams,
+      1: this.fieldU,
+      2: this.nodes,
+      3: this.x,
+      4: this.pred,
+      5: this.segs,
+      6: this.tails,
+      7: this.field,
+      8: this.fieldStrength,
+      9: this.counters,
+      10: this.fieldEvents,
+    });
+    for (const k of ['spanStrain', 'fieldUpdate', 'couple']) this.bg[k] = this.bg.yarnField;
     for (let it = 0; it < MAX_NEWTON; it++) {
       group(`newtonApply${it}`, { ...stepEntries, 1: this.slot(it) });
       this.bg[`gate${it}`] = this.mod.gate.bindGroup(`gate${it}`, { 0: this.slot(it), 1: this.counters, 2: this.gateArgs, 3: this.gateSizes });
@@ -536,7 +578,9 @@ export class GpuSolver {
 
   encodeFinalize(pass: GPUComputePassEncoder): void {
     this.dispatch(pass, 'commit', 'commit', this.nodeGroups(this.N));
-    this.dispatch(pass, 'damage', 'damage', this.nodeGroups(2 * this.N));
+    this.dispatch(pass, 'spanStrain', 'spanStrain', this.nodeGroups(this.N));
+    this.dispatch(pass, 'fieldUpdate', 'fieldUpdate', Math.ceil(this.fieldCount / 128));
+    this.dispatch(pass, 'couple', 'couple', this.nodeGroups(2 * this.N));
     for (let f = 0; f < 2; f++) for (let par = 0; par < 2; par++) this.dispatch(pass, 'slip', `slip${f}${par}`, this.nodeGroups(this.N));
   }
 
@@ -585,14 +629,21 @@ export class GpuSolver {
     const xs = new Float32Array(4 * N);
     for (let n = 0; n < N; n++) for (let q = 0; q < 3; q++) xs[4 * n + q] = this.scene.position[3 * n + q];
     this.setState(xs);
-    this.setSegments(this.scene.restLength, this.scene.maxExt, this.scene.segFlags, this.scene.tails);
+    this.setSegments(this.scene, this.scene.tails);
+    this.setField(this.scene.fieldDamage);
     this.device.queue.writeBuffer(this.ext, 0, new Float32Array(12 * N));
   }
 
-  /** Upload per-span history and tails (snapshots, reset, tests). */
-  setSegments(restLength: ArrayLike<number>, maxExt: ArrayLike<number>, segFlags: ArrayLike<number>, tails: ArrayLike<number>): void {
-    this.device.queue.writeBuffer(this.segs, 0, this.segData(restLength, maxExt, segFlags));
+  /** Upload per-span state and tails (snapshots, reset, tests). */
+  setSegments(spans: SpanState, tails: ArrayLike<number>): void {
+    this.device.queue.writeBuffer(this.segs, 0, this.segData(spans));
     this.device.queue.writeBuffer(this.tails, 0, Float32Array.from(tails));
+  }
+
+  /** Upload yarn damage codes (2 per crossing, as CompiledScene.fieldDamage). */
+  setField(damage: Uint8Array): void {
+    this.device.queue.writeBuffer(this.field, 0, packField(damage, this.scene.fieldArea));
+    this.device.queue.writeBuffer(this.fieldEvents, 0, new Uint32Array([1]));
   }
 
   /** Upload a full position set (e.g. a settled snapshot) and zero velocities. */

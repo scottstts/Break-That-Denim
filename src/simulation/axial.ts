@@ -1,6 +1,6 @@
 /**
- * Axial yarn response: a C1 "J-curve" (decrimping then yarn extension) with irreversible
- * triangular cohesive softening defined on physical extension.
+ * Axial yarn response: a C1 "J-curve" (decrimping then yarn extension), and the per-yarn cohesive
+ * damage law of the yarn damage field (yarnField.ts).
  *
  * Mirrored exactly by `axialTension` / `axialStiffness` in WGSL (src/simulation/gpu/common.wgsl).
  */
@@ -52,90 +52,34 @@ export function strainAtTension(p: AxialParams, t: number): number {
   return (2 * t) / (p.eaLow + Math.sqrt(p.eaLow * p.eaLow + 4 * a * t));
 }
 
-/** Remaining tension envelope at extension `ext` (only meaningful at/after peak). */
-export function envelopeTension(peakTension: number, peakExt: number, softening: number, ext: number): number {
-  if (ext <= peakExt) return peakTension;
-  return Math.max(0, peakTension * (1 - (ext - peakExt) / softening));
+/**
+ * Irreversible damage of one yarn of a bundled span at strain `eps`, from a triangular cohesive law on
+ * the yarn's own tension: elastic up to its peak tension `peakYarn` (N), then softening linearly to
+ * zero over `softStrain`. `p` is the bundle law of `yarns` parallel yarns; an abraded yarn keeps the
+ * fraction `area` of its fibres, so its elastic law is area / yarns of the bundle's. Damage is the
+ * secant loss d = 1 - T_env / T_el, 0 below the peak, 1 once the yarn has separated; the span then
+ * carries (1 - d) of the yarn's elastic tension (yarnField.ts). Mirrored in WGSL (common.wgsl).
+ */
+export function yarnDamage(p: AxialParams, yarns: number, area: number, peakYarn: number, softStrain: number, eps: number): number {
+  const ep = strainAtTension(p, (peakYarn * yarns) / area);
+  if (eps <= ep) return 0;
+  if (eps >= ep + softStrain) return 1;
+  const tEnv = peakYarn * (1 - (eps - ep) / softStrain);
+  const tEl = (area * axialTension(p, eps)) / yarns;
+  return Math.min(1, Math.max(0, 1 - tEnv / Math.max(tEl, 1e-12)));
 }
 
 /**
- * Damaged tension and a positive semidefinite solver tangent for the frozen committed history
- * `maxExt` and current extension. Returns [T, K].
- *
- * On the softening branch the true tangent is negative (concave energy). Zeroing it would leave a
- * Newton step unbounded along the yarn, so K is the tangent of the damaged secant curve through the
- * current point, (T_env / T_el) * dT_el/deps, which majorizes the concave branch and keeps steps
- * conservative. The gradient (T) is exact.
+ * Tension and tangent of a span whose yarns keep the intact fraction `intact` of the bundle's load
+ * capacity (abraded cross-section and damage, yarnField.ts): the elastic bundle law scaled by it. Damage is frozen during a substep and updated after it, so the
+ * law is elastic with the damaged secant stiffness (unloading never heals). Mirrored in WGSL
+ * (common.wgsl spanResponse).
  */
-export function damagedResponse(
-  p: AxialParams,
-  restLength: number,
-  peakTension: number,
-  softening: number,
-  maxExt: number,
-  eps: number,
-): [number, number] {
-  const peakExt = strainAtTension(p, peakTension) * restLength;
-  const ext = eps * restLength;
-  const tEl = axialTension(p, eps);
-  const kEl = axialStiffness(p, eps);
-  let s = 1;
-  if (maxExt > peakExt) {
-    const tAtMax = axialTension(p, maxExt / restLength);
-    s = tAtMax > 0 ? envelopeTension(peakTension, peakExt, softening, maxExt) / tAtMax : 0;
-  }
-  const tSecant = s * tEl;
-  if (ext > peakExt) {
-    const tEnv = envelopeTension(peakTension, peakExt, softening, ext);
-    if (tEnv < tSecant) return [tEnv, tEl > 0 ? (tEnv / tEl) * kEl : 0];
-  }
-  return [tSecant, s * kEl];
+export function spanResponse(p: AxialParams, intact: number, eps: number): [number, number] {
+  return [intact * axialTension(p, eps), intact * axialStiffness(p, eps)];
 }
 
-/** Separation is complete once the committed history passes the end of the softening branch. */
-export function isSeparated(p: AxialParams, restLength: number, peakTension: number, softening: number, maxExt: number): boolean {
-  return maxExt >= strainAtTension(p, peakTension) * restLength + softening;
-}
-
-/**
- * Strand-level damage inside a bundled span. The span's yarns form S equal strands (material.ts
- * strandsPerSpan); each strand stores one strength multiplier (packed u8, see unpackYarnPeak):
- * strand k peaks at the bundle tension peak * m_k, i.e. at its own extension, and softens on its
- * own; all share the span's extension history. The span force is the mean of the per-strand damaged
- * responses evaluated at bundle scale, so a bundle fails strand by strand and keeps load in the
- * survivors. A zero byte marks a strand that is absent (worn through before interaction). Mirrored
- * in WGSL (common.wgsl: bundleResponse).
- */
-/** Strength multiplier of packed byte u (0 = absent yarn). */
-export function unpackYarnPeak(u: number): number {
-  return u === 0 ? 0 : 0.4 + (1.2 * (u - 1)) / 254;
-}
-
-/** Byte for a strength multiplier m in [0.4, 1.6] (never 0: absence is explicit). */
-export function packYarnPeak(m: number): number {
-  return 1 + Math.round((Math.min(1.6, Math.max(0.4, m)) - 0.4) * (254 / 1.2));
-}
-
-/** Damaged (T, K) of a bundle of `b` strands with packed multipliers `peaks` (byte k = strand k). */
-export function bundleResponse(p: AxialParams, b: number, restLength: number, peakTension: number, softening: number, maxExt: number, eps: number, peaks: number): [number, number] {
-  let T = 0;
-  let K = 0;
-  for (let k = 0; k < b; k++) {
-    const m = unpackYarnPeak((peaks >>> (8 * k)) & 0xff);
-    if (m === 0) continue;
-    const [t, kk] = damagedResponse(p, restLength, peakTension * m, softening, maxExt, eps);
-    T += t;
-    K += kk;
-  }
-  return [T / b, K / b];
-}
-
-/** Bit k set when strand k of the bundle is absent or fully separated. */
-export function bundleBrokenMask(p: AxialParams, b: number, restLength: number, peakTension: number, softening: number, maxExt: number, peaks: number): number {
-  let mask = 0;
-  for (let k = 0; k < b; k++) {
-    const m = unpackYarnPeak((peaks >>> (8 * k)) & 0xff);
-    if (m === 0 || isSeparated(p, restLength, peakTension * m, softening, maxExt)) mask |= 1 << k;
-  }
-  return mask;
+/** Strain energy per unit rest length of a span with intact fraction `intact`, J/m. */
+export function spanEnergyDensity(p: AxialParams, intact: number, eps: number): number {
+  return intact * axialEnergyDensity(p, eps);
 }

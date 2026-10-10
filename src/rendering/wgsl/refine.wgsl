@@ -1,7 +1,7 @@
 // Per-frame geometry preparation from the accepted mechanical state:
 //  - nodeFrame: per-node unit normal and +u / +v tangents from connected yarn neighbours (holes never
 //    bridge; a missing direction completes the frame and an isolated node keeps its last frame),
-//  - classify: per-cell intact flag and strand masks, compact lists of torn cells and loose yarn tails,
+//  - classify: per-cell intact flag, compact lists of torn cells and of the spans beside them (threads),
 //  - refine: bicubic (Catmull-Rom) surface samples on an S x S grid per cell with exact derivatives,
 //  - args: indirect draw arguments from the list counters.
 
@@ -9,7 +9,6 @@
 @group(0) @binding(1) var<storage, read> nodes: array<NodeStaticR>;
 @group(0) @binding(2) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> segw: array<vec4<u32>>; // Seg as 2 x vec4<u32>; flags at [1].y
-@group(0) @binding(4) var<storage, read> tails: array<f32>;
 @group(0) @binding(5) var<storage, read_write> nrm: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> cellFlags: array<u32>;
 @group(0) @binding(7) var<storage, read_write> lists: array<atomic<u32>>;
@@ -18,8 +17,8 @@
 // per node: +u unit tangent with the node's wear in w (static), +v unit tangent
 @group(0) @binding(10) var<storage, read_write> tframe: array<vec4<f32>>;
 
-// lists layout: [0] unused, [1] tail count, [2] torn cell count, [3] unused, then (unused) spans at
-// SPAN_BASE, tails after MAX_SPANS entries, torn cells after MAX_TAILS more
+// lists layout: [0] thread span count, [1] unused, [2] torn cell count, [3] unused, then thread
+// spans at SPAN_BASE, an unused region of MAX_TAILS entries, torn cells after it
 const SPAN_BASE: u32 = 4u;
 override MAX_SPANS: u32 = 65536u;
 override MAX_TAILS: u32 = 65536u;
@@ -27,7 +26,10 @@ override MAX_TORN: u32 = 16384u;
 override TORN_VERTS: u32 = 96u;
 override TAIL_VERTS: u32 = 14u;
 override FUZZ_VERTS: u32 = 14u;
-override FUZZ_PER_TAIL: u32 = 12u;
+override FUZZ_PER_TAIL: u32 = 6u;
+override STRAND_VERTS: u32 = 18u;
+// Instances per loose bundle span: up to MAX_STRANDS threads, each drawn in two halves.
+const BUNDLE_INSTANCES: u32 = 18u;
 
 // Node still in the scene (retired debris, x.w = 2, is not drawn).
 fn live(n: u32) -> bool { return x[n].w < 1.5; }
@@ -42,7 +44,7 @@ fn segOk(owner: u32, f: u32) -> bool {
 fn layerOf(n: u32) -> u32 { return nodes[n].ijl >> 24u; }
 
 // Bundled yarns of span (owner, f) that are absent or separated (bit k = yarn k).
-fn yarnMask(owner: u32, f: u32) -> u32 { return (segw[2u * (2u * owner + f) + 1u].y >> 8u) & 0xFu; }
+fn yarnMask(owner: u32, f: u32) -> u32 { return min(segw[2u * (2u * owner + f)].w, 0xFu); }
 fn nodeI(n: u32) -> i32 { return i32(nodes[n].ijl & 0xFFFu); }
 fn nodeJ(n: u32) -> i32 { return i32((nodes[n].ijl >> 12u) & 0xFFFu); }
 
@@ -126,33 +128,49 @@ fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   cellFlags[cell] = flags;
 }
 
-// Loose yarn ends (broken or pulled-out tails) are listed per node side.
+// Spans beside a torn cell are listed for the thread pass (yarn_geom.wgsl): there, a yarn whose
+// crossing yarns have separated runs on alone, outside the woven cloth the cell draws.
 @compute @workgroup_size(128)
 fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= R.counts.x || !live(n)) { return; }
-  for (var side = 0u; side < 4u; side++) {
-    if (tails[4u * n + side] > 1e-6) {
-      let k = atomicAdd(&lists[1], 1u);
-      if (k < MAX_TAILS) { atomicStore(&lists[SPAN_BASE + MAX_SPANS + k], 4u * n + side); }
+  let l = layerOf(n);
+  let L = R.layers[l].lattice;
+  let i = u32(nodeI(n));
+  let j = u32(nodeJ(n));
+  for (var f = 0u; f < 2u; f++) {
+    let inside = select(j + 1u < L.z, i + 1u < L.y, f == 0u);
+    if (!inside || (segw[2u * (2u * n + f) + 1u].y & SEG_EXISTS_R) == 0u) { continue; }
+    if (!live(n + select(L.y, 1u, f == 0u))) { continue; }
+    // the cells on either side of the span
+    var torn = false;
+    if (f == 0u) {
+      if (j > 0u) { torn = torn || cellFlags[cellOf(l, i, j - 1u)] == 0u; }
+      if (j + 1u < L.z) { torn = torn || cellFlags[cellOf(l, i, j)] == 0u; }
+    } else {
+      if (i > 0u) { torn = torn || cellFlags[cellOf(l, i - 1u, j)] == 0u; }
+      if (i + 1u < L.y) { torn = torn || cellFlags[cellOf(l, i, j)] == 0u; }
     }
+    if (!torn) { continue; }
+    let k = atomicAdd(&lists[0], 1u);
+    if (k < MAX_SPANS) { atomicStore(&lists[SPAN_BASE + k], 2u * n + f); }
   }
 }
 
-// Indirect arguments: draws [unused, tails, edge fibres, tail fibres, torn groups] x (vertexCount,
+// Indirect arguments: draws [threads, unused, edge fibres, thread fibres, torn groups] x (vertexCount,
 // instanceCount, 0, 0), then the torn-geometry dispatch (x, y, z).
 @compute @workgroup_size(1)
 fn args() {
-  let tl = min(atomicLoad(&lists[1]), MAX_TAILS);
   let torn = min(atomicLoad(&lists[2]), MAX_TORN);
+  let bundles = min(atomicLoad(&lists[0]), MAX_SPANS);
   // instances per tail: the larger bundle (extra instances of the smaller family are empty)
   let b = bundleMax(R.layers[0]);
-  drawArgs[0] = 0u;
-  drawArgs[1] = 0u;
+  drawArgs[0] = STRAND_VERTS;
+  drawArgs[1] = bundles * BUNDLE_INSTANCES;
   drawArgs[2] = 0u;
   drawArgs[3] = 0u;
-  drawArgs[4] = TAIL_VERTS;
-  drawArgs[5] = tl * b;
+  drawArgs[4] = 0u;
+  drawArgs[5] = 0u;
   drawArgs[6] = 0u;
   drawArgs[7] = 0u;
   drawArgs[8] = FUZZ_VERTS;
@@ -160,7 +178,7 @@ fn args() {
   drawArgs[10] = 0u;
   drawArgs[11] = 0u;
   drawArgs[12] = FUZZ_VERTS;
-  drawArgs[13] = tl * b * FUZZ_PER_TAIL;
+  drawArgs[13] = bundles * BUNDLE_INSTANCES * FUZZ_PER_TAIL;
   drawArgs[14] = 0u;
   drawArgs[15] = 0u;
   drawArgs[16] = TORN_VERTS;

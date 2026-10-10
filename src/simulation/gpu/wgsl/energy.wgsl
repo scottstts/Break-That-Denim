@@ -85,12 +85,12 @@ fn nodeDelta(n: u32) -> vec3<f32> {
       let de = dir(b) - dn;
       let l0 = length(ec);
       let ln = length(en);
-      let T0 = bundleResponse(y, strandsOf(mat, f), L, s, l0 / L - 1.0).x;
+      let T0 = spanResponse(y, s, l0 / L - 1.0).x;
       let c = y.axialVisc / (L * h);
       for (var k = 0u; k < 3u; k++) {
         let al = ALPHA;
         let r = lenChange(ec, de, al[k], l0);
-        let Ta = bundleResponse(y, strandsOf(mat, f), L, s, r.y / L - 1.0).x;
+        let Ta = spanResponse(y, s, r.y / L - 1.0).x;
         acc[k] += 0.5 * (T0 + Ta) * r.x + 0.5 * c * r.x * (r.y + l0 - 2.0 * ln);
       }
     }

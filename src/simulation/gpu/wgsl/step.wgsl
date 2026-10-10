@@ -1,5 +1,5 @@
-// Per-substep kernels outside the linear solve: predictor, Newton update, commit, cohesive damage
-// and rupture, friction-limited crossing slip. Mirrors ReferenceSolver (reference/solver.ts).
+// Per-substep kernels outside the linear solve: predictor, Newton update, commit, friction-limited
+// crossing slip (damage and rupture: yarnfield.wgsl). Mirrors ReferenceSolver (reference/solver.ts).
 
 @group(0) @binding(0) var<uniform> P: SimParams;
 @group(0) @binding(1) var<uniform> Mode: vec4<u32>; // slip: x = family, y = parity; newtonApply/gate: x = iteration
@@ -113,33 +113,6 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
   x[n] = vec4<f32>(p, w);
 }
 
-@compute @workgroup_size(128)
-fn damage(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let s = gid.x;
-  if (s >= 2u * P.counts.x || P.counts.z == 0u) { return; }
-  var sg = segs[s];
-  if (!segActive(sg)) { return; }
-  let a = s >> 1u;
-  let f = s & 1u;
-  let b = u32(nbr(a, f, 1));
-  if (x[a].w > 0.5 || x[b].w > 0.5) { return; }
-  // an unconverged iterate must not commit damage: defer until both ends have converged locally
-  if (max(v[a].w, v[b].w) > historyTolerance()) { return; }
-  let ext = length(x[b].xyz - x[a].xyz) - sg.rest;
-  if (ext > sg.maxExt) { sg.maxExt = ext; }
-  let mat = P.layers[nodes[a].ijl >> 24u];
-  let strands = strandsOf(mat, f);
-  let mask = bundleBrokenMask(mat.yarn[f], strands, sg.rest, sg);
-  sg.flags = sg.flags | (mask << SEG_YARN_SHIFT);
-  if (mask == (1u << strands) - 1u) {
-    sg.flags = sg.flags | SEG_BROKEN;
-    tails[4u * a + 2u * f + 1u] += sg.rest * sg.failSite;
-    tails[4u * b + 2u * f] += sg.rest * (1.0 - sg.failSite);
-    atomicAdd(&counters[0], 1u);
-  }
-  segs[s] = sg;
-}
-
 // Tension of an active span at committed positions and dT/dL at fixed length.
 fn spanTension(owner: u32, f: u32) -> vec2<f32> {
   let sg = segs[2u * owner + f];
@@ -147,7 +120,7 @@ fn spanTension(owner: u32, f: u32) -> vec2<f32> {
   let l = length(x[b].xyz - x[owner].xyz);
   let L = sg.rest;
   let mat = P.layers[nodes[owner].ijl >> 24u];
-  let r = bundleResponse(mat.yarn[f], strandsOf(mat, f), L, sg, l / L - 1.0);
+  let r = spanResponse(mat.yarn[f], sg, l / L - 1.0);
   return vec2<f32>(r.x, max(r.y, 0.0) * l / (L * L));
 }
 

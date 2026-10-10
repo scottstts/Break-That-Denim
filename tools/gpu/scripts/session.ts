@@ -104,6 +104,69 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: 1.5 },
   ],
+  // grab at GRAB and pull by PULL (10 cm units, x,y,z) over 0.8 s, hold, release: a user opening the
+  // worn patch they see (cores of the worn cells: tools/gpu/scripts/cores in the notes)
+  pluck: [
+    { grab: (process.env.GRAB ?? '0.0105,-0.0063').split(',').map(Number) as [number, number] },
+    { to: (process.env.PULL ?? '0.012,0,0.012').split(',').map(Number) as [number, number, number], t: 0.8 },
+    { wait: 0.3 },
+    { release: true },
+    { wait: 0.8 },
+  ],
+  // a user working the worn patch: plucks at each worn-through core and between them, cumulative
+  worn: [
+    { grab: [0.0105, -0.0063] },
+    { to: [0.015, 0.0, 0.01], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.0035, -0.0042] },
+    { to: [-0.004, -0.014, 0.012], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.0007, 0.0058] },
+    { to: [-0.008, 0.012, 0.014], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.004, -0.005] },
+    { to: [0.0, -0.002, 0.02], t: 0.7 },
+    { release: true },
+    { wait: 0.6 },
+  ],
+  // the worn session, then a second round of pulls at the opened holes' edges in other directions
+  worn2: [
+    { grab: [0.0105, -0.0063] },
+    { to: [0.015, 0.0, 0.01], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.0035, -0.0042] },
+    { to: [-0.004, -0.014, 0.012], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.0007, 0.0058] },
+    { to: [-0.008, 0.012, 0.014], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.004, -0.005] },
+    { to: [0.0, -0.002, 0.02], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.014, -0.004] },
+    { to: [0.012, 0.01, 0.012], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.007, -0.006] },
+    { to: [-0.012, 0.004, 0.012], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.003, 0.009] },
+    { to: [0.006, 0.016, 0.01], t: 0.7 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.009, -0.009] },
+    { to: [0.004, -0.02, 0.012], t: 0.7 },
+    { release: true },
+    { wait: 0.6 },
+  ],
   intact: [
     { grab: [-0.035, 0.03] },
     { to: [-0.03, 0.0, 0.015], t: 0.8 },
@@ -448,14 +511,16 @@ export default async function main(args: string[]): Promise<void> {
   writeFileSync(resolve(CAPTURES, `${name}.log`), log.join('\n'));
   if (process.env.DUMP) {
     // final state for offline analysis (still.ts): x (vec4 per node), segs (8 x 32-bit per span),
-    // tails (4 per node)
+    // tails (4 per node), yarn field (u32 per crossing)
     const xb = new Uint8Array(await readBuffer(device, solver.x));
     const sb = new Uint8Array(await readBuffer(device, solver.segs));
     const tb = new Uint8Array(await readBuffer(device, solver.tails));
-    const out = new Uint8Array(xb.length + sb.length + tb.length);
+    const fb = new Uint8Array(await readBuffer(device, solver.field));
+    const out = new Uint8Array(xb.length + sb.length + tb.length + fb.length);
     out.set(xb, 0);
     out.set(sb, xb.length);
     out.set(tb, xb.length + sb.length);
+    out.set(fb, xb.length + sb.length + tb.length);
     writeFileSync(resolve(CAPTURES, `${name}.state`), out);
   }
   const path = resolve(CAPTURES, `${name}.png`);
