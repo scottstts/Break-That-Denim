@@ -55,8 +55,14 @@
 
 ## Measured
 
-- Substep 8.2 ms; product frame (4 substeps + render) 37 ms at rest: sim/wall ~0.9.
-- Options measured but not taken: one fewer multigrid level (-12 %, max error 2.8 -> 4.0 mm vs a
-  converged solve), one coarse sweep (-4.5 %, 2.8 -> 3.1 mm), two line colours (unsafe on the GPU:
-  same-colour lines two apart are coupled and would race). A fused single-workgroup cycle for the
-  coarse levels (identical math) is estimated at ~10 %.
+- Substep 7.97 ms after the contact query culling (detection 1.67 -> 0.70 ms); product frame
+  (4 substeps + render) 36 ms at rest: sim/wall ~0.93.
+- Options measured and rejected (max position error during a grab vs a converged solve, production
+  2.82 mm): one fewer multigrid level -12 % / 3.96 mm; one coarse sweep -4.5 % / 3.09 mm; h = 1/100
+  -17 % / 3.75 mm; one PCG iteration in the second Newton iteration -20 % / 4.40 mm (or in the first,
+  4.18 mm); 3 Newton x 1 PCG 6.09 mm. Two line colours are unsafe on the GPU (same-colour lines two
+  apart are coupled and would race).
+- A single-workgroup fused V-cycle for the coarse levels (identical math, serial block elimination per
+  line) was slower: 1.61 vs 1.35 ms per V-cycle even with the line rows built in parallel. One
+  workgroup runs on one GPU core and the dependent 3x3 elimination chain is latency-bound; the
+  dispatches it saved were cheaper.
