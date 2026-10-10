@@ -1,6 +1,6 @@
 import { acquireGpu, GpuUnavailableError } from '../gpu/device';
 import { readBuffer } from '../gpu/util';
-import { DEFAULT_CAMERA, Renderer, cameraMatrices, type CameraState } from '../rendering/renderer';
+import { DEFAULT_CAMERA, Renderer, cameraMatrices, type CameraState, type FloorImages } from '../rendering/renderer';
 import { add, dot, normalize, scale, sub, transformPoint, type Vec3 } from '../rendering/math';
 import { Interaction, MAX_GRIPS } from '../simulation/gpu/interaction';
 import { GRIP, pinchScale } from '../simulation/grip';
@@ -21,6 +21,20 @@ const scope = self as unknown as WorkerScope;
 const send = (m: FromEngine) => scope.postMessage(m);
 /** Loading progress, 0..1, by stage. */
 const progress = (value: number) => send({ type: 'progress', value });
+
+/** The floor's material set (public/texture), decoded as stored (no colour conversion); null if any is missing. */
+async function loadFloorImages(): Promise<FloorImages | null> {
+  const at = (name: string) =>
+    fetch(new URL(`/texture/${name}`, self.location.href))
+      .then((r) => (r.ok ? r.blob() : Promise.reject(new Error(name))))
+      .then((b) => createImageBitmap(b, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' }));
+  try {
+    const [base, normal, roughness, ao] = await Promise.all([at('floor_baseColor.jpg'), at('floor_normal.png'), at('floor_roughness.jpg'), at('floor_AO.jpg')]);
+    return { base, normal, roughness, ao };
+  } catch {
+    return null;
+  }
+}
 
 const H = GPU_DEFAULTS.h;
 /** Upper bound on substeps per presented frame; a larger backlog is dropped, never replayed. */
@@ -105,6 +119,7 @@ class Engine {
     const drape = fetch(new URL('/drape.bin', self.location.href))
       .then((r) => (r.ok ? r.arrayBuffer() : null))
       .catch(() => null);
+    const floor = loadFloorImages();
     const gpu = await acquireGpu((navigator as Navigator & { gpu?: GPU }).gpu);
     progress(0.1);
     this.device = gpu.device;
@@ -138,6 +153,8 @@ class Engine {
     this.speedProbe = this.device.createBuffer({ label: 'speedProbe', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     progress(0.7);
 
+    const images = await floor;
+    if (images) this.renderer.setFloorImages(images);
     await this.settle(await drape);
     progress(0.9);
     // authored defects could leave pieces disconnected from the start

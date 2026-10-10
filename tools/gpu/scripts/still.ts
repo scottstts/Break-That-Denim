@@ -10,7 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
-import { CAPTURES, drain, gpuDevice, saveTexture } from '../env';
+import { CAPTURES, drain, floorImages, gpuDevice, saveTexture } from '../env';
 import { settledSolver } from './render';
 
 export default async function main(args: string[]): Promise<void> {
@@ -39,6 +39,8 @@ export default async function main(args: string[]): Promise<void> {
   const format: GPUTextureFormat = 'rgba8unorm';
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(width, height);
+  const floor = floorImages();
+  if (floor) renderer.setFloorImages(floor);
   // LIGHT='{"keyOffset":[..],"keyIntensity":..,"exposure":..,"ambient":[..],"keyAim":[..],"keyCone":..}'
   Object.assign(renderer, JSON.parse(process.env.LIGHT ?? '{}') as object);
   const camera = { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.CAMERA ?? '{}') as object) };

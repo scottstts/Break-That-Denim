@@ -15,7 +15,7 @@ import { Topology } from '../../../src/simulation/gpu/topology';
 import { GRIP, pinchScale } from '../../../src/simulation/grip';
 import { AcousticLog } from '../../../src/engine/acousticLog';
 import { ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../../../src/audio/record';
-import { CAPTURES, drain, encodePng, gpuDevice } from '../env';
+import { CAPTURES, drain, encodePng, floorImages, gpuDevice } from '../env';
 import { settledSolver } from './render';
 
 /** Gesture steps in world metres relative to the grab point; times in seconds. */
@@ -307,6 +307,8 @@ export default async function main(args: string[]): Promise<void> {
   const [W, Hh] = (process.env.SIZE ?? "960x600").split("x").map(Number);
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(W, Hh);
+  const floor = floorImages();
+  if (floor) renderer.setFloorImages(floor);
   const tex = device.createTexture({ size: [W, Hh], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const snaps = (process.env.SNAPS ?? '').split(',').filter((q) => q.length > 0).map(Number).sort((a, b) => a - b);
   const [snapW, snapH] = (process.env.SNAPSIZE ?? '1320x1624').split('x').map(Number);

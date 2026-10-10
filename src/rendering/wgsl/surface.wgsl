@@ -27,6 +27,7 @@
 @group(0) @binding(13) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(14) var<storage, read> tframe: array<vec4<f32>>;
 @group(0) @binding(15) var<storage, read> kappaM: array<u32>;
+@group(0) @binding(16) var overMap: texture_depth_2d;
 
 
 struct VOut {
@@ -379,7 +380,11 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
 
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, Nf);
+  let shO = shadowOver(in.world, Nf);
+  let over = F.overColor.rgb * shO;
   let amb = F.ambient.rgb * (0.55 + 0.45 * Nf.z);
+  // direct irradiance on the cloth's plane, for the haze of fibres bridging the grooves
+  let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) + over * max(dot(Nf, F.overDir.xyz), 0.0);
   // the rim's loose fibres: pale albedo, more sheen, weave washed out toward the edge
   var fib = vec4<f32>(0.0);
   if (rim.rim > 0.0) { fib = rimFibres(rest, rim.dir, in.layer, pix); }
@@ -485,9 +490,9 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let inv = 1.0 / cnt;
     let Nl = normalize(nSum);
     let Tl = normalize(tSum - dot(tSum, Nl) * Nl + 1e-6 * Tu);
-    acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) + amb * albAmb * inv;
+    acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) + fiberShade(Nl, Tl, Vv, F.overDir.xyz, albDirect * inv, fuzz * inv) * over + amb * albAmb * inv;
     // loose fibres bridging the grooves: a faint haze lifts the deepest points
-    acc = mix(acc, (key.w * sh * max(dot(Nf, key.xyz), 0.0) * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * groove * inv * fuzz * inv);
+    acc = mix(acc, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * groove * inv * fuzz * inv);
     acc *= cnt;
   }
   var color = acc / max(cnt, 1.0);
@@ -515,8 +520,9 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let Ta = select(Tu, Tv, wf > 0.5);
     let Tf = normalize(cos(tw) * Ta + sin(tw) * cross(Ny, Ta));
     let fz = mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak;
-    var ct = fiberShade(Ny, Tf, Vv, key.xyz, albedo * mix(0.55, 1.0, ao), fz) * (key.w * sh) + amb * albedo * ao;
-    ct = mix(ct, (key.w * sh * max(dot(Nf, key.xyz), 0.0) * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
+    let albD = albedo * mix(0.55, 1.0, ao);
+    var ct = fiberShade(Ny, Tf, Vv, key.xyz, albD, fz) * (key.w * sh) + fiberShade(Ny, Tf, Vv, F.overDir.xyz, albD, fz) * over + amb * albedo * ao;
+    ct = mix(ct, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
     color = select(mix(color, ct, lodTile), ct, cnt == 0.0);
     if (lodTile >= 1.0) {
       // coverage of the filtered cloth: holes where both families are gone, dithered over the samples

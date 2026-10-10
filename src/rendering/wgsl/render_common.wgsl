@@ -17,6 +17,18 @@ struct FrameU {
   viewport: vec4<f32>,
   // exposure, time (s), key distance to the view target (irradiance normalisation, m), frame index
   params: vec4<f32>,
+  // the overhead (room) light, a distant lamp: its shadow projection; xyz toward it, w = shadow-map
+  // texel size (m); rgb irradiance, w = angular radius (rad)
+  overViewProj: mat4x4<f32>,
+  overDir: vec4<f32>,
+  overColor: vec4<f32>,
+  // floor: height (m), texture repeats per metre, 1 if drawn, texels per repeat of the base colour and
+  // normal maps (they are a crop of the tile at its centre)
+  floor: vec4<f32>,
+  // per light (key, overhead), its shadow seen from the floor: angular radius of the source (rad),
+  // depth range of its shadow projection (m), extent of the projection (m), coverage-map texels per side
+  keyCov: vec4<f32>,
+  overCov: vec4<f32>,
 };
 
 struct LayerR {

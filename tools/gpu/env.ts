@@ -4,10 +4,12 @@
  * GPU work is submitted in short chunks with idle gaps so a long experiment never monopolizes the
  * GPU the desktop compositor also needs.
  */
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { acquireGpu } from '../../src/gpu/device';
+import type { FloorImage, FloorImages } from '../../src/rendering/renderer';
 import { defaultSceneSpecs, type LayerSpec } from '../../src/simulation/scene';
 
 export const ROOT = resolve(import.meta.dirname, '../..');
@@ -133,4 +135,18 @@ export function experimentSpecs(): LayerSpec[] {
 /** Drape file for the experiment scene (DRAPE, default public/drape.bin). */
 export function drapeFile(): string {
   return resolve(ROOT, process.env.DRAPE ?? 'public/drape.bin');
+}
+
+/** Decode an image to RGBA8 with ImageMagick (the browser decodes with createImageBitmap). */
+function decodeImage(file: string): FloorImage {
+  const [width, height] = execFileSync('magick', ['identify', '-format', '%w %h', file], { encoding: 'utf8' }).trim().split(' ').map(Number);
+  const data = execFileSync('magick', [file, '-depth', '8', 'rgba:-'], { maxBuffer: 4 * width * height + 1024 });
+  return { width, height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) };
+}
+
+/** The app's floor material set (public/texture), or none with FLOOR=none. */
+export function floorImages(): FloorImages | null {
+  if (process.env.FLOOR === 'none') return null;
+  const at = (name: string) => decodeImage(resolve(ROOT, 'public/texture', name));
+  return { base: at('floor_baseColor.jpg'), normal: at('floor_normal.png'), roughness: at('floor_roughness.jpg'), ao: at('floor_AO.jpg') };
 }

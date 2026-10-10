@@ -20,6 +20,10 @@ import postWgsl from './wgsl/post.wgsl?raw';
 import weaveTileWgsl from './wgsl/weave_tile.wgsl?raw';
 import edgeFieldWgsl from './wgsl/edgefield.wgsl?raw';
 import edgeRootsWgsl from './wgsl/edge_roots.wgsl?raw';
+import floorWgsl from './wgsl/floor.wgsl?raw';
+import coverageWgsl from './wgsl/coverage.wgsl?raw';
+import mipgenWgsl from './wgsl/mipgen.wgsl?raw';
+import mountWgsl from './wgsl/mount.wgsl?raw';
 
 export interface CameraState {
   target: Vec3;
@@ -48,6 +52,36 @@ const TILE_SIZE = 128;
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 const SHADOW_SIZE = 4096;
 const SHADOW_HALF = 0.34;
+/**
+ * Depth range of the key's and the overhead light's shadow projections (m): from the key's, deep
+ * enough to hold the mount wherever the floor's view of the key crosses it.
+ */
+const SHADOW_NEAR = 0.3;
+const SHADOW_FAR = 1.2;
+const OVER_NEAR = 0.7;
+const OVER_FAR = 1.3;
+/** Overhead light's shadow map: texels per side and half its extent (m), covering the visible floor and its fill's reach. */
+const OVER_SIZE = 2048;
+const OVER_HALF = 0.45;
+/** Shadow-map texels per side of a floor coverage texel (coverage.wgsl). */
+const COV_BLOCK = 4;
+/**
+ * Angular radius of the key (rad): the penumbra its cloth shadows use (3 texels over a nominal 2 mm
+ * occluder gap, render_light.wgsl), i.e. a source about 0.33 m across at its distance.
+ */
+const KEY_ANGULAR_RADIUS = (3 * (2 * SHADOW_HALF)) / SHADOW_SIZE / 2e-3;
+const FRAME_BYTES = 512;
+
+/** An image for the floor material: decoded RGBA8 bytes (headless) or a browser image bitmap. */
+export type FloorImage = ImageBitmap | { width: number; height: number; data: Uint8Array };
+
+/** The floor's scanned material set. */
+export interface FloorImages {
+  base: FloorImage;
+  normal: FloorImage;
+  roughness: FloorImage;
+  ao: FloorImage;
+}
 /** Sub-quads per lattice cell edge of the bicubic surface. */
 const REFINE = 2;
 /** Vec4s per run of the per-frame thread geometry (render_common.wgsl RUN_GEO). */
@@ -157,8 +191,36 @@ export class Renderer {
   keyCone = 0.9;
   /** Radiance behind the cloth (the void seen through openings). */
   background: Vec3 = [0.002, 0.002, 0.003];
+  /**
+   * The room's overhead lamp: direction toward it, irradiance on a surface facing it, colour, and
+   * angular radius (rad). A dim fixture high above, tilted toward the top of the frame like the key:
+   * light falling through an opening lands on the floor close beneath it.
+   */
+  overDir: Vec3 = normalize([-0.03, 0.17, 1]);
+  overIntensity = 0.1;
+  overColor: Vec3 = [1.0, 0.92, 0.82];
+  overAngle = 0.065;
+  /**
+   * Floor beneath the cloth (m): parallel to the mount and below everything the cloth hangs to (pulled
+   * flaps reach ~6 cm, a grip pushes 3 cm), so it never meets the cloth; and its material's texture
+   * repeat (m, the scanned set's real size).
+   */
+  floorZ = -0.12;
+  floorTile = 2.5;
+  /** Texels per tile of the floor's base colour and normal maps (public/texture holds their centre crop). */
+  floorDetailTexels = 8192;
 
   private readonly frameU: GPUBuffer;
+  /** The frame uniform as the overhead light's shadow pass sees it (its projection in place of the key's). */
+  private readonly frameOverU: GPUBuffer;
+  private readonly overTex: GPUTexture;
+  /** Floor coverage of the key's and the overhead light's shadow maps (coverage.wgsl), mipmapped. */
+  private readonly keyCov: GPUTexture;
+  private readonly overCov: GPUTexture;
+  private readonly covGroups: { pipe: GPUComputePipeline; group: GPUBindGroup; size: number }[] = [];
+  private floorGroup: GPUBindGroup | null = null;
+  private readonly floorLayout: GPUBindGroupLayout;
+  private readonly mountCorners: GPUBuffer;
   private readonly renderU: GPUBuffer;
   private readonly nrm: GPUBuffer;
   /** Per node: unit +u tangent with the node's wear in w, unit +v tangent. */
@@ -251,7 +313,8 @@ export class Renderer {
     });
     this.edgeSize = [edgeW, edgeH];
 
-    this.frameU = createBuffer(device, 'frameU', 256, UNIFORM);
+    this.frameU = createBuffer(device, 'frameU', FRAME_BYTES, UNIFORM);
+    this.frameOverU = createBuffer(device, 'frameOverU', FRAME_BYTES, UNIFORM);
     this.renderU = createBufferWith(device, 'renderU', new Uint8Array(this.renderParams()), UNIFORM);
     const nInit = new Float32Array(4 * N);
     for (let n = 0; n < N; n++) nInit[4 * n + 2] = 1;
@@ -427,6 +490,15 @@ export class Renderer {
     this.shadowTex = device.createTexture({ label: 'shadowMap', size: [SHADOW_SIZE, SHADOW_SIZE], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
     this.dummyDepth = device.createTexture({ size: [1, 1], format: 'depth32float', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
     this.shadowSampler = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
+    this.overTex = device.createTexture({ label: 'overShadowMap', size: [OVER_SIZE, OVER_SIZE], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    const covTex = (label: string, size: number) =>
+      device.createTexture({ label, size: [size, size], format: 'rgba16float', mipLevelCount: Math.log2(size) + 1, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+    this.keyCov = covTex('keyCoverage', SHADOW_SIZE / COV_BLOCK);
+    this.overCov = covTex('overCoverage', OVER_SIZE / COV_BLOCK);
+    this.buildCoverage([
+      [this.shadowTex, this.keyCov],
+      [this.overTex, this.overCov],
+    ]);
     this.weaveTile = this.buildWeaveTile(common);
     this.tileSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
 
@@ -458,16 +530,17 @@ export class Renderer {
         ro(13),
         ro(14),
         ro(15),
+        { binding: 16, visibility: F, texture: { sampleType: 'depth' } },
       ],
     });
     const fuzzLayout = device.createBindGroupLayout({
       label: 'fuzz',
       // fibre strands are lit per vertex
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9, VF)],
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ...shadowEntries(9, VF), { binding: 11, visibility: VF, texture: { sampleType: 'depth' } }],
     });
     const threadLayout = device.createBindGroupLayout({
       label: 'thread',
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9), ro(11)],
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9), ro(11), { binding: 12, visibility: F, texture: { sampleType: 'depth' } }],
     });
 
     const depth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' };
@@ -501,19 +574,34 @@ export class Renderer {
     this.pipes.thread = pipe('thread', threadLayout, threadModule, 'vsThread', 'fsThread', strip, coverage);
     this.pipes.threadShadow = pipe('thread.shadow', threadLayout, threadModule, 'vsThreadShadow', null, strip, null);
     this.pipes.threadFuzz = pipe('threadFuzz', threadLayout, threadModule, 'vsThreadFuzz', 'fsThreadFuzz', strip, ms, blended);
+    const tex = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility: F, texture: { sampleType: 'float' } });
+    this.floorLayout = device.createBindGroupLayout({
+      label: 'floor',
+      entries: [uni(0), tex(1), tex(2), tex(3), { binding: 4, visibility: F, sampler: { type: 'filtering' } }, tex(5), tex(6), { binding: 7, visibility: F, sampler: { type: 'filtering' } }, { binding: 11, visibility: F, sampler: { type: 'filtering' } }],
+    });
+    const floorModule = shaderModule(device, 'floor', common + lightWgsl + floorWgsl);
+    this.pipes.floor = pipe('floor', this.floorLayout, floorModule, 'vsFloor', 'fsFloor', list, ms);
+    const mountLayout = device.createBindGroupLayout({ label: 'mount', entries: [uni(0), ro(1), ...shadowEntries(2), { binding: 4, visibility: F, texture: { sampleType: 'depth' } }] });
+    const mountModule = shaderModule(device, 'mount', common + lightWgsl + mountWgsl);
+    this.pipes.mount = pipe('mount', mountLayout, mountModule, 'vsMount', 'fsMount', list, ms);
+    this.pipes.mountShadow = pipe('mount.shadow', mountLayout, mountModule, 'vsMountShadow', null, list, null);
+    this.mountCorners = createBufferWith(device, 'mountCorners', this.mountGeometry());
 
     const tileView = this.weaveTile.createView({ dimension: '2d-array' });
     const edgeView = this.edgeTex.createView();
     const shadowView = this.shadowTex.createView();
     const dummyView = this.dummyDepth.createView();
-    for (const [suffix, shadow] of [
-      ['', shadowView],
-      ['Shadow', dummyView],
+    const overView = this.overTex.createView();
+    // the shaded passes read both shadow maps; the two shadow passes (each writing one) neither
+    for (const [suffix, shadow, over, frame] of [
+      ['', shadowView, overView, this.frameU],
+      ['Shadow', dummyView, dummyView, this.frameU],
+      ['Over', dummyView, dummyView, this.frameOverU],
     ] as const) {
       this.groups[`surface${suffix}`] = device.createBindGroup({
         layout: surfaceLayout,
         entries: [
-          { binding: 0, resource: { buffer: this.frameU } },
+          { binding: 0, resource: { buffer: frame } },
           { binding: 1, resource: { buffer: this.renderU } },
           { binding: 2, resource: { buffer: this.rsurf } },
           { binding: 3, resource: { buffer: this.cellFlags } },
@@ -529,12 +617,13 @@ export class Renderer {
           { binding: 13, resource: { buffer: solver.x } },
           { binding: 14, resource: { buffer: this.tframe } },
           { binding: 15, resource: { buffer: this.kappa } },
+          { binding: 16, resource: over },
         ],
       });
       this.groups[`thread${suffix}`] = device.createBindGroup({
         layout: threadLayout,
         entries: [
-          { binding: 0, resource: { buffer: this.frameU } },
+          { binding: 0, resource: { buffer: frame } },
           { binding: 1, resource: { buffer: this.renderU } },
           { binding: 2, resource: { buffer: solver.x } },
           { binding: 3, resource: { buffer: solver.segs } },
@@ -546,6 +635,23 @@ export class Renderer {
           { binding: 11, resource: { buffer: this.tails } },
           { binding: 9, resource: shadow },
           { binding: 10, resource: this.shadowSampler },
+          { binding: 12, resource: over },
+        ],
+      });
+    }
+    for (const [name, frame, shadow, over] of [
+      ['mount', this.frameU, shadowView, overView],
+      ['mountShadow', this.frameU, dummyView, dummyView],
+      ['mountOver', this.frameOverU, dummyView, dummyView],
+    ] as const) {
+      this.groups[name] = device.createBindGroup({
+        layout: this.pipes.mount.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: frame } },
+          { binding: 1, resource: { buffer: this.mountCorners } },
+          { binding: 2, resource: shadow },
+          { binding: 3, resource: this.shadowSampler },
+          { binding: 4, resource: over },
         ],
       });
     }
@@ -559,6 +665,7 @@ export class Renderer {
         { binding: 4, resource: { buffer: solver.field } },
         { binding: 9, resource: shadowView },
         { binding: 10, resource: this.shadowSampler },
+        { binding: 11, resource: overView },
       ],
     });
 
@@ -622,6 +729,140 @@ export class Renderer {
     this.device.queue.submit([enc.finish()]);
     void this.device.queue.onSubmittedWorkDone().then(() => temps.forEach((b) => b.destroy()));
     return tex;
+  }
+
+  /**
+   * The mount (mount.wgsl): inner corners under the pinned collar (the second node in from each corner
+   * of the first layer), just beneath the cloth, and outer corners far beyond the view.
+   */
+  private mountGeometry(): Float32Array {
+    const L = this.scene.layers[0];
+    const p = this.scene.position;
+    const node = (i: number, j: number) => L.nodeOffset + j * L.nx + i;
+    const inner = [node(1, 1), node(L.nx - 2, 1), node(L.nx - 2, L.ny - 2), node(1, L.ny - 2)];
+    const z = p[3 * inner[0] + 2] - 0.5 * L.weave.thickness;
+    const out = new Float32Array(32);
+    inner.forEach((n, k) => out.set([p[3 * n], p[3 * n + 1], z, 0], 4 * k));
+    const R = 1.5;
+    [[-R, -R], [R, -R], [R, R], [-R, R]].forEach(([x, y], k) => out.set([x, y, z, 0], 16 + 4 * k));
+    return out;
+  }
+
+  /** Coverage passes (coverage.wgsl) of each [shadow map, coverage texture]: level 0 from depth, then the mip chain. */
+  private buildCoverage(maps: [GPUTexture, GPUTexture][]): void {
+    const module = shaderModule(this.device, 'coverage', coverageWgsl);
+    const C = GPUShaderStage.COMPUTE;
+    const layout = this.device.createBindGroupLayout({
+      label: 'coverage',
+      entries: [
+        { binding: 0, visibility: C, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: C, texture: { sampleType: 'depth' } },
+        { binding: 2, visibility: C, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 3, visibility: C, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+        { binding: 4, visibility: C, sampler: { type: 'non-filtering' } },
+      ],
+    });
+    const gather = this.device.createSampler({ label: 'coverage.gather' });
+    const pl = this.device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    const fromDepth = this.device.createComputePipeline({ label: 'coverage.fromDepth', layout: pl, compute: { module, entryPoint: 'fromDepth' } });
+    const down = this.device.createComputePipeline({ label: 'coverage.down', layout: pl, compute: { module, entryPoint: 'down' } });
+    const blockU = createBufferWith(this.device, 'coverage.block', new Uint32Array([COV_BLOCK, 0, 0, 0]), UNIFORM);
+    const unusedDepth = this.device.createTexture({ size: [1, 1], format: 'depth32float', usage: GPUTextureUsage.TEXTURE_BINDING });
+    const unusedCov = this.device.createTexture({ size: [1, 1], format: 'rgba16float', usage: GPUTextureUsage.TEXTURE_BINDING });
+    for (const [depth, cov] of maps) {
+      for (let k = 0; k < cov.mipLevelCount; k++) {
+        const level = (m: number) => cov.createView({ baseMipLevel: m, mipLevelCount: 1 });
+        const group = this.device.createBindGroup({
+          layout,
+          entries: [
+            { binding: 0, resource: { buffer: blockU } },
+            { binding: 1, resource: (k === 0 ? depth : unusedDepth).createView() },
+            { binding: 2, resource: k === 0 ? unusedCov.createView() : level(k - 1) },
+            { binding: 3, resource: level(k) },
+            { binding: 4, resource: gather },
+          ],
+        });
+        this.covGroups.push({ pipe: k === 0 ? fromDepth : down, group, size: cov.width >> k });
+      }
+    }
+  }
+
+  /** Upload the floor's material set (mipmapped, roughness and AO packed); the floor is drawn from then on. */
+  setFloorImages(images: FloorImages): void {
+    const device = this.device;
+    const levelsOf = (img: FloorImage) => Math.floor(Math.log2(Math.max(img.width, img.height))) + 1;
+    const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT;
+    const upload = (label: string, img: FloorImage, format: GPUTextureFormat, mipLevelCount: number) => {
+      const t = device.createTexture({ label, size: [img.width, img.height], format, mipLevelCount, usage });
+      if ('data' in img) device.queue.writeTexture({ texture: t }, img.data, { bytesPerRow: 4 * img.width }, [img.width, img.height]);
+      else device.queue.copyExternalImageToTexture({ source: img }, { texture: t }, [img.width, img.height]);
+      return t;
+    };
+    const base = upload('floor.base', images.base, 'rgba8unorm-srgb', levelsOf(images.base));
+    const normal = upload('floor.normal', images.normal, 'rgba8unorm', levelsOf(images.normal));
+    const rough = upload('floor.roughness', images.roughness, 'rgba8unorm', 1);
+    const ao = upload('floor.ao', images.ao, 'rgba8unorm', 1);
+    const ra = device.createTexture({ label: 'floor.ra', size: [rough.width, rough.height], format: 'rg8unorm', mipLevelCount: levelsOf(images.roughness), usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT });
+
+    const module = shaderModule(device, 'mipgen', mipgenWgsl);
+    const layout = device.createBindGroupLayout({
+      label: 'mipgen',
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ],
+    });
+    const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    const pipes = new Map<string, GPURenderPipeline>();
+    const pipeFor = (format: GPUTextureFormat, entryPoint: string) => {
+      const key = `${format}.${entryPoint}`;
+      let p = pipes.get(key);
+      if (!p) {
+        p = device.createRenderPipeline({ label: `mipgen.${key}`, layout: pl, vertex: { module, entryPoint: 'vsFull' }, fragment: { module, entryPoint, targets: [{ format }] }, primitive: { topology: 'triangle-list' } });
+        pipes.set(key, p);
+      }
+      return p;
+    };
+    const linear = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+    const enc = device.createCommandEncoder({ label: 'floor.mips' });
+    const blit = (t: GPUTexture, level: number, entryPoint: string, a: GPUTextureView, b: GPUTextureView) => {
+      const pass = enc.beginRenderPass({ colorAttachments: [{ view: t.createView({ baseMipLevel: level, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+      pass.setPipeline(pipeFor(t.format, entryPoint));
+      pass.setBindGroup(0, device.createBindGroup({ layout, entries: [{ binding: 0, resource: a }, { binding: 1, resource: b }, { binding: 2, resource: linear }] }));
+      pass.draw(3);
+      pass.end();
+    };
+    blit(ra, 0, 'fsPack', rough.createView(), ao.createView());
+    for (const t of [base, normal, ra]) {
+      for (let k = 1; k < t.mipLevelCount; k++) {
+        const src = t.createView({ baseMipLevel: k - 1, mipLevelCount: 1 });
+        blit(t, k, 'fsDown', src, src);
+      }
+    }
+    device.queue.submit([enc.finish()]);
+    void device.queue.onSubmittedWorkDone().then(() => {
+      rough.destroy();
+      ao.destroy();
+    });
+    const matSampler = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
+    const covSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear' });
+    const detailSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: 16 });
+    this.floorGroup = device.createBindGroup({
+      label: 'floor',
+      layout: this.floorLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameU } },
+        { binding: 1, resource: base.createView() },
+        { binding: 2, resource: normal.createView() },
+        { binding: 3, resource: ra.createView() },
+        { binding: 4, resource: matSampler },
+        { binding: 5, resource: this.keyCov.createView() },
+        { binding: 6, resource: this.overCov.createView() },
+        { binding: 7, resource: covSampler },
+        { binding: 11, resource: detailSampler },
+      ],
+    });
   }
 
   private renderParams(): ArrayBuffer {
@@ -696,8 +937,16 @@ export class Renderer {
     const dir = normalize(sub(key, target));
     const eye: Vec3 = [target[0] + dir[0] * 0.9, target[1] + dir[1] * 0.9, target[2] + dir[2] * 0.9];
     const view = lookAt(eye, target, Math.abs(dir[2]) > 0.95 ? [0, 1, 0] : [0, 0, 1]);
-    const proj = orthographic(-SHADOW_HALF, SHADOW_HALF, -SHADOW_HALF, SHADOW_HALF, 0.6, 1.2);
+    const proj = orthographic(-SHADOW_HALF, SHADOW_HALF, -SHADOW_HALF, SHADOW_HALF, SHADOW_NEAR, SHADOW_FAR);
     return multiply(proj, view);
+  }
+
+  /** The overhead light's shadow projection: orthographic along its direction (it is distant). */
+  private overMatrix(target: Vec3): Mat4 {
+    const d = normalize(this.overDir);
+    const eye: Vec3 = [target[0] + d[0], target[1] + d[1], target[2] + d[2]];
+    const view = lookAt(eye, target, Math.abs(d[2]) > 0.95 ? [0, 1, 0] : [0, 0, 1]);
+    return multiply(orthographic(-OVER_HALF, OVER_HALF, -OVER_HALF, OVER_HALF, OVER_NEAR, OVER_FAR), view);
   }
 
 
@@ -713,7 +962,7 @@ export class Renderer {
     // aim the key slightly above the frame centre so illumination falls off toward the bottom
     const aim: Vec3 = [camera.target[0] + this.keyAim[0], camera.target[1] + this.keyAim[1], camera.target[2] + this.keyAim[2]];
     const axis = normalize(sub(aim, key));
-    const fu = new Float32Array(64);
+    const fu = new Float32Array(FRAME_BYTES / 4);
     fu.set(m.viewProj, 0);
     fu.set(this.lightMatrix(camera.target), 16);
     fu.set([...m.eye, camera.fovY / this.height], 32);
@@ -724,7 +973,20 @@ export class Renderer {
     fu.set([this.width, this.height, 1 / this.width, 1 / this.height], 48);
     const kd = Math.hypot(key[0] - camera.target[0], key[1] - camera.target[1], key[2] - camera.target[2]);
     fu.set([this.exposure, time, kd, this.frameIndex++], 52);
+    const over = this.overMatrix(camera.target);
+    const od = normalize(this.overDir);
+    fu.set(over, 56);
+    fu.set([...od, (2 * OVER_HALF) / OVER_SIZE], 72);
+    fu.set([...this.overColor.map((c) => c * this.overIntensity), this.overAngle], 76);
+    fu.set([this.floorZ, 1 / this.floorTile, this.floorGroup ? 1 : 0, this.floorDetailTexels], 80);
+    fu.set([KEY_ANGULAR_RADIUS, SHADOW_FAR - SHADOW_NEAR, 2 * SHADOW_HALF, SHADOW_SIZE / COV_BLOCK], 84);
+    fu.set([this.overAngle, OVER_FAR - OVER_NEAR, 2 * OVER_HALF, OVER_SIZE / COV_BLOCK], 88);
     this.device.queue.writeBuffer(this.frameU, 0, fu);
+    // the overhead light's shadow pass: its projection in place of the key's, and the loose threads'
+    // ribbons turned toward it (they face keyPos when drawn from the light)
+    fu.set(over, 16);
+    fu.set([camera.target[0] + 10 * od[0], camera.target[1] + 10 * od[1], camera.target[2] + 10 * od[2]], 36);
+    this.device.queue.writeBuffer(this.frameOverU, 0, fu);
 
     const N = this.scene.nodeCount;
     encoder.clearBuffer(this.lists, 0, 16);
@@ -793,7 +1055,39 @@ export class Renderer {
     sp.setBindGroup(0, this.groups.threadShadow);
     sp.setPipeline(this.pipes.threadShadow);
     sp.drawIndirect(this.threadDraw, 0);
+    sp.setBindGroup(0, this.groups.mountShadow);
+    sp.setPipeline(this.pipes.mountShadow);
+    sp.draw(24);
     sp.end();
+
+    const op = encoder.beginRenderPass({
+      label: 'overShadow',
+      colorAttachments: [],
+      depthStencilAttachment: { view: this.overTex.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+    });
+    op.setBindGroup(0, this.groups.surfaceOver);
+    op.setPipeline(this.pipes.surfaceShadow);
+    op.draw(surfaceVerts, this.cellCount);
+    op.setPipeline(this.pipes.fineShadow);
+    op.drawIndirect(this.drawArgs, 64);
+    op.setBindGroup(0, this.groups.threadOver);
+    op.setPipeline(this.pipes.threadShadow);
+    op.drawIndirect(this.threadDraw, 0);
+    op.setBindGroup(0, this.groups.mountOver);
+    op.setPipeline(this.pipes.mountShadow);
+    op.draw(24);
+    op.end();
+
+    if (this.floorGroup) {
+      // the floor's view of the cloth from each light
+      const cc = encoder.beginComputePass({ label: 'floorCoverage' });
+      for (const c of this.covGroups) {
+        cc.setPipeline(c.pipe);
+        cc.setBindGroup(0, c.group);
+        cc.dispatchWorkgroups(Math.ceil(c.size / 8), Math.ceil(c.size / 8));
+      }
+      cc.end();
+    }
 
     const mp = encoder.beginRenderPass({
       label: 'main',
@@ -809,6 +1103,16 @@ export class Renderer {
     mp.setBindGroup(0, this.groups.thread);
     mp.setPipeline(this.pipes.thread);
     mp.drawIndirect(this.threadDraw, 0);
+    mp.setBindGroup(0, this.groups.mount);
+    mp.setPipeline(this.pipes.mount);
+    mp.draw(24);
+    if (this.floorGroup) {
+      // after the opaque cloth (only what shows through it is shaded), before the blended fibre over it
+      mp.setBindGroup(0, this.floorGroup);
+      mp.setPipeline(this.pipes.floor);
+      mp.draw(6);
+    }
+    mp.setBindGroup(0, this.groups.thread);
     mp.setPipeline(this.pipes.threadFuzz);
     mp.drawIndirect(this.threadDraw, 16);
     mp.setBindGroup(0, this.groups.fuzz);

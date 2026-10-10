@@ -1,6 +1,8 @@
 # Handoff (rolling)
 
-Latest round: `docs/decisions/2026-10-10-tear-sound-sample.md` (tear sound: the recording's tearing passages
+Latest round: `docs/decisions/2026-10-10-floor-and-room-light.md` (render-only floor 12 cm below, mount board,
+dim overhead lamp, 8K base/normal cropped to the visible floor; uncommitted).
+Before: `docs/decisions/2026-10-10-tear-sound-sample.md` (tear sound: the recording's tearing passages
 played back; the mechanics control only tearing on/off, loudness and place; fall-off on stop/release; uncommitted).
 Before: `docs/decisions/2026-10-10-tear-sound-structure.md` (the procedural voice it replaced).
 Before: `docs/decisions/2026-10-10-tear-sound.md` (records, transport, multi-touch, page UI).

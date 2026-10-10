@@ -1,4 +1,5 @@
-// Lighting shared by the shaded passes (requires a module-scope `F: FrameU` uniform).
+// Lighting shared by the shaded passes (requires a module-scope `F: FrameU` uniform and the shadow
+// maps shadowMap (key), overMap (overhead light) with shadowSampler).
 
 // ---------------------------------------------------------------- lighting
 
@@ -46,27 +47,56 @@ fn fiberShade(N: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Ldir: vec3<f32>, albedo:
   return diff + spec + sheen;
 }
 
-// Soft shadow from the broad key light: PCF over a rotated Poisson disk whose radius grows with the
-// blocker distance (light size), requires module-scope shadowMap / shadowSampler bindings.
-fn shadowFactor(world: vec3<f32>, nrmW: vec3<f32>) -> f32 {
-  let texel = F.ambient.w;
-  let p = F.lightViewProj * vec4<f32>(world + nrmW * (1.5 * texel), 1.0);
+// Soft shadow from a broad light: PCF over a rotated Poisson disk of radiusTexels shadow-map texels
+// (the penumbra the light's size gives a nominal 2 mm occluder gap).
+// bias: the depth offset of the comparison (m) over the projection's depth range (m).
+fn shadowPCF(map: texture_depth_2d, smp: sampler_comparison, M: mat4x4<f32>, texel: f32, radiusTexels: f32, bias: f32, world: vec3<f32>, nrmW: vec3<f32>) -> f32 {
+  let p = M * vec4<f32>(world + nrmW * (1.5 * texel), 1.0);
   let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
   if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) { return 1.0; }
-  let depth = p.z - 0.0004;
+  let depth = p.z - bias;
   var taps = array<vec2<f32>, 8>(
     vec2<f32>(-0.326, -0.406), vec2<f32>(-0.840, -0.074), vec2<f32>(-0.696, 0.457), vec2<f32>(-0.203, 0.621),
     vec2<f32>(0.962, -0.195), vec2<f32>(0.473, -0.480), vec2<f32>(0.519, 0.767), vec2<f32>(0.185, -0.893));
-  let dims = vec2<f32>(textureDimensions(shadowMap));
+  let dims = vec2<f32>(textureDimensions(map));
   let ang = hash2f(u32(world.x * 4e5 + 1e5), u32(world.y * 4e5 + 1e5)) * 6.2831853;
   let cs = vec2<f32>(cos(ang), sin(ang));
-  // penumbra: the key light subtends ~F.params.z / distance; scale with a nominal 2 mm occluder gap
-  let radius = clamp(3.0 / dims.x, 1.5 / dims.x, 6.0 / dims.x);
+  let radius = clamp(radiusTexels, 1.5, 6.0) / dims.x;
   var acc = 0.0;
   for (var k = 0u; k < 8u; k++) {
     let d = taps[k];
     let r = vec2<f32>(d.x * cs.x - d.y * cs.y, d.x * cs.y + d.y * cs.x);
-    acc += textureSampleCompareLevel(shadowMap, shadowSampler, uv + r * radius, depth);
+    acc += textureSampleCompareLevel(map, smp, uv + r * radius, depth);
   }
   return acc / 8.0;
+}
+
+// Depth offset of the shadow comparison (m).
+const SHADOW_BIAS: f32 = 0.24e-3;
+
+// The key's shadow (module-scope shadowMap / shadowSampler).
+fn shadowFactor(world: vec3<f32>, nrmW: vec3<f32>) -> f32 {
+  return shadowPCF(shadowMap, shadowSampler, F.lightViewProj, F.ambient.w, 3.0, SHADOW_BIAS / F.keyCov.y, world, nrmW);
+}
+
+// The overhead light's shadow (module-scope overMap). The small lamp's penumbra over a nominal 2 mm
+// gap is a fraction of a texel, so four bilinear comparisons a texel apart (a fixed 4 x 4 texel
+// footprint, no rotated disk) resolve it.
+fn shadowOver(world: vec3<f32>, nrmW: vec3<f32>) -> f32 {
+  let texel = F.overDir.w;
+  let p = F.overViewProj * vec4<f32>(world + nrmW * (1.5 * texel), 1.0);
+  let uv = vec2<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+  if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) { return 1.0; }
+  let depth = p.z - SHADOW_BIAS / F.overCov.y;
+  let o = 0.5 / f32(textureDimensions(overMap).x);
+  var acc = textureSampleCompareLevel(overMap, shadowSampler, uv + vec2<f32>(-o, -o), depth);
+  acc += textureSampleCompareLevel(overMap, shadowSampler, uv + vec2<f32>(o, -o), depth);
+  acc += textureSampleCompareLevel(overMap, shadowSampler, uv + vec2<f32>(-o, o), depth);
+  acc += textureSampleCompareLevel(overMap, shadowSampler, uv + vec2<f32>(o, o), depth);
+  return 0.25 * acc;
+}
+
+// Fibre BRDF times cos for the overhead light, with its shadow and colour.
+fn overShade(N: vec3<f32>, T: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>, fuzz: f32, world: vec3<f32>, nrmW: vec3<f32>) -> vec3<f32> {
+  return fiberShade(N, T, V, F.overDir.xyz, albedo, fuzz) * F.overColor.rgb * shadowOver(world, nrmW);
 }

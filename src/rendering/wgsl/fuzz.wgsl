@@ -21,6 +21,7 @@
 @group(0) @binding(4) var<storage, read> fieldY: array<u32>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
+@group(0) @binding(11) var overMap: texture_depth_2d;
 
 const FIBER_PTS: u32 = FIBER_VERTS / 2u;
 // strands per open side (FIBERS_PER_EDGE are dealt round a crossing's open sides)
@@ -128,13 +129,28 @@ fn fibreKey(P: vec3<f32>, T: vec3<f32>, V: vec3<f32>) -> vec4<f32> {
   return vec4<f32>(key.xyz, key.w * shadowFactor(P, normalize(V - dot(V, T) * T)));
 }
 
-fn fibreLight(key: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32) -> FibreLit {
+// The overhead light at P (direction, its shadow) for a fibre of tangent T seen from V.
+fn fibreOver(P: vec3<f32>, T: vec3<f32>, V: vec3<f32>) -> vec4<f32> {
+  return vec4<f32>(F.overDir.xyz, shadowOver(P, normalize(V - dot(V, T) * T)));
+}
+
+// One light of direction Ld and irradiance E through optical depth tau.
+fn fibreDirect(Ld: vec3<f32>, E: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32) -> FibreLit {
   let N = normalize(V - dot(V, T) * T);
   let direct = exp(-tau);
-  let kd = diffusion(a);
   var o: FibreLit;
-  o.single = fiberShade(N, T, V, key.xyz, a, 0.3) * (direct * key.w);
-  o.multi = a * (1.0 / PI) * abs(dot(Nc, key.xyz)) * max(exp(-kd * tau) - vec3<f32>(direct), vec3<f32>(0.0)) * key.w + F.ambient.rgb * a * exp(-kd * tau);
+  o.single = fiberShade(N, T, V, Ld, a, 0.3) * direct * E;
+  o.multi = a * (1.0 / PI) * abs(dot(Nc, Ld)) * max(exp(-diffusion(a) * tau) - vec3<f32>(direct), vec3<f32>(0.0)) * E;
+  return o;
+}
+
+// The key (through tau), the overhead light (through tauO) and the fill.
+fn fibreLight(key: vec4<f32>, over: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32, tauO: f32) -> FibreLit {
+  let k = fibreDirect(key.xyz, vec3<f32>(key.w), T, V, Nc, a, tau);
+  let o2 = fibreDirect(over.xyz, F.overColor.rgb * over.w, T, V, Nc, a, tauO);
+  var o: FibreLit;
+  o.single = k.single + o2.single;
+  o.multi = k.multi + o2.multi + F.ambient.rgb * a * exp(-diffusion(a) * tau);
   return o;
 }
 
@@ -187,16 +203,19 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
   let x = x0 + dot(P - root, outW);
   let up = select(h, 1.0 - h, dot(N, F.keyPos.xyz - P) > 0.0);
   let rim = select(1.0, exp(-x / RIM_HAIR_LEN), x > 0.0);
-  let tau = up * (tauEnd * endReach(x) + tauRim * rim);
+  let tau0 = tauEnd * endReach(x) + tauRim * rim;
+  let tau = up * tau0;
+  let tauO = select(h, 1.0 - h, dot(N, F.overDir.xyz) > 0.0) * tau0;
   let undyed = select(WEFT_FIBRE, CORE_FIBRE, m.undyed == 0u);
   o.keyAcross = dot(normalize(F.keyPos.xyz - P), B) * sideSign;
   let key = fibreKey(P, dP, V);
+  let over = fibreOver(P, dP, V);
   if (m.n > 0.0) {
-    let u = fibreLight(key, dP, V, N, undyed, tau);
+    let u = fibreLight(key, over, dP, V, N, undyed, tau, tauO);
     o.litU = u.single;
     o.msU = u.multi;
     if (m.dyed > 0.0) {
-      let d = fibreLight(key, dP, V, N, DYED_FIBRE, tau);
+      let d = fibreLight(key, over, dP, V, N, DYED_FIBRE, tau, tauO);
       o.litD = d.single;
       o.msD = d.multi;
     } else {
@@ -206,7 +225,7 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
   } else {
     // the compact yarn end: a warp shows its dyed surface, paling as it untwists toward the fans
     let a = select(WEFT_FIBRE, mix(vec3<f32>(0.054, 0.078, 0.16), mix(DYED_FIBRE, CORE_FIBRE, 0.5), t * t), m.undyed == 0u);
-    let e = fibreLight(key, dP, V, N, a, tau);
+    let e = fibreLight(key, over, dP, V, N, a, tau, tauO);
     o.litU = e.single + e.multi;
   }
   return o;

@@ -18,6 +18,7 @@
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
 // free tails of threads held at one end (thread_prep.wgsl tailSolve)
 @group(0) @binding(11) var<storage, read> tails: array<vec4<f32>>;
+@group(0) @binding(12) var overMap: texture_depth_2d;
 
 const CHUNK_PTS: u32 = THREAD_VERTS / 2u;
 const FIBER_PTS: u32 = FIBER_VERTS / 2u;
@@ -129,7 +130,7 @@ fn fsThread(in: VOut) -> @location(0) vec4<f32> {
   let sh = shadowFactor(in.world, N);
   let amb = F.ambient.rgb * (0.55 + 0.45 * N.z);
   let ao = mix(0.6, 1.0, crown);
-  let c = fiberShade(N, Tf, V, key.xyz, look.albedo, look.fuzz + 0.25) * (key.w * sh) + amb * look.albedo * ao;
+  let c = fiberShade(N, Tf, V, key.xyz, look.albedo, look.fuzz + 0.25) * (key.w * sh) + overShade(N, Tf, V, look.albedo, look.fuzz + 0.25, in.world, N) + amb * look.albedo * ao;
   return vec4<f32>(c, in.alpha);
 }
 
@@ -210,6 +211,6 @@ fn fsThreadFuzz(in: FOut) -> @location(0) vec4<f32> {
   if (!pale && in.id.y == 1u) { albedo = vec3<f32>(0.08, 0.12, 0.27); }
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, N);
-  let c = fiberShade(N, T, V, key.xyz, albedo, 0.2) * (key.w * sh) + F.ambient.rgb * albedo;
+  let c = fiberShade(N, T, V, key.xyz, albedo, 0.2) * (key.w * sh) + overShade(N, T, V, albedo, 0.2, in.world, N) + F.ambient.rgb * albedo;
   return vec4<f32>(c, in.alpha);
 }
