@@ -13,7 +13,7 @@ import { CAPTURES } from '../gpu/env';
 type V = [number, number, number];
 
 /** Parameter t in (0, 1) where segment p-q crosses triangle (a, b, c), or -1. */
-function segTri(p: V, q: V, a: V, b: V, c: V): number {
+export function segTri(p: V, q: V, a: V, b: V, c: V): number {
   const e1: V = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
   const e2: V = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
   const d: V = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];

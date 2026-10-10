@@ -16,6 +16,8 @@
 @group(0) @binding(8) var<storage, read> runGeo: array<vec4<f32>>;
 @group(0) @binding(9) var shadowMap: texture_depth_2d;
 @group(0) @binding(10) var shadowSampler: sampler_comparison;
+// free tails of threads held at one end (thread_prep.wgsl tailSolve)
+@group(0) @binding(11) var<storage, read> tails: array<vec4<f32>>;
 
 const CHUNK_PTS: u32 = THREAD_VERTS / 2u;
 const FIBER_PTS: u32 = FIBER_VERTS / 2u;

@@ -1,5 +1,6 @@
 // Per frame, per thread run (threads.wgsl): where its held ends are (the cloth they come out of,
-// material_map.wgsl) and whether the lattice chain carries it (thread_geom.wgsl RunGeo).
+// material_map.wgsl), whether the lattice chain carries it (thread_geom.wgsl RunGeo), and where a free
+// tail beyond the chain's reach leaves it (solved by thread_tail.wgsl).
 
 @group(0) @binding(0) var<uniform> R: RenderU;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -12,6 +13,8 @@
 @group(0) @binding(7) var<storage, read_write> runGeo: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> rsurf: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read> kappaM: array<u32>;
+// (runCenter reads the solved tails; threadPrep does not)
+var<private> tails: array<vec4<f32>, 1>;
 
 override MAX_RUNS: u32 = 65536u;
 
@@ -103,14 +106,50 @@ fn threadPrep(@builtin(global_invocation_id) gid: vec3<u32>) {
     g.pB = e[0];
     g.tB = e[1];
   }
-  // a run held at one end and not carried whole: how far its chain carries it from that end
+  // a run held at one end and not carried whole: how far its chain carries it from that end, and the
+  // free tail beyond
   var reach = select(ri.drawA, ri.drawB, ri.heldA);
-  if (!g.chain && ri.heldA != ri.heldB) { reach = chainReach(ri); }
-  runGeo[RUN_GEO * r] = vec4<f32>(select(0.0, 1.0, g.chain), reach, 0.0, 0.0);
+  var tailLen = 0.0;
+  if (!g.chain && ri.heldA != ri.heldB) {
+    reach = chainReach(ri);
+    let LR = R.layers[ri.layer];
+    let pitchAl = select(LR.pitch.y, LR.pitch.x, ri.fam == 0u);
+    tailLen = abs(select(ri.drawA, ri.drawB, ri.heldA) - reach) * pitchAl;
+    g.reach = reach;
+    let root = tailRoot(ri, g, cA, cB);
+    runGeo[RUN_GEO * r + 7u] = root[0];
+    runGeo[RUN_GEO * r + 8u] = root[1];
+  }
+  // the tail's slot is set by threadTail
+  runGeo[RUN_GEO * r] = vec4<f32>(select(0.0, 1.0, g.chain), reach, -1.0, tailLen);
   runGeo[RUN_GEO * r + 1u] = vec4<f32>(g.pA, 0.0);
   runGeo[RUN_GEO * r + 2u] = vec4<f32>(g.pB, 0.0);
   runGeo[RUN_GEO * r + 3u] = vec4<f32>(g.tA, 0.0);
   runGeo[RUN_GEO * r + 4u] = vec4<f32>(g.tB, 0.0);
   runGeo[RUN_GEO * r + 5u] = vec4<f32>(cA, 0.0);
   runGeo[RUN_GEO * r + 6u] = vec4<f32>(cB, 0.0);
+}
+
+// Where the free tail of a run held at one end leaves its chain (as runCenter leaves it): its root
+// point and the chain node there (w), and the yarn's direction.
+fn tailRoot(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>) -> array<vec4<f32>, 2> {
+  let LR = R.layers[ri.layer];
+  let fromA = ri.heldA;
+  let held = select(ri.drawB, ri.drawA, fromA);
+  let shift = endOffset(ri, g, cA, cB, g.reach);
+  var q = select(g.pB, g.pA, fromA);
+  var dir0 = select(-g.tB, g.tA, fromA);
+  let L = LR.lattice;
+  let f = ri.fam;
+  let Bal = f32(select(bundleOf(LR, 0u), bundleOf(LR, 1u), f == 0u));
+  let Bcr = select(bundleOf(LR, 1u), bundleOf(LR, 0u), f == 0u);
+  let len = select(L.z, L.y, f == 0u);
+  let a = u32(clamp(round((g.reach - 0.5 * (Bal - 1.0)) / Bal), 0.0, f32(len) - 1.0));
+  let root = chainNode(L, f, a, ri.yarn / Bcr);
+  if (g.reach != held) {
+    let e = centerAt(ri, g.reach);
+    q = e.p + shift;
+    dir0 = normalize(e.d * select(-1.0, 1.0, fromA) + vec3<f32>(1e-9, 0.0, 0.0));
+  }
+  return array<vec4<f32>, 2>(vec4<f32>(q, f32(root)), vec4<f32>(dir0, 0.0));
 }

@@ -7,37 +7,9 @@
 // mechanics resolves the bundle's motion, not where its yarns lie across it. Where a yarn is held in
 // the weave it keeps its woven place; away from it, freed of the crossing yarns, the bundle's yarns
 // cling together side by side in one to three flat clumps around the chain. No shape is added that the
-// chain does not have: a thread swings, sags and settles as its strand does. Near a free end (a few
-// millimetres at most: the bundle span beyond its last node) the yarn leaves its clump and droops.
-
-struct RunInfo {
-  layer: u32,
-  fam: u32,
-  yarn: u32,
-  // first lone crossing and count
-  pos: f32,
-  n: f32,
-  // the ends are held in the weave (or the field's border), not free
-  heldA: bool,
-  heldB: bool,
-  // drawn parameter range (crossings along the yarn)
-  drawA: f32,
-  drawB: f32,
-};
-
-fn runInfo(rec: vec4<u32>) -> RunInfo {
-  var o: RunInfo;
-  o.layer = rec.x & 0xFu;
-  o.fam = (rec.x >> 4u) & 1u;
-  o.heldA = ((rec.x >> 5u) & 3u) != 1u;
-  o.heldB = ((rec.x >> 7u) & 3u) != 1u;
-  o.yarn = rec.y & 0xFFFFu;
-  o.pos = f32(rec.y >> 16u);
-  o.n = f32(rec.z);
-  o.drawA = o.pos - select(0.5, 1.0, o.heldA);
-  o.drawB = o.pos + o.n - 1.0 + select(0.5, 1.0, o.heldB);
-  return o;
-}
+// chain does not have: a thread swings, sags and settles as its strand does. Beyond the last span its
+// chain holds, a yarn held at one end takes its free tail's solved shape (thread_prep.wgsl), and
+// near a free end it leaves its clump.
 
 fn liveTh(n: u32) -> bool { return x[n].w < 1.5; }
 
@@ -124,13 +96,17 @@ fn cmrdT(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> 
 // out of is placed per crossing (material_map.wgsl), so its held ends are attached where that cloth
 // is: pA / pB (where held). Where the chain carries the thread over its whole drawn range (its spans
 // hold, its nodes are of one piece) the thread follows the chain, shifted to meet the ends; otherwise
-// (a falling piece, a separated bundle) it runs straight between its held ends, or hangs from its one
-// held end along tA, the yarn's direction there.
+// (a falling piece, a separated bundle) it runs straight between its held ends, or, held at one end,
+// follows its chain as far as that holds and beyond it takes its free tail's shape (thread_prep.wgsl
+// tailSolve: tails, TAIL_SEGS + 1 points per tail).
 struct RunGeo {
   chain: bool,
   // held at one end only, not carried whole: the drawn parameter up to which the chain carries it from
   // its held end (thread_prep.wgsl chainReach)
   reach: f32,
+  // the free tail beyond reach: its slot in tails (-1: none) and its length (m)
+  tail: i32,
+  tailLen: f32,
   pA: vec3<f32>,
   pB: vec3<f32>,
   tA: vec3<f32>,
@@ -181,6 +157,21 @@ fn runCenter(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Ce
     o.d = c.d;
     return o;
   }
+  if (g.tail >= 0) {
+    // the solved tail, by arc length from its root (Catmull-Rom through its points)
+    let h = g.tailLen / f32(TAIL_SEGS);
+    let u = clamp(abs(p - g.reach) * pitchAl / max(h, 1e-9), 0.0, f32(TAIL_SEGS));
+    let i = min(u32(floor(u)), TAIL_SEGS - 1u);
+    let t = u - f32(i);
+    let b = u32(g.tail) * (TAIL_SEGS + 1u);
+    let p0 = tails[b + i].xyz;
+    let p1 = tails[b + i + 1u].xyz;
+    let pm = select(2.0 * p0 - p1, tails[b + i - 1u].xyz, i > 0u);
+    let pp = select(2.0 * p1 - p0, tails[b + i + 2u].xyz, i + 1u < TAIL_SEGS);
+    o.p = cmrT(pm, p0, p1, pp, t);
+    o.d = cmrdT(pm, p0, p1, pp, t) / max(h, 1e-9) * pitchAl * select(-1.0, 1.0, fromA);
+    return o;
+  }
   var q = select(g.pB, g.pA, fromA);
   var dir0 = select(-g.tB, g.tA, fromA);
   if (g.reach != held) {
@@ -207,6 +198,8 @@ fn runGeoZero() -> RunGeo {
   var g: RunGeo;
   g.chain = true;
   g.reach = 0.0;
+  g.tail = -1;
+  g.tailLen = 0.0;
   g.pA = vec3<f32>(0.0);
   g.pB = vec3<f32>(0.0);
   g.tA = vec3<f32>(1.0, 0.0, 0.0);
@@ -291,12 +284,12 @@ fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Thr
   var P = c.p + S * lat + N * up;
   var dP = c.d + S * (gather * dInCord.x + dGather * (cordLat + inCord.x - woven)) + N * (gather * dInCord.y + dGather * inCord.y);
   // a free end leaves the cord over its last millimetre or two: it splays a little away from the
-  // other yarns and droops under its own weight (no stiffness to hold it straight once untwisted)
+  // other yarns (its weight bends a freed yarn over ~1.4 cm, not within its tip: tailSolve)
   o.tip = 0.0;
   if (!ri.heldA || !ri.heldB) {
     let lt = (0.6e-3 + 1.8e-3 * hashf(seedY + 6u)) / pitchAl;
     let u = clamp(select(p - (ri.drawB - lt), (ri.drawA + lt) - p, !ri.heldA) / lt, 0.0, 1.0);
-    let splay = S * (0.35 * (hashf(seedY + 10u) - 0.5)) + N * (0.2 * (hashf(seedY + 11u) - 0.5)) + vec3<f32>(0.0, 0.0, -0.25);
+    let splay = S * (0.35 * (hashf(seedY + 10u) - 0.5)) + N * (0.2 * (hashf(seedY + 11u) - 0.5));
     let off = splay * (lt * pitchAl);
     P += off * (u * u);
     dP += off * (2.0 * u / lt) * select(1.0, -1.0, !ri.heldA);
@@ -316,6 +309,8 @@ fn runGeoAt(r: u32) -> RunGeo {
   let h = runGeo[RUN_GEO * r];
   g.chain = h.x > 0.5;
   g.reach = h.y;
+  g.tail = i32(h.z);
+  g.tailLen = h.w;
   g.pA = runGeo[RUN_GEO * r + 1u].xyz;
   g.pB = runGeo[RUN_GEO * r + 2u].xyz;
   g.tA = runGeo[RUN_GEO * r + 3u].xyz;

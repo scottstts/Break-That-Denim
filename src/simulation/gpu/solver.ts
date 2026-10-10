@@ -635,6 +635,20 @@ export class GpuSolver {
     pass.end();
   }
 
+  /**
+   * Contact detection at the current positions without a step, for a state loaded from outside the
+   * solve (development stills): the face hash the renderer's thread tails collide with is otherwise
+   * built by the substeps. Clears the step increment, which every substep's prediction sets anew.
+   */
+  encodeContactRefresh(encoder: GPUCommandEncoder): void {
+    if (!this.contactEnabled) return;
+    this.contact.encodeClear(encoder);
+    encoder.clearBuffer(this.dx);
+    const pass = encoder.beginComputePass({ label: 'contactRefresh' });
+    this.contact.encodeDetect(pass);
+    pass.end();
+  }
+
   /** Enable/disable history updates (cohesive damage, crossing slip); off only while settling. */
   setHistoryEnabled(on: boolean): void {
     this.device.queue.writeBuffer(this.simParams, 24, new Uint32Array([on ? 1 : 0]));

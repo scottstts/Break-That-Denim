@@ -233,6 +233,12 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: 1.0 },
   ],
+  // a pull held (no release): the cloth while the user keeps dragging, for DUMP=1 (fold census)
+  hold: [
+    { grab: (process.env.GRAB ?? '0.004,-0.003').split(',').map(Number) as [number, number] },
+    { to: (process.env.PULL ?? '0.03,0,0').split(',').map(Number) as [number, number, number], t: 0.6 },
+    { wait: Number(process.env.HOLD ?? 1.0) },
+  ],
   // a user playing roughly: hard, fast drags in different directions across the worn zone, each held
   // a moment and released (robustness: rejections, runaway nodes, settling, threads)
   maul: [

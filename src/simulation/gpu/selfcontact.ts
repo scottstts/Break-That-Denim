@@ -53,7 +53,11 @@ export class SelfContact {
   private readonly pipes: Record<string, GPUComputePipeline> = {};
   private readonly group: GPUBindGroup;
   private readonly scanGroups: Array<{ scan: GPUBindGroup; add: GPUBindGroup; blocks: number }> = [];
-  private readonly cells: GPUBuffer;
+  /** Face hash, rebuilt every substep at the predicted iterate (selfcontact.wgsl faceFill): cell counts
+   * scanned into start offsets [0, T) and fill cursors [T, 2T); per item, the face centroid and a
+   * bounding radius, then its centroid at the substep's start and the face index. */
+  readonly cells: GPUBuffer;
+  readonly items: GPUBuffer;
 
   constructor(s: SolverBuffers) {
     this.s = s;
@@ -66,6 +70,7 @@ export class SelfContact {
     const su = createBufferWith(d, 'selfContactU', u, UNIFORM);
     this.cells = createBuffer(d, 'selfContact.cells', 8 * T);
     const items = createBuffer(d, 'selfContact.items', 32 * s.N);
+    this.items = items;
     const pairs = createBuffer(d, 'selfContact.pairs', 4 * K * s.N);
     const acc = createBuffer(d, 'selfContact.acc', 4 * 9 * s.N);
     this.meta = createBuffer(d, 'selfContact.meta', 16 * s.N);

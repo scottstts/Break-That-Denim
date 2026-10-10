@@ -1,5 +1,6 @@
 import type { CompiledScene } from '../simulation/scene';
 import type { GpuSolver } from '../simulation/gpu/solver';
+import { SELF_CONTACT, SelfContact } from '../simulation/gpu/selfcontact';
 import { ComputeModule, createBuffer, createBufferWith, shaderModule, STORAGE, UNIFORM } from '../gpu/util';
 import { invert, lookAt, multiply, normalize, orthographic, perspective, sub, type Mat4, type Vec3 } from './math';
 import commonWgsl from './wgsl/render_common.wgsl?raw';
@@ -11,6 +12,7 @@ import piecesWgsl from './wgsl/pieces.wgsl?raw';
 import threadsWgsl from './wgsl/threads.wgsl?raw';
 import threadGeomWgsl from './wgsl/thread_geom.wgsl?raw';
 import threadPrepWgsl from './wgsl/thread_prep.wgsl?raw';
+import threadTailWgsl from './wgsl/thread_tail.wgsl?raw';
 import threadWgsl from './wgsl/thread.wgsl?raw';
 import fuzzWgsl from './wgsl/fuzz.wgsl?raw';
 import postWgsl from './wgsl/post.wgsl?raw';
@@ -47,6 +49,8 @@ const SHADOW_SIZE = 4096;
 const SHADOW_HALF = 0.34;
 /** Sub-quads per lattice cell edge of the bicubic surface. */
 const REFINE = 2;
+/** Vec4s per run of the per-frame thread geometry (render_common.wgsl RUN_GEO). */
+const RUN_GEO = 9;
 /** Loose-thread runs and their draw chunks (threads.wgsl). */
 const MAX_RUNS = 65536;
 const MAX_CHUNKS = 262144;
@@ -61,6 +65,9 @@ const MAX_EDGES = 262144;
 const FIBERS_PER_EDGE = 12;
 /** Linear density of a cotton fibre (1.8 dtex, micronaire ~4.2), kg/m: a yarn holds its linear density over this many fibres. */
 const COTTON_FIBRE_DENSITY = 0.18e-6;
+/** Free tails of threads held at one end (thread_prep.wgsl tailSolve): segments per tail, most per frame. */
+const TAIL_SEGS = 16;
+const MAX_TAILS = 8192;
 /**
  * Connection of a crossing to a node from the ratio of rest to material path distance (pieces.wgsl):
  * a smoothstep from KAPPA_LO (cut off) to KAPPA_HI (joined). With the node about a cell from a crack,
@@ -92,7 +99,7 @@ export function cameraMatrices(c: CameraState, aspect: number): ViewMatrices {
 }
 
 /** Layout constants of the yarn-resolution passes, prepended to every render module. */
-function prelude(scene: CompiledScene): string {
+function prelude(scene: CompiledScene, faceHash: boolean): string {
   const bu = Math.max(...scene.layers.map((L) => L.bundle[0]));
   const bv = Math.max(...scene.layers.map((L) => L.bundle[1]));
   const RW = 2 * bu + 3;
@@ -116,6 +123,14 @@ function prelude(scene: CompiledScene): string {
     ['FINE_QM', 'u32', `${bv + 1}u`],
     ['MAX_EDGES', 'u32', `${MAX_EDGES}u`],
     ['FIBERS_PER_EDGE', 'u32', `${FIBERS_PER_EDGE}u`],
+    ['FIBRE_LIN', 'f32', `${COTTON_FIBRE_DENSITY}`],
+    ['TAIL_SEGS', 'u32', `${TAIL_SEGS}u`],
+    ['TAIL_SEGS_1', 'u32', `${TAIL_SEGS + 1}u`],
+    ['MAX_TAILS', 'u32', `${MAX_TAILS}u`],
+    // the solver's self-contact face hash, which the tails collide against (absent in a layered scene)
+    ['FACE_HASH', 'bool', `${faceHash}`],
+    ['FACE_CELL', 'f32', `${SELF_CONTACT.cell}`],
+    ['FACE_MASK', 'u32', `${(1 << SELF_CONTACT.tableBits) - 1}u`],
   ];
   return lines.map(([n, t, v]) => `const ${n}: ${t} = ${v};`).join('\n') + '\n';
 }
@@ -167,6 +182,9 @@ export class Renderer {
   private readonly chunks: GPUBuffer;
   private readonly runGeo: GPUBuffer;
   private readonly threadDraw: GPUBuffer;
+  /** Free tails of threads held at one end (thread_prep.wgsl tailSolve) and their count. */
+  private readonly tails: GPUBuffer;
+  private readonly tailCount: GPUBuffer;
   /** Material connectivity (pieces.wgsl): slots and connection fields, dirty cells, args, free edges. */
   private readonly kappa: GPUBuffer;
   private readonly cellDirty: GPUBuffer;
@@ -206,7 +224,9 @@ export class Renderer {
     this.solver = solver;
     this.scene = scene;
     const N = scene.nodeCount;
-    const common = prelude(scene) + commonWgsl;
+    // the free tails collide with the cloth through the solver's self-contact face hash
+    const faceHash = solver.contactEnabled && solver.contact instanceof SelfContact ? solver.contact : null;
+    const common = prelude(scene, faceHash !== null) + commonWgsl;
 
     let cells = 0;
     let refined = 0;
@@ -256,9 +276,11 @@ export class Renderer {
     this.threadBits = createBuffer(device, 'threadBits', 4 * (Math.ceil(this.fieldCount / 16) + Math.ceil(this.fieldCount / 32) + 1));
     this.threadScratch = createBuffer(device, 'threadScratch', 4 * (2 * Math.ceil(this.fieldCount / 16) + Math.ceil(this.fieldCount / 32)));
     this.threadCount = createBuffer(device, 'threadCount', 16);
+    this.tails = createBuffer(device, 'threadTails', 16 * (TAIL_SEGS + 1) * MAX_TAILS);
+    this.tailCount = createBuffer(device, 'threadTailCount', 16);
     this.runs = createBuffer(device, 'threadRuns', 16 * MAX_RUNS);
     this.chunks = createBuffer(device, 'threadChunks', 4 * MAX_CHUNKS);
-    this.runGeo = createBuffer(device, 'threadRunGeo', 7 * 16 * MAX_RUNS);
+    this.runGeo = createBuffer(device, 'threadRunGeo', RUN_GEO * 16 * MAX_RUNS);
     this.threadDraw = createBuffer(device, 'threadDraw', 48, STORAGE | GPUBufferUsage.INDIRECT);
     // slot table initialised to "no field" so the first frame before a rebuild draws everything intact
     // header, node table, slot nodes, slot fields, slot hashes, persistent node slots (pieces.wgsl)
@@ -331,6 +353,20 @@ export class Renderer {
       7: this.runGeo,
       8: this.rsurf,
       9: this.kappa,
+    });
+    const threadTail = new ComputeModule(device, 'threadTail', common + threadTailWgsl);
+    this.cpipes.threadTail = threadTail.pipeline('threadTail');
+    this.groups.threadTail = threadTail.bindGroup('threadTail', {
+      0: this.renderU,
+      1: solver.x,
+      2: this.runs,
+      3: this.threadCount,
+      4: this.runGeo,
+      5: this.tails,
+      6: this.tailCount,
+      7: solver.nodes,
+      8: faceHash ? faceHash.cells : createBuffer(device, 'noFaceCells', 16),
+      9: faceHash ? faceHash.items : createBuffer(device, 'noFaceItems', 32),
     });
 
     // edge field
@@ -432,7 +468,7 @@ export class Renderer {
     });
     const threadLayout = device.createBindGroupLayout({
       label: 'thread',
-      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9)],
+      entries: [uni(0), uni(1), ro(2), ro(3), ro(4), ro(5), ro(6), ro(7), ro(8), ...shadowEntries(9), ro(11)],
     });
 
     const depth: GPUDepthStencilState = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' };
@@ -508,6 +544,7 @@ export class Renderer {
           { binding: 6, resource: { buffer: this.runs } },
           { binding: 7, resource: { buffer: this.chunks } },
           { binding: 8, resource: { buffer: this.runGeo } },
+          { binding: 11, resource: { buffer: this.tails } },
           { binding: 9, resource: shadow },
           { binding: 10, resource: this.shadowSampler },
         ],
@@ -693,6 +730,7 @@ export class Renderer {
     const N = this.scene.nodeCount;
     encoder.clearBuffer(this.lists, 0, 16);
     encoder.clearBuffer(this.threadCount, 8, 4);
+    encoder.clearBuffer(this.tailCount);
     const cp = encoder.beginComputePass({ label: 'renderPrep', timestampWrites: tw(0) });
     const run = (name: string, groups: number) => {
       cp.setPipeline(this.cpipes[name]);
@@ -735,6 +773,8 @@ export class Renderer {
     run('refine', Math.ceil(this.refinedCount / 128));
     cp.setBindGroup(0, this.groups.threadPrep);
     runIndirect('threadPrep', this.threadDraw, 32);
+    cp.setBindGroup(0, this.groups.threadTail);
+    runIndirect('threadTail', this.threadDraw, 32);
     cp.setBindGroup(0, this.groups.edgeRoots);
     runIndirect('edgeRootsMain', this.piecesArgs, 32);
     cp.end();

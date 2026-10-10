@@ -1,8 +1,8 @@
 # Handoff (rolling)
 
-Latest round: `docs/decisions/2026-10-10-edge-fibre-population.md` (render; uncommitted, for the user
-to inspect). Before: `docs/decisions/2026-10-10-interaction-round.md` (threads through cloth, restless
-settling, grip slipping).
+Latest round: `docs/decisions/2026-10-10-folds-and-free-tails.md` (uncommitted, for the user to
+inspect). Before: `docs/decisions/2026-10-10-edge-fibre-population.md`,
+`docs/decisions/2026-10-10-interaction-round.md`.
 
 ## State
 
@@ -13,7 +13,8 @@ settling, grip slipping).
 - Grip: pinch gathering, drag lift, bounded force; holds until release; torn-out pieces stay held. Pinch
   is the only loading (user decision): slit and eye openings are the correct result for it.
 - Rendering: threads from the strand chains, split where the mechanics ruptured their bundle; flat clumps
-  of freed yarns; edge fibre from the fibre population (fans and rim hair, per fibre or closed form);
+  of freed yarns; free tails solved as heavy elastic rods resting on the cloth (`thread_tail.wgsl`); edge
+  fibre from the fibre population (fans and rim hair, per fibre or closed form);
   rim/halo, footprint-filtered albedo, top key light. Colour, exposure and fill were measured against the
   reference and match; no shading change is justified.
 
@@ -34,21 +35,24 @@ settling, grip slipping).
   thread runs drawn without a carrying chain.
 - `still.ts` with `CAMERA`, `LIGHT` (incl. `background`), `RENDERCOST=1`; `tools/compare/sbs.zsh`;
   `SCENE` / `DRAPE` overrides; `bench.ts`.
+- `session.ts hold` (held pull, `GRAB`, `PULL`, `HOLD`; `DUMP=1`) + `tools/studies/folds.ts <state> <grab x,y>`:
+  wrinkles and in-plane vs buckled gathering around a grip. `tools/studies/tails.ts <state>`: free tails
+  through the cloth (solved vs the old procedural hang).
 - `tools/compare/coverage.mjs`: fringe coverage by distance from the edge, from two stills over different
   backgrounds. `tools/compare/fuzzband.mjs`: loose-material band vs a reference frame (its edge length
   grows with fuzz, so compare coverage for our own changes).
 
 ## Open
 
-1. Shape plan (agreed): measurement done; rim volume done (edge fibre); next the threads' hairiness
-   envelope (same population model: Uster-type hairiness of a freed yarn), then fold depth (mechanics:
-   does the cloth buckle under compression, is the lattice fine enough).
-2. Real time: ~0.93x on the M5. Edge fibre adds 1.2-3.6 ms to the render at default framing and ~11 ms at
-   max zoom on heavily torn cloth (per-fibre loop ~7 ms). Next: draw the sparse resolvable fibres as
-   explicit geometry lit from their fan (compute pass), not per-pixel loops.
+1. Shape plan: measurement, rim volume (edge fibre) and fold diagnosis done. Folds buckle correctly and
+   are converged in resolution; their depth follows the mount (taut along the warp) and the pull. Thread
+   hairiness not pursued (reference single threads are as thin as ours).
+2. Real time: ~0.93x on the M5. Edge fibre adds 1.2-3.6 ms to the render at default framing and ~12 ms at
+   max zoom on heavily torn cloth (on-screen fringe fragments; explicit-geometry and culling alternatives
+   measured/estimated as no better). Free tails add ~0.26 ms.
 3. Threads inside openings are often single yarns in shadow (physically consistent, faint).
 4. The reference framing camera sees past the coupon's top edge (product framing does not).
 5. The surface rim band is still painted pale (`rimFibres`), in addition to the rim hair now drawn as
    fibre; the halo adds wear over 1 cm around openings (no measurable effect; not a tear mechanism).
-6. One-ended threads beyond their chain hang procedurally toward -z without contact (978 such runs in
-   `maul`, 34 longer than 5 mm).
+6. Free tails are quasi-static (no swing of their own); they collide with intact cells only (not with
+   threads or other tails), and not at all in a layered scene (no self-contact face hash).

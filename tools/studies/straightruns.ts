@@ -33,7 +33,7 @@ export default async function main(args: string[]): Promise<void> {
   const r = renderer as unknown as { threadCount: GPUBuffer; runs: GPUBuffer; runGeo: GPUBuffer };
   const count = new Uint32Array(await readBuffer(device, r.threadCount))[0];
   const runs = new Uint32Array(await readBuffer(device, r.runs, 16 * count));
-  const geo = new Float32Array(await readBuffer(device, r.runGeo, 7 * 16 * count));
+  const geo = new Float32Array(await readBuffer(device, r.runGeo, 9 * 16 * count));
   let both = 0;
   let straight = 0;
   const lens: number[] = [];
@@ -75,7 +75,7 @@ export default async function main(args: string[]): Promise<void> {
   for (let q = 0; q < count; q++) {
     const heldA = ((runs[4 * q] >> 5) & 3) !== 1;
     const heldB = ((runs[4 * q] >> 7) & 3) !== 1;
-    const g = 28 * q;
+    const g = 36 * q;
     if (!heldA || !heldB) {
       if (heldA !== heldB && geo[g] < 0.5) hanging.push(((runs[4 * q + 2] + 0.5) * (((runs[4 * q] >> 4) & 1) === 0 ? scene.layers[0].weave.pitchU : scene.layers[0].weave.pitchV)) * 1e3);
       continue;

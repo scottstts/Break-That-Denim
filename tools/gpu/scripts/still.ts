@@ -30,6 +30,12 @@ export default async function main(args: string[]): Promise<void> {
   const tBytes = solver.tails.size;
   if (buf.byteLength >= xBytes + sBytes + tBytes) device.queue.writeBuffer(solver.tails, 0, buf, xBytes + sBytes, tBytes);
   if (buf.byteLength >= xBytes + sBytes + tBytes + solver.field.size) device.queue.writeBuffer(solver.field, 0, buf, xBytes + sBytes + tBytes, solver.field.size);
+  // the cloth's contact faces at the loaded positions (the thread tails collide with them)
+  {
+    const enc = device.createCommandEncoder();
+    solver.encodeContactRefresh(enc);
+    device.queue.submit([enc.finish()]);
+  }
   const format: GPUTextureFormat = 'rgba8unorm';
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(width, height);

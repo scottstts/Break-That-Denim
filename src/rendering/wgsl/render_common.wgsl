@@ -229,8 +229,38 @@ const CHUNK: u32 = 8u;
 const THREAD_VERTS: u32 = 34u;
 const FIBERS_PER_CHUNK: u32 = 20u;
 const FIBER_VERTS: u32 = 14u;
-// vec4 per run of the per-frame thread geometry (thread_prep.wgsl)
-const RUN_GEO: u32 = 7u;
+// vec4 per run of the per-frame thread geometry (thread_prep.wgsl, thread_tail.wgsl)
+const RUN_GEO: u32 = 9u;
+
+// A thread run's record (threads.wgsl threadScan).
+struct RunInfo {
+  layer: u32,
+  fam: u32,
+  yarn: u32,
+  // first lone crossing and count
+  pos: f32,
+  n: f32,
+  // the ends are held in the weave (or the field's border), not free
+  heldA: bool,
+  heldB: bool,
+  // drawn parameter range (crossings along the yarn)
+  drawA: f32,
+  drawB: f32,
+};
+
+fn runInfo(rec: vec4<u32>) -> RunInfo {
+  var o: RunInfo;
+  o.layer = rec.x & 0xFu;
+  o.fam = (rec.x >> 4u) & 1u;
+  o.heldA = ((rec.x >> 5u) & 3u) != 1u;
+  o.heldB = ((rec.x >> 7u) & 3u) != 1u;
+  o.yarn = rec.y & 0xFFFFu;
+  o.pos = f32(rec.y >> 16u);
+  o.n = f32(rec.z);
+  o.drawA = o.pos - select(0.5, 1.0, o.heldA);
+  o.drawB = o.pos + o.n - 1.0 + select(0.5, 1.0, o.heldB);
+  return o;
+}
 
 // The material at crossing c belongs to a falling piece: bit c of the debris region of the thread bits
 // (threads.wgsl), which starts after the 2-bit-per-crossing region of fieldTotal crossings.
