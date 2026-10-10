@@ -6,6 +6,8 @@ export type ToEngine =
   | { type: 'wheel'; seq: number; deltaY: number; time: number }
   | { type: 'reset' }
   | { type: 'visibility'; visible: boolean }
+  /** Port to the audio thread's tear voice (audio/worklet.ts): acoustic records go there. */
+  | { type: 'audio'; port: MessagePort }
   | DevCommand;
 
 /** Development-only commands (never sent by the product UI). */
@@ -17,6 +19,8 @@ export type DevCommand =
 export interface PointerCommand {
   type: 'pointer';
   phase: 'down' | 'move' | 'up' | 'cancel';
+  /** Pointer (finger) identity; ALL_POINTERS with 'cancel' releases every grip. */
+  id: number;
   seq: number;
   /** performance.now() at the event (main-thread clock). */
   time: number;
@@ -28,6 +32,8 @@ export interface PointerCommand {
 export type FromEngine =
   | { type: 'ready' }
   | { type: 'status'; state: 'loading' | 'running' | 'paused' | 'error'; message?: string }
+  /** Loading progress by stage, 0..1. */
+  | { type: 'progress'; value: number }
   | { type: 'cursor'; cursor: 'grab' | 'grabbing' | 'default' }
   | { type: 'stats'; stats: EngineStats }
   | { type: 'devDone'; id: number; result?: unknown };
@@ -42,3 +48,6 @@ export interface EngineStats {
   /** Simulation is asleep (cloth at rest, no interaction). */
   asleep: boolean;
 }
+
+/** PointerCommand.id addressing every pointer. */
+export const ALL_POINTERS = -1;

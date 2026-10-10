@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#020203" />
     <title>Break That Denim</title>
     <meta
       name="description"
@@ -33,8 +34,31 @@
     />
     <meta name="twitter:image" content="https://denim.scottsun.io/og_image.jpeg" />
     <meta name="twitter:image:alt" content="Denim tear simulation preview" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Anton&family=Oswald:wght@500;600&display=swap" />
   </head>
   <body class="loading">
+    <header class="brand" aria-label="Break That Denim">
+      <span class="brand-kicker" aria-hidden="true">Break that</span>
+      <span class="brand-word" aria-hidden="true"
+        ><span class="brand-half brand-top">Denim</span><span class="brand-half brand-bottom">Denim</span></span
+      >
+      <span class="brand-stitch" aria-hidden="true"></span>
+    </header>
+    <div class="loader" role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <span class="loader-rows loader-track"></span>
+      <span class="loader-rows loader-fill"></span>
+      <span class="loader-needle"></span>
+    </div>
+    <button class="reset" type="button" aria-label="Reset the denim" title="Reset the denim">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path d="M19.4 13.1a7.5 7.5 0 1 1-2.1-6.4" />
+        <path d="M18.3 3.4v3.9h-3.9" />
+      </svg>
+      <span>Reset</span>
+    </button>
+    <div class="status" role="status" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

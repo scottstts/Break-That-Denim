@@ -8,6 +8,9 @@
 
 export const MATERIAL_VERSION = 1;
 
+/** Linear density of a cotton fibre (1.8 dtex, micronaire ~4.2), kg/m: a yarn holds its linear density over this many fibres. */
+export const COTTON_FIBRE_DENSITY = 0.18e-6;
+
 /** Family index: 0 = yarns running along material u (weft / picks), 1 = along v (warp / ends). */
 export const FAMILY_U = 0;
 export const FAMILY_V = 1;

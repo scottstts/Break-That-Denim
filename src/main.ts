@@ -1,34 +1,40 @@
 import './style.css';
+import { TearAudio } from './audio/audio';
 import { computeDrawingBufferSize } from './shared/drawingBuffer';
-import type { FromEngine, ToEngine } from './shared/messages';
+import { ALL_POINTERS, type FromEngine, type ToEngine } from './shared/messages';
 
 const canvas = document.createElement('canvas');
 canvas.className = 'stage';
-document.body.appendChild(canvas);
+document.body.prepend(canvas);
 
-const status = document.createElement('div');
-status.className = 'status';
-status.setAttribute('role', 'status');
-status.setAttribute('aria-live', 'polite');
-document.body.appendChild(status);
+const status = document.querySelector<HTMLElement>('.status')!;
+const reset = document.querySelector<HTMLButtonElement>('.reset')!;
+const loader = document.querySelector<HTMLElement>('.loader')!;
 
-const reset = document.createElement('button');
-reset.className = 'reset';
-reset.type = 'button';
-reset.setAttribute('aria-label', 'Reset fabric');
-reset.title = 'Reset';
-reset.innerHTML =
-  '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z" fill="currentColor"/></svg>';
-document.body.appendChild(reset);
+// the wordmark appears once its typefaces are in (no fallback flash), or with the fallback after a wait
+void Promise.race([
+  Promise.all([document.fonts.load('400 48px Anton'), document.fonts.load('600 12px Oswald')]),
+  new Promise((r) => setTimeout(r, 2500)),
+])
+  .catch(() => {})
+  .then(() => document.body.classList.add('fonts'));
+
+function fail(message: string): void {
+  status.textContent = message;
+  status.classList.add('visible');
+  document.body.classList.add('failed');
+}
 
 if (!('transferControlToOffscreen' in canvas) || !navigator.gpu) {
-  status.textContent = 'This experience needs a browser with WebGPU.';
-  status.classList.add('visible');
+  fail('This experience needs a browser with WebGPU.');
   throw new Error('WebGPU or OffscreenCanvas unavailable');
 }
 
 const worker = new Worker(new URL('./engine/worker.ts', import.meta.url), { type: 'module' });
 const post = (m: ToEngine, transfer: Transferable[] = []) => worker.postMessage(m, transfer);
+
+// tear sound: the engine sends its acoustic records straight to the audio thread
+const audio = new TearAudio((port) => post({ type: 'audio', port }, [port]));
 
 function size() {
   const cssWidth = Math.max(1, window.innerWidth);
@@ -52,21 +58,30 @@ function onResize() {
 window.addEventListener('resize', onResize);
 matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change', onResize);
 
+// every pointer (mouse, pen, each finger) drives its own grip
 let seq = 0;
 function pointer(phase: 'down' | 'move' | 'up' | 'cancel', e: PointerEvent) {
   const r = canvas.getBoundingClientRect();
-  post({ type: 'pointer', phase, seq: seq++, time: e.timeStamp, x: e.clientX - r.left, y: e.clientY - r.top });
+  post({ type: 'pointer', phase, id: e.pointerId, seq: seq++, time: e.timeStamp, x: e.clientX - r.left, y: e.clientY - r.top });
+}
+function cancelAll(time: number) {
+  post({ type: 'pointer', phase: 'cancel', id: ALL_POINTERS, seq: seq++, time, x: 0, y: 0 });
 }
 canvas.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  audio.unlock();
   canvas.setPointerCapture(e.pointerId);
   pointer('down', e);
 });
 canvas.addEventListener('pointermove', (e) => {
-  // Coalesced samples are superseded by the latest; only the newest position matters.
+  // coalesced samples are superseded by the latest; only the newest position matters
   pointer('move', e);
 });
-canvas.addEventListener('pointerup', (e) => pointer('up', e));
+canvas.addEventListener('pointerup', (e) => {
+  // iOS counts the end of a touch, not its start, as the gesture that may start audio
+  audio.unlock();
+  pointer('up', e);
+});
 canvas.addEventListener('pointercancel', (e) => pointer('cancel', e));
 canvas.addEventListener('lostpointercapture', (e) => pointer('cancel', e));
 canvas.addEventListener(
@@ -78,11 +93,21 @@ canvas.addEventListener(
   { passive: false },
 );
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') post({ type: 'pointer', phase: 'cancel', seq: seq++, time: e.timeStamp, x: 0, y: 0 });
+  if (e.key === 'Escape') cancelAll(e.timeStamp);
 });
-window.addEventListener('blur', () => post({ type: 'pointer', phase: 'cancel', seq: seq++, time: performance.now(), x: 0, y: 0 }));
-document.addEventListener('visibilitychange', () => post({ type: 'visibility', visible: document.visibilityState === 'visible' }));
-reset.addEventListener('click', () => post({ type: 'reset' }));
+window.addEventListener('blur', () => cancelAll(performance.now()));
+document.addEventListener('visibilitychange', () => {
+  const visible = document.visibilityState === 'visible';
+  post({ type: 'visibility', visible });
+  audio.setVisible(visible);
+});
+reset.addEventListener('click', () => {
+  audio.unlock();
+  post({ type: 'reset' });
+  reset.classList.remove('spin');
+  void reset.offsetWidth;
+  reset.classList.add('spin');
+});
 
 const pendingDev = new Map<number, (r: unknown) => void>();
 let markReady: () => void = () => {};
@@ -108,9 +133,15 @@ worker.onmessage = (ev: MessageEvent<FromEngine>) => {
   if (m.type === 'devDone') {
     pendingDev.get(m.id)?.(m.result);
     pendingDev.delete(m.id);
+  } else if (m.type === 'progress') {
+    loader.style.setProperty('--p', String(m.value));
+    loader.setAttribute('aria-valuenow', String(Math.round(100 * m.value)));
   } else if (m.type === 'status') {
-    status.textContent = m.state === 'loading' ? '' : (m.message ?? '');
-    status.classList.toggle('visible', m.state === 'error' || m.state === 'paused');
+    if (m.state === 'error') fail(m.message ?? '');
+    else {
+      status.textContent = m.state === 'paused' ? (m.message ?? '') : '';
+      status.classList.toggle('visible', m.state === 'paused');
+    }
     document.body.classList.toggle('loading', m.state === 'loading');
     if (m.state === 'running') markReady();
   } else if (m.type === 'cursor') {
@@ -120,7 +151,6 @@ worker.onmessage = (ev: MessageEvent<FromEngine>) => {
   }
 };
 worker.onerror = (e) => {
-  status.textContent = 'The fabric engine stopped unexpectedly.';
-  status.classList.add('visible');
+  fail('The fabric engine stopped unexpectedly.');
   console.error(e);
 };

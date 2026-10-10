@@ -27,6 +27,9 @@ function captureEndpoint(): Plugin {
 }
 
 export default defineConfig({
+  server: {
+      allowedHosts: true
+  },
   plugins: [captureEndpoint()],
   worker: { format: 'es' },
   build: { target: 'es2023' },

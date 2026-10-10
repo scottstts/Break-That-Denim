@@ -1,15 +1,24 @@
-// Picking and grip terms. The grip is a finite material patch attached to a handle by quadratic
-// springs (exact for Newton). The force is bounded by clamping the handle's lead over the patch
+// Picking and grip terms. A grip is a finite material patch attached to a handle by quadratic
+// springs (exact for Newton). Its force is bounded by clamping the handle's lead over the patch
 // centroid once per substep (gripLead); gradient and stiffness enter the Newton system via ext.
+// Up to GRIPS grips (one per finger) hold disjoint patches: entries of grip g occupy
+// [g * SLOT_ENTRIES, g * SLOT_ENTRIES + count), and no node is in two patches, so every ext entry
+// has a single writer.
 
 const GRIP_ADDS: bool = true;
+const GRIPS: u32 = 4u;
+const SLOT_ENTRIES: u32 = 512u;
 
-struct GripU {
+struct GripSlot {
   // handle target (xyz), entry count (w as f32)
   goal: vec4<f32>,
   // stiffness per unit weight (N/m), largest handle lead (m), picked node (bitcast), pinch scale of the
   // grab-time offsets (grip.ts pinchScale)
   params: vec4<f32>,
+};
+
+struct GripU {
+  slots: array<GripSlot, GRIPS>,
 };
 
 struct PickU {
@@ -39,20 +48,26 @@ struct GripEntry {
 @group(0) @binding(8) var<storage, read_write> ext: array<vec4<f32>>; // 3 per node (see assemble.wgsl)
 @group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>; // [depthKey, distKey]
 @group(0) @binding(10) var<storage, read_write> pickOut: array<vec4<f32>>;
-// [0] effective handle (xyz)
+// [g] effective handle of grip g (xyz)
 @group(0) @binding(11) var<storage, read_write> gripGoal: array<vec4<f32>>;
+// x: the grip whose entries gripInit initialises
+@group(0) @binding(12) var<uniform> InitU: vec4<u32>;
 
 var<workgroup> leadSum: array<vec4<f32>, 256>;
 
-// Once per substep, from committed positions: the effective handle is the requested one, moved to
-// within the largest lead of the weighted patch centroid (bounded total force).
+// Once per substep, from committed positions: each grip's effective handle is the requested one,
+// moved to within the largest lead of its weighted patch centroid (bounded total force). One
+// workgroup per grip.
 @compute @workgroup_size(256)
-fn gripLead(@builtin(local_invocation_index) t: u32) {
-  let count = u32(G.goal.w);
+fn gripLead(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+  let g = wg.x;
+  let S = G.slots[g];
+  let count = u32(S.goal.w);
+  if (count == 0u) { return; }
   var acc = vec4<f32>(0.0);
   for (var k = t; k < count; k += 256u) {
-    let e = grip[k];
-    acc += vec4<f32>(e.w * (x[e.node].xyz - G.params.w * e.offset.xyz), e.w);
+    let e = grip[g * SLOT_ENTRIES + k];
+    acc += vec4<f32>(e.w * (x[e.node].xyz - S.params.w * e.offset.xyz), e.w);
   }
   leadSum[t] = acc;
   workgroupBarrier();
@@ -65,21 +80,24 @@ fn gripLead(@builtin(local_invocation_index) t: u32) {
   }
   if (t == 0u) {
     let c = leadSum[0].xyz / max(leadSum[0].w, 1e-12);
-    var lead = G.goal.xyz - c;
+    var lead = S.goal.xyz - c;
     let l = length(lead);
-    if (l > G.params.y) { lead *= G.params.y / l; }
-    gripGoal[0] = vec4<f32>(c + lead, 0.0);
+    if (l > S.params.y) { lead *= S.params.y / l; }
+    gripGoal[g] = vec4<f32>(c + lead, 0.0);
   }
 }
 
 @compute @workgroup_size(64)
 fn gripTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let k = gid.x;
-  if (k >= u32(G.goal.w)) { return; }
-  let e = grip[k];
+  let g = gid.x / SLOT_ENTRIES;
+  let k = gid.x % SLOT_ENTRIES;
+  if (g >= GRIPS) { return; }
+  let S = G.slots[g];
+  if (k >= u32(S.goal.w)) { return; }
+  let e = grip[gid.x];
   let y = x[e.node].xyz + dx[e.node].xyz;
-  let d = y - (gripGoal[0].xyz + G.params.w * e.offset.xyz);
-  let kg = G.params.x * e.w;
+  let d = y - (gripGoal[g].xyz + S.params.w * e.offset.xyz);
+  let kg = S.params.x * e.w;
   let force = kg * d;
   let stiff = kg;
   // with contact, its terms already wrote ext this iteration and the grip adds its own
@@ -90,12 +108,14 @@ fn gripTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
   ext[b + 2u] = keep * ext[b + 2u] + vec4<f32>(0.0, stiff, 0.0, 0.0);
 }
 
-// Offsets of patch nodes from the picked node at grab time.
+// Offsets of a grip's patch nodes from its picked node at grab time.
 @compute @workgroup_size(64)
 fn gripInit(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let k = gid.x;
-  if (k >= u32(G.goal.w)) { return; }
-  let picked = bitcast<u32>(G.params.z);
+  let g = InitU.x;
+  let S = G.slots[g];
+  if (gid.x >= u32(S.goal.w)) { return; }
+  let k = g * SLOT_ENTRIES + gid.x;
+  let picked = bitcast<u32>(S.params.z);
   grip[k].offset = vec4<f32>(x[grip[k].node].xyz - x[picked].xyz, 0.0);
 }
 

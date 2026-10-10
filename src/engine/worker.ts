@@ -2,13 +2,15 @@ import { acquireGpu, GpuUnavailableError } from '../gpu/device';
 import { readBuffer } from '../gpu/util';
 import { DEFAULT_CAMERA, Renderer, cameraMatrices, type CameraState } from '../rendering/renderer';
 import { add, dot, normalize, scale, sub, transformPoint, type Vec3 } from '../rendering/math';
-import { Interaction } from '../simulation/gpu/interaction';
+import { Interaction, MAX_GRIPS } from '../simulation/gpu/interaction';
 import { GRIP, pinchScale } from '../simulation/grip';
 import { GPU_DEFAULTS, GpuSolver } from '../simulation/gpu/solver';
 import { loadDrape, settleDrape } from '../simulation/gpu/settle';
 import { Topology } from '../simulation/gpu/topology';
 import { compileScene, defaultSceneSpecs, type CompiledScene } from '../simulation/scene';
-import type { DevCommand, FromEngine, PointerCommand, ToEngine } from '../shared/messages';
+import { ALL_POINTERS, type DevCommand, type FromEngine, type PointerCommand, type ToEngine } from '../shared/messages';
+import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../audio/record';
+import { AcousticLog } from './acousticLog';
 
 interface WorkerScope {
   postMessage(m: FromEngine): void;
@@ -17,6 +19,8 @@ interface WorkerScope {
 }
 const scope = self as unknown as WorkerScope;
 const send = (m: FromEngine) => scope.postMessage(m);
+/** Loading progress, 0..1, by stage. */
+const progress = (value: number) => send({ type: 'progress', value });
 
 const H = GPU_DEFAULTS.h;
 /** Upper bound on substeps per presented frame; a larger backlog is dropped, never replayed. */
@@ -36,7 +40,9 @@ const MAX_DRAG_LIFT = 0.05;
 const REST_SPEED = 0.003;
 const REST_TIME = 0.4;
 
+/** One finger's grip (interaction slot) and its handle. */
 interface GripState {
+  slot: number;
   node: number;
   plane: Vec3;
   normal: Vec3;
@@ -65,10 +71,18 @@ class Engine {
   private ready = false;
   private lastFrame = 0;
   private simBacklog = 0;
-  private grip: GripState | null = null;
+  /** Grips by pointer id (one per finger, at most MAX_GRIPS). */
+  private readonly grips = new Map<number, GripState>();
+  /** Latest command of every pointer that is down, and the token of its pending pick. */
+  private readonly down = new Map<number, PointerCommand>();
+  private readonly picking = new Map<number, number>();
   private pickToken = 0;
-  private pointerDown = false;
-  private latestPointer: PointerCommand | null = null;
+  /** Acoustic records to the audio thread (audio/record.ts), once audio has started. */
+  private audioPort: MessagePort | null = null;
+  private acoustic: AcousticLog | null = null;
+  /** Last pan of each sound source (kept while a source has no fracture). */
+  private readonly lastPan = new Float64Array(SOURCES);
+  private readonly anchors = new Float32Array(4 * SOURCES);
   private snapshot: { x: GPUBuffer; segs: GPUBuffer; tails: GPUBuffer; field: GPUBuffer } | null = null;
   /** GPU work of the previous frame still executing: never queue more than one frame ahead. */
   private inFlight = false;
@@ -87,7 +101,12 @@ class Engine {
 
   async init(canvas: OffscreenCanvas, width: number, height: number, cssWidth: number, cssHeight: number): Promise<void> {
     send({ type: 'status', state: 'loading' });
+    // the settled drape downloads while the GPU state and pipelines are built
+    const drape = fetch(new URL('/drape.bin', self.location.href))
+      .then((r) => (r.ok ? r.arrayBuffer() : null))
+      .catch(() => null);
     const gpu = await acquireGpu((navigator as Navigator & { gpu?: GPU }).gpu);
+    progress(0.1);
     this.device = gpu.device;
     this.device.lost.then((info) => {
       send({ type: 'status', state: 'error', message: info.reason === 'destroyed' ? '' : 'The graphics device was lost. Reload to continue.' });
@@ -107,7 +126,9 @@ class Engine {
     canvas.height = height;
 
     this.scene = compileScene(defaultSceneSpecs());
+    progress(0.25);
     this.solver = new GpuSolver(this.device, this.scene, GPU_DEFAULTS);
+    progress(0.5);
     this.interaction = new Interaction(this.device, this.solver, this.scene);
     this.solver.preSubstep = (pass) => this.interaction.encodeSubstep(pass);
     this.solver.preAssemble = (dispatch) => this.interaction.encode(dispatch);
@@ -115,11 +136,15 @@ class Engine {
     this.renderer = new Renderer(this.device, format, this.solver, this.scene);
     this.renderer.resize(width, height);
     this.speedProbe = this.device.createBuffer({ label: 'speedProbe', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    progress(0.7);
 
-    await this.settle();
+    await this.settle(await drape);
+    progress(0.9);
     // authored defects could leave pieces disconnected from the start
     await this.topology.request([]);
+    progress(1);
     this.ready = true;
+    if (this.audioPort) this.startAcoustics();
     this.asleep = true;
     this.lastFrame = performance.now();
     send({ type: 'status', state: 'running' });
@@ -128,14 +153,8 @@ class Engine {
   }
 
   /** Load (or compute) the settled drape, then keep the validated state as the reset snapshot. */
-  private async settle(): Promise<void> {
-    let loaded = false;
-    try {
-      const r = await fetch(new URL('/drape.bin', self.location.href));
-      if (r.ok) loaded = loadDrape(this.solver, await r.arrayBuffer());
-    } catch {
-      loaded = false;
-    }
+  private async settle(drape: ArrayBuffer | null): Promise<void> {
+    const loaded = drape !== null && loadDrape(this.solver, drape);
     if (!loaded) await settleDrape(this.device, this.solver);
     const copy = (src: GPUBuffer, label: string) => this.device.createBuffer({ label, size: src.size, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
     this.snapshot = { x: copy(this.solver.x, 'snap.x'), segs: copy(this.solver.segs, 'snap.segs'), tails: copy(this.solver.tails, 'snap.tails'), field: copy(this.solver.field, 'snap.field') };
@@ -150,8 +169,7 @@ class Engine {
 
   reset(): void {
     if (!this.ready || !this.snapshot) return;
-    this.endGrip();
-    this.pickToken++;
+    this.releaseAll();
     const enc = this.device.createCommandEncoder({ label: 'reset' });
     enc.copyBufferToBuffer(this.snapshot.x, 0, this.solver.x, 0, this.solver.x.size);
     enc.copyBufferToBuffer(this.snapshot.segs, 0, this.solver.segs, 0, this.solver.segs.size);
@@ -160,6 +178,7 @@ class Engine {
     enc.clearBuffer(this.solver.v);
     enc.clearBuffer(this.solver.ext);
     enc.clearBuffer(this.solver.counters);
+    enc.clearBuffer(this.solver.acousticSources);
     this.renderer.resetTopology(enc);
     this.device.queue.submit([enc.finish()]);
     this.topology.reset();
@@ -203,41 +222,51 @@ class Engine {
 
   pointer(c: PointerCommand): void {
     if (!this.ready) return;
-    if (c.phase === 'down') {
-      this.pointerDown = true;
-      this.latestPointer = c;
+    if (c.phase === 'cancel' && c.id === ALL_POINTERS) {
+      this.releaseAll();
+    } else if (c.phase === 'down') {
+      // one grip per finger, as many fingers as there are grip slots
+      if (this.down.has(c.id) || this.down.size >= MAX_GRIPS) return;
+      this.down.set(c.id, c);
       void this.beginGrip(c);
     } else if (c.phase === 'move') {
-      this.latestPointer = c;
-      if (this.grip) this.updateGripTarget(c);
+      if (!this.down.has(c.id)) return;
+      this.down.set(c.id, c);
+      const g = this.grips.get(c.id);
+      if (g) this.updateGripTarget(g, c);
     } else {
-      this.pointerDown = false;
-      this.pickToken++;
-      this.endGrip();
+      this.down.delete(c.id);
+      this.picking.delete(c.id);
+      this.endGrip(c.id);
     }
   }
 
   private async beginGrip(c: PointerCommand): Promise<void> {
     const token = ++this.pickToken;
+    this.picking.set(c.id, token);
     const m = cameraMatrices(this.camera, this.width / this.height);
     const px = (c.x / this.cssWidth) * this.width;
     const py = (c.y / this.cssHeight) * this.height;
     // larger than the projected node spacing (~3.5 mm cells, ~1.1% of the view height)
     const radius = Math.max(8, 0.016 * this.height);
     const hit = await this.interaction.pickAt(m.viewProj, px, py, this.width, this.height, radius);
-    if (token !== this.pickToken || !this.pointerDown || !hit) return;
-    const forward = normalize(sub(this.camera.target, m.eye));
+    if (this.picking.get(c.id) !== token) return;
+    this.picking.delete(c.id);
+    if (!hit || !this.down.has(c.id)) return;
+    // a finger on material another finger already pinches holds nothing more
+    if (this.interaction.holder(hit.node) >= 0) return;
+    const slot = this.interaction.freeSlot();
     const p = hit.position as Vec3;
-    this.grip = { node: hit.node, plane: p, normal: forward, handle: p, target: p, depth: 0, engageTime: performance.now() };
-    this.interaction.attach(hit.node, p);
+    if (slot < 0 || !this.interaction.attach(hit.node, p, slot)) return;
+    const forward = normalize(sub(this.camera.target, m.eye));
+    const g: GripState = { slot, node: hit.node, plane: p, normal: forward, handle: p, target: p, depth: 0, engageTime: performance.now() };
+    this.grips.set(c.id, g);
     this.wake();
     send({ type: 'cursor', cursor: 'grabbing' });
-    if (this.latestPointer) this.updateGripTarget(this.latestPointer);
+    this.updateGripTarget(g, this.down.get(c.id) ?? c);
   }
 
-  private updateGripTarget(c: PointerCommand): void {
-    const g = this.grip;
-    if (!g) return;
+  private updateGripTarget(g: GripState, c: PointerCommand): void {
     const { origin, dir } = this.ray(c.x, c.y);
     const denom = dot(dir, g.normal);
     if (Math.abs(denom) < 1e-6) return;
@@ -245,40 +274,93 @@ class Engine {
     g.target = add(origin, scale(dir, t));
   }
 
-  private endGrip(): void {
-    if (this.grip) {
-      this.interaction.release();
-      // pieces held only by the grip are free now
-      void this.topology.request([]);
-      this.grip = null;
-      send({ type: 'cursor', cursor: 'grab' });
-    }
+  private endGrip(id: number): void {
+    const g = this.grips.get(id);
+    if (!g) return;
+    this.interaction.release(g.slot);
+    this.grips.delete(id);
+    // pieces held only by this grip are free now
+    void this.topology.request(this.interaction.coreNodes);
+    if (this.grips.size === 0) send({ type: 'cursor', cursor: 'grab' });
+  }
+
+  /** Release every grip and forget every pointer (cancel, reset, hidden page). */
+  private releaseAll(): void {
+    this.pickToken++;
+    this.picking.clear();
+    this.down.clear();
+    for (const id of [...this.grips.keys()]) this.endGrip(id);
   }
 
   wheel(deltaY: number): void {
-    if (this.grip) {
-      this.grip.depth = Math.max(-0.03, Math.min(0.1, this.grip.depth - deltaY * 0.00006));
+    if (this.grips.size > 0) {
+      for (const g of this.grips.values()) g.depth = Math.max(-0.03, Math.min(0.1, g.depth - deltaY * 0.00006));
     } else {
       this.camera.distance = Math.max(0.3, Math.min(1.15, this.camera.distance * Math.exp(deltaY * 0.0008)));
       this.dirty = true;
     }
   }
 
-  /** Advance the grip handle along a bounded-speed path toward the pointer target (one substep). */
-  private stepHandle(h: number): void {
-    const g = this.grip;
-    if (!g) return;
-    const since = (performance.now() - g.engageTime) / 1000;
-    const engage = Math.min(1, since / GRIP.engageTime);
-    const drag = Math.hypot(g.target[0] - g.plane[0], g.target[1] - g.plane[1], g.target[2] - g.plane[2]);
-    const lift = -(ENGAGE_LIFT * engage + Math.min(MAX_DRAG_LIFT, LIFT_PER_DRAG * drag) + g.depth);
-    const goal = add(g.target, scale(g.normal, lift));
-    this.interaction.setPinch(pinchScale(since));
-    const d = sub(goal, g.handle);
-    const len = Math.hypot(d[0], d[1], d[2]);
-    const maxStep = HANDLE_MAX_SPEED * h;
-    g.handle = len <= maxStep ? goal : add(g.handle, scale(d, maxStep / len));
-    this.interaction.setTarget(g.handle);
+  /** Advance every grip handle along a bounded-speed path toward its pointer target (one substep). */
+  private stepHandles(h: number): void {
+    const now = performance.now();
+    for (const g of this.grips.values()) {
+      const since = (now - g.engageTime) / 1000;
+      const engage = Math.min(1, since / GRIP.engageTime);
+      const drag = Math.hypot(g.target[0] - g.plane[0], g.target[1] - g.plane[1], g.target[2] - g.plane[2]);
+      const lift = -(ENGAGE_LIFT * engage + Math.min(MAX_DRAG_LIFT, LIFT_PER_DRAG * drag) + g.depth);
+      const goal = add(g.target, scale(g.normal, lift));
+      this.interaction.setPinch(pinchScale(since), g.slot);
+      const d = sub(goal, g.handle);
+      const len = Math.hypot(d[0], d[1], d[2]);
+      const maxStep = HANDLE_MAX_SPEED * h;
+      g.handle = len <= maxStep ? goal : add(g.handle, scale(d, maxStep / len));
+      this.interaction.setTarget(g.handle, g.slot);
+    }
+  }
+
+  /**
+   * Sound sources follow the fingers: each emission belongs to the nearest held grip (common.wgsl
+   * nearestSource), so two tears made by two hands are two sources. With no grip held the last
+   * anchors stay, and a tear running on after the release keeps its source.
+   */
+  private updateAnchors(): void {
+    if (this.grips.size === 0) return;
+    this.anchors.fill(0);
+    for (const g of this.grips.values()) this.anchors.set([g.handle[0], g.handle[1], g.handle[2], 1], 4 * g.slot);
+    this.device.queue.writeBuffer(this.solver.acousticSources, 0, this.anchors);
+  }
+
+  /** Audio has started: acoustic records go to `port` from now on. */
+  setAudio(port: MessagePort): void {
+    this.audioPort = port;
+    if (this.ready) this.startAcoustics();
+  }
+
+  private startAcoustics(): void {
+    if (this.acoustic) return;
+    this.acoustic = new AcousticLog(this.device, this.solver.counters);
+    // what accumulated before audio started is not heard
+    const enc = this.device.createCommandEncoder({ label: 'acousticStart' });
+    enc.clearBuffer(this.solver.counters, 4 * ACOUSTIC_SLOT, 4 * ACOUSTIC_SLOTS);
+    this.device.queue.submit([enc.finish()]);
+  }
+
+  /** Decode a frame's acoustic records and send them to the audio thread. */
+  private sendAcoustics(raw: Uint32Array, count: number, duration: number, viewProj: Float32Array): void {
+    if (!this.audioPort) return;
+    const out = new Float32Array(count * RECORD_FLOATS);
+    for (let q = 0; q < count; q++) {
+      for (let src = 0; src < SOURCES; src++) {
+        const at = fracturePosition(raw, q * ACOUSTIC_SLOTS, src);
+        if (!at) continue;
+        // the source's fracture, horizontally on screen
+        const c = transformPoint(viewProj, at);
+        if (c[3] > 1e-6) this.lastPan[src] = Math.max(-1, Math.min(1, c[0] / c[3]));
+      }
+      decodeRecord(raw, q * ACOUSTIC_SLOTS, out, q * RECORD_FLOATS, duration, this.lastPan);
+    }
+    this.audioPort.postMessage(out, [out.buffer]);
   }
 
   /** Asynchronously read the largest nodal speed since the last probe (rest detection). */
@@ -307,7 +389,7 @@ class Engine {
           void this.topology.request(this.interaction.coreNodes);
         }
         this.probeBusy = false;
-        if (this.grip || this.asleep) {
+        if (this.grips.size > 0 || this.asleep) {
           this.restFor = 0;
           return;
         }
@@ -339,12 +421,22 @@ class Engine {
     if (steps === 0 && !this.dirty) return;
     this.dirty = false;
     this.lastPresent = now;
+    if (steps > 0) this.updateAnchors();
+    const acoustic = steps > 0 && this.acoustic?.begin() ? this.acoustic : null;
     for (let k = 0; k < steps; k++) {
       // grip targets are queue writes; one submission per substep keeps each ordered with its work
-      this.stepHandle(H);
+      this.stepHandles(H);
       const se = this.device.createCommandEncoder({ label: 'substep' });
       this.solver.encodeSubstep(se);
+      acoustic?.record(se);
       this.device.queue.submit([se.finish()]);
+    }
+    if (acoustic) {
+      // read back as soon as the substeps finish (before the frame renders): the substeps are heard
+      // over the wall time this frame presents them in
+      const duration = dt / steps;
+      const viewProj = cameraMatrices(this.camera, this.width / this.height).viewProj;
+      void acoustic.end().then((r) => r && this.sendAcoustics(r.raw, r.count, duration, viewProj));
     }
     if (steps > 0) this.probeRest(steps);
     this.substepsDone += steps;
@@ -377,8 +469,7 @@ class Engine {
   setVisible(v: boolean): void {
     this.visible = v;
     if (!v) {
-      this.pickToken++;
-      this.endGrip();
+      this.releaseAll();
       this.simBacklog = 0;
     }
     this.dirty = true;
@@ -388,7 +479,7 @@ class Engine {
 
   private async runSubsteps(n: number): Promise<void> {
     for (let k = 0; k < n; k++) {
-      this.stepHandle(H);
+      this.stepHandles(H);
       const se = this.device.createCommandEncoder({ label: 'devSubstep' });
       this.solver.encodeSubstep(se);
       this.device.queue.submit([se.finish()]);
@@ -440,6 +531,9 @@ scope.onmessage = (ev: MessageEvent<ToEngine>) => {
       break;
     case 'visibility':
       engine.setVisible(m.visible);
+      break;
+    case 'audio':
+      engine.setAudio(m.port);
       break;
     case 'dev':
       engine.dev(m).then((result) => send({ type: 'devDone', id: m.id, result }), (e: unknown) => send({ type: 'devDone', id: m.id, result: String(e) }));

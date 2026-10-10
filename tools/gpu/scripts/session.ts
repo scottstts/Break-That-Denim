@@ -13,6 +13,8 @@ import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
 import { Interaction } from '../../../src/simulation/gpu/interaction';
 import { Topology } from '../../../src/simulation/gpu/topology';
 import { GRIP, pinchScale } from '../../../src/simulation/grip';
+import { AcousticLog } from '../../../src/engine/acousticLog';
+import { ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../../../src/audio/record';
 import { CAPTURES, drain, encodePng, gpuDevice } from '../env';
 import { settledSolver } from './render';
 
@@ -298,6 +300,9 @@ export default async function main(args: string[]): Promise<void> {
   solver.preAssemble = (dispatch) => interaction.encode(dispatch);
   const topology = process.env.NO_TOPOLOGY ? null : new Topology(device, solver, scene);
   let events = 0;
+  // AUDIO=file.json: the acoustic record of every substep (audio/record.ts; pan = world x of the fracture)
+  const acoustic = process.env.AUDIO ? new AcousticLog(device, solver.counters) : null;
+  const audioRecords: number[][] = [];
   const format: GPUTextureFormat = 'rgba8unorm';
   const [W, Hh] = (process.env.SIZE ?? "960x600").split("x").map(Number);
   const renderer = new Renderer(device, format, solver, scene);
@@ -349,6 +354,7 @@ export default async function main(args: string[]): Promise<void> {
     const ce = device.createCommandEncoder();
     ce.clearBuffer(solver.counters, 8, 4);
     device.queue.submit([ce.finish()]);
+    acoustic?.begin();
     for (let k = 0; k < perFrame; k++) {
       if (handle && goal) {
         const d = [goal[0] - handle[0], goal[1] - handle[1], goal[2] - handle[2]];
@@ -366,6 +372,7 @@ export default async function main(args: string[]): Promise<void> {
       }
       const enc = device.createCommandEncoder();
       solver.encodeSubstep(enc);
+      acoustic?.record(enc);
       device.queue.submit([enc.finish()]);
       if (hunting && (await hunt(device, solver, `t=${(t + (k + 1) * h).toFixed(4)}`))) {
         snapshot(device, solver, false);
@@ -374,6 +381,16 @@ export default async function main(args: string[]): Promise<void> {
       }
     }
     await drain(device);
+    const rec = await acoustic?.end();
+    if (rec) {
+      const out = new Float32Array(RECORD_FLOATS);
+      for (let q = 0; q < rec.count; q++) {
+        // pan: the fracture's world x per source (render.ts maps it to the view)
+        const pans = Array.from({ length: SOURCES }, (_, src) => fracturePosition(rec.raw, q * ACOUSTIC_SLOTS, src)?.[0] ?? 0);
+        decodeRecord(rec.raw, q * ACOUSTIC_SLOTS, out, 0, h, pans);
+        audioRecords.push(Array.from(out));
+      }
+    }
     t += perFrame * h;
     const xs = new Float32Array(await readBuffer(device, solver.x));
     const v = new Float32Array(await readBuffer(device, solver.v));
@@ -769,6 +786,10 @@ export default async function main(args: string[]): Promise<void> {
   log.push(summary);
   mkdirSync(CAPTURES, { recursive: true });
   writeFileSync(resolve(CAPTURES, `${name}.log`), log.join('\n'));
+  if (process.env.AUDIO) {
+    writeFileSync(resolve(process.env.AUDIO), JSON.stringify({ h, records: audioRecords }));
+    console.log(`acoustic records: ${audioRecords.length} -> ${process.env.AUDIO}`);
+  }
   if (process.env.DUMP) {
     // final state for offline analysis (still.ts): x (vec4 per node), segs (8 x 32-bit per span),
     // tails (4 per node), yarn field (u32 per crossing)

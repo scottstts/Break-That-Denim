@@ -1,7 +1,7 @@
 # Handoff (rolling)
 
-Latest round: `docs/decisions/2026-10-10-folds-and-free-tails.md` (uncommitted, for the user to
-inspect). Before: `docs/decisions/2026-10-10-edge-fibre-population.md`,
+Latest round: `docs/decisions/2026-10-10-tear-sound.md` (tear sound, multi-touch, page UI; uncommitted).
+Before: `docs/decisions/2026-10-10-folds-and-free-tails.md`, `docs/decisions/2026-10-10-edge-fibre-population.md`,
 `docs/decisions/2026-10-10-interaction-round.md`.
 
 ## State
@@ -20,6 +20,11 @@ inspect). Before: `docs/decisions/2026-10-10-edge-fibre-population.md`,
 
 ## Verified
 
+- Tear sound: side-by-side waveforms vs the recording at 1 s / 200 ms / 40 ms / 10 ms
+  (`tools/audio/compare.mjs`); 50 ms kurtosis 4.4-5.1 / crest 13.5-14.6 dB vs 5.1 / 14.3. Not yet
+  confirmed by the user by ear in the app after the last rework (dense fibre-bundle events).
+- Multi-touch: `twohand.ts` apart/shear/overlap/adjacent/three clean; `npm run check` 45 unit.
+
 - `npm run check` (33 unit), `npm run test:gpu` (26/26).
 - Session `settle`: 0 line-search rejections (was 164), settles 0.73 s after release.
 - `haul` (fast long drag, AUTOLIFT=1): grip held on worn and intact cloth; worn scrap stays in the hand.
@@ -28,6 +33,10 @@ inspect). Before: `docs/decisions/2026-10-10-edge-fibre-population.md`,
   large worn piece (freed 368 nodes), which falls when released.
 
 ## Reproduce
+
+- Sound: `AUDIO=f.json node tools/gpu/run.mjs tools/gpu/scripts/session.ts rip` (or `twohand.ts`),
+  then `tools/audio/render.ts f.json out.wav` (`VOICE`, `JITTER` overrides), `tools/audio/analyze.mjs`,
+  `tools/audio/compare.mjs ref 0.70 out.wav 0.15 cmp.png`; refit spectra with `tools/audio/fit.ts`.
 
 - `node tools/gpu/run.mjs tools/gpu/scripts/session.ts <script> NAME 30` (`DUMP=1`, `SNAPS=t,...`,
   `FRAMES=dir`, `STATS=1`, `TRACK=n`, `LSPROBE=t`); `haul` with `GRAB`, `PULL`, `HOLD`, `AUTOLIFT=1`.
@@ -43,6 +52,10 @@ inspect). Before: `docs/decisions/2026-10-10-edge-fibre-population.md`,
   grows with fuzz, so compare coverage for our own changes).
 
 ## Open
+
+0. Sound: verify by ear in the browser; the pre-tear quiet passages of the recording carry a
+   continuous low rustle (handling) that ours lacks (only friction from crossing slip, quiet by
+   design). Mouse wheel depth applies to all held grips.
 
 1. Shape plan: measurement, rim volume (edge fibre) and fold diagnosis done. Folds buckle correctly and
    are converged in resolution; their depth follows the mount (taut along the warp) and the pull. Thread

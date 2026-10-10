@@ -321,3 +321,33 @@ fn bracketOf(i: u32, n: u32) -> Bracket {
   let inv = 1.0 / f32(b - a);
   return Bracket(lo, lo + 1u, f32(b - i) * inv, f32(i - a) * inv);
 }
+
+// ---------------------------------------------------------------- acoustic emission (src/audio)
+
+// Slots of the counters buffer that accumulate what the mechanics release audibly during one
+// substep (the engine copies and clears them after every substep; decoded by src/audio/record.ts).
+// One block of ACOUSTIC_STRIDE slots per sound source (one per finger: an emission belongs to the
+// nearest held grip, interaction.ts), at ACOUSTIC + ACOUSTIC_STRIDE * source:
+// +0 strain energy released by fibre fracture (1e-5 J/m), +1 yarn ends pulled out of a crossing
+// (count), +2 their friction work (1e-8 J), +3 crossing slip work times slip speed (1e-8 J mm/s),
+// +4..6 fracture-weighted position sum (mm x damage code, i32), +7 its weight (damage codes).
+const ACOUSTIC: u32 = 16u;
+const ACOUSTIC_STRIDE: u32 = 8u;
+
+// Sound source of an emission at p: the nearest anchor in use (w > 0), else the first.
+fn nearestSource(p: vec3<f32>, anchors: array<vec4<f32>, 4>) -> u32 {
+  var best = 0u;
+  var bestD = 1e30;
+  for (var s = 0u; s < 4u; s++) {
+    let a = anchors[s];
+    if (a.w <= 0.0) { continue; }
+    let d = dot(p - a.xyz, p - a.xyz);
+    if (d < bestD) {
+      bestD = d;
+      best = s;
+    }
+  }
+  return best;
+}
+
+fn acousticSlot(source: u32, field: u32) -> u32 { return ACOUSTIC + ACOUSTIC_STRIDE * source + field; }

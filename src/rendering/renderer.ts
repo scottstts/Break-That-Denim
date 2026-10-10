@@ -1,4 +1,5 @@
 import type { CompiledScene } from '../simulation/scene';
+import { COTTON_FIBRE_DENSITY } from '../simulation/material';
 import type { GpuSolver } from '../simulation/gpu/solver';
 import { SELF_CONTACT, SelfContact } from '../simulation/gpu/selfcontact';
 import { ComputeModule, createBuffer, createBufferWith, shaderModule, STORAGE, UNIFORM } from '../gpu/util';
@@ -63,8 +64,6 @@ const KAPPA_SLOTS = 16384;
 const MAX_EDGES = 262144;
 /** Edge-fibre strands per free-edge crossing, dealt round its open sides (fuzz.wgsl). */
 const FIBERS_PER_EDGE = 12;
-/** Linear density of a cotton fibre (1.8 dtex, micronaire ~4.2), kg/m: a yarn holds its linear density over this many fibres. */
-const COTTON_FIBRE_DENSITY = 0.18e-6;
 /** Free tails of threads held at one end (thread_prep.wgsl tailSolve): segments per tail, most per frame. */
 const TAIL_SEGS = 16;
 const MAX_TAILS = 8192;

@@ -17,6 +17,8 @@
 // contact bound per node: unit normal away from its nearest face (or foreign node) at the start of the
 // substep, and the largest step displacement allowed toward it (zero normal: unbounded)
 @group(0) @binding(11) var<storage, read> cmeta: array<vec4<f32>>;
+// sound source anchors (common.wgsl nearestSource): positions of the held grips, w > 0 in use
+@group(0) @binding(12) var<uniform> SRC: array<vec4<f32>, 4>;
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
 
@@ -153,22 +155,22 @@ fn spanActive(owner: i32, f: u32) -> bool {
   return segActive(segs[2u * u32(owner) + f]);
 }
 
-@compute @workgroup_size(128)
-fn slip(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x;
-  if (n >= P.counts.x || P.counts.z == 0u) { return; }
-  if (v[n].w > historyTolerance()) { return; }
+// Friction-limited slip of the family-Mode.x yarn through crossing n; returns the friction work (J)
+// and the slip length (m).
+fn slipAt(n: u32) -> vec2<f32> {
+  if (n >= P.counts.x || P.counts.z == 0u) { return vec2<f32>(0.0); }
+  if (v[n].w > historyTolerance()) { return vec2<f32>(0.0); }
   let f = Mode.x;
   let ijl = nodes[n].ijl;
   let along = select((ijl >> 12u) & 0xFFFu, ijl & 0xFFFu, f == 0u);
-  if ((along & 1u) != Mode.y) { return; }
-  if (pinnedN(n)) { return; }
+  if ((along & 1u) != Mode.y) { return vec2<f32>(0.0); }
+  if (pinnedN(n)) { return vec2<f32>(0.0); }
   let prev = nbr(n, f, -1);
   let next = nbr(n, f, 1);
-  if (prev < 0 || next < 0) { return; }
+  if (prev < 0 || next < 0) { return vec2<f32>(0.0); }
   let actL = spanActive(prev, f);
   let actR = spanActive(i32(n), f);
-  if (!actL && !actR) { return; }
+  if (!actL && !actR) { return vec2<f32>(0.0); }
   var tl = vec2<f32>(0.0);
   var tr = vec2<f32>(0.0);
   if (actL) { tl = spanTension(u32(prev), f); }
@@ -186,12 +188,12 @@ fn slip(@builtin(global_invocation_id) gid: vec3<u32>) {
     tc += max(0.0, spanTension(n, g).x);
     cnt += 1.0;
   }
-  if (cnt == 0.0) { return; }
+  if (cnt == 0.0) { return vec2<f32>(0.0); }
   tc /= cnt;
   let mat = P.layers[ijl >> 24u];
   let Fc = mat.a.y * (nodes[n].n0 + mat.a.z * mat.yarn[f].yarnsPerSpan * tc);
   let dT = max(tr.x, 0.0) - max(tl.x, 0.0);
-  if (abs(dT) <= Fc) { return; }
+  if (abs(dT) <= Fc) { return vec2<f32>(0.0); }
   let highR = dT > 0.0;
   let kHigh = select(tl.y, tr.y, highR);
   let lowActive = select(actR, actL, highR);
@@ -216,6 +218,30 @@ fn slip(@builtin(global_invocation_id) gid: vec3<u32>) {
       tails[farTail] += segs[sHigh].rest;
       segs[sHigh].flags = segs[sHigh].flags | SEG_BROKEN;
       atomicAdd(&counters[1], 1u);
+    }
+  }
+  return vec2<f32>(Fc * dl, dl);
+}
+
+// Acoustic emission of crossing slip (common.wgsl ACOUSTIC): the friction work times the slip speed,
+// summed per workgroup and sound source and added once (1e-8 J mm/s). Rubbing noise grows with the
+// sliding speed, so creep under a held load is all but silent while fast slip rasps.
+var<workgroup> slipRasp: array<vec4<f32>, 128>;
+
+@compute @workgroup_size(128)
+fn slip(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+  let r = slipAt(gid.x);
+  var v = vec4<f32>(0.0);
+  if (r.x > 0.0) { v[nearestSource(x[gid.x].xyz, SRC)] = r.x * r.y / P.hg.x * 1e3; }
+  slipRasp[t] = v;
+  workgroupBarrier();
+  for (var s = 64u; s > 0u; s = s / 2u) {
+    if (t < s) { slipRasp[t] += slipRasp[t + s]; }
+    workgroupBarrier();
+  }
+  if (t == 0u) {
+    for (var s = 0u; s < 4u; s++) {
+      if (slipRasp[0][s] > 0.0) { atomicAdd(&counters[acousticSlot(s, 3u)], u32(round(slipRasp[0][s] * 1e8))); }
     }
   }
 }

@@ -41,8 +41,11 @@ export interface GripPatch {
   stiffness: number;
 }
 
-/** Smoothly weighted material patch around `node` (same layer, free nodes only). */
-export function gripPatch(s: CompiledScene, node: number): GripPatch | null {
+/**
+ * Smoothly weighted material patch around `node` (same layer, free nodes only), limited to nodes
+ * `available` accepts (material another finger already holds stays with that finger).
+ */
+export function gripPatch(s: CompiledScene, node: number, available: (n: number) => boolean = () => true): GripPatch | null {
   const layer = s.layers.find((L) => node >= L.nodeOffset && node < L.nodeOffset + L.nodeCount);
   if (!layer) return null;
   const u0 = s.restUV[2 * node];
@@ -60,7 +63,7 @@ export function gripPatch(s: CompiledScene, node: number): GripPatch | null {
   for (let j = Math.max(0, j0 - rj); j <= Math.min(layer.ny - 1, j0 + rj); j++) {
     for (let i = Math.max(0, i0 - ri); i <= Math.min(layer.nx - 1, i0 + ri); i++) {
       const n = layer.nodeOffset + j * layer.nx + i;
-      if (s.pinned[n]) continue;
+      if (s.pinned[n] || !available(n)) continue;
       const d = Math.hypot(s.restUV[2 * n] - u0, s.restUV[2 * n + 1] - v0) / R;
       if (d >= 1) continue;
       // smooth falloff: full weight in the core, tapering to zero at the rim

@@ -13,6 +13,7 @@ import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
 import yarnFieldWgsl from './wgsl/yarnfield.wgsl?raw';
 import { SHARE, shareReach } from '../yarnField';
+import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS } from '../../audio/record';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
 import dragWgsl from './wgsl/drag.wgsl?raw';
@@ -72,7 +73,7 @@ const MAX_LINE = 384;
 /** Line colors per family (3: lines smoothed together never share a stencil coupling). */
 const COLORS_PER_FAMILY = 3;
 const LINE_COLORS = 2 * COLORS_PER_FAMILY;
-/** Workgroups of the grip kernel in a gated iteration (it early-outs beyond the active entries). */
+/** Workgroups of the grip kernel (64 entries each: every grip slot, interaction.ts; it early-outs beyond the active entries). */
 const GRIP_GROUPS = 32;
 /** Floats per operator row (vec4-aligned): fine lattice rows (12 couplings), coarse Galerkin rows (24). */
 export const FINE_ROW = 72;
@@ -194,9 +195,12 @@ export class GpuSolver {
    * [0] ruptures, [1] pulled-out spans, [2] max speed since last cleared (f32 bits), [3] line-search
    * step length of the current Newton iteration (f32 bits),
    * [4 + k] largest nodal update of Newton iteration k in the current substep (f32 bits),
-   * [12] Newton directions rejected by the line search (no evaluated step decreased the potential).
+   * [12] Newton directions rejected by the line search (no evaluated step decreased the potential),
+   * [ACOUSTIC_SLOT...] acoustic emission of the substep (audio/record.ts, common.wgsl ACOUSTIC).
    */
   readonly counters: GPUBuffer;
+  /** Sound source anchors (common.wgsl nearestSource): 4 x vec4, positions of the held grips, w > 0 in use. */
+  readonly acousticSources: GPUBuffer;
   /** Cross-layer contact for multi-layer scenes, self-contact for a single layer. */
   readonly contact: Contact | SelfContact;
   readonly contactEnabled: boolean;
@@ -271,7 +275,9 @@ export class GpuSolver {
     this.pullBits = createBuffer(device, 'pullBits', 4 * Math.ceil(scene.fieldDamage.length / 2 / 16));
     this.tails = createBufferWith(device, 'tails', Float32Array.from(scene.tails));
     this.ext = createBuffer(device, 'ext', 48 * N);
-    this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON + 16);
+    if (4 + MAX_NEWTON + 4 > ACOUSTIC_SLOT) throw new Error('counter slots overlap the acoustic accumulators');
+    this.counters = createBuffer(device, 'counters', 4 * (ACOUSTIC_SLOT + ACOUSTIC_SLOTS));
+    this.acousticSources = createBuffer(device, 'acousticSources', 64, UNIFORM);
     this.contactEnabled = scene.layers.length > 1 || this.params.selfContact;
 
     // ---- levels
@@ -436,6 +442,7 @@ export class GpuSolver {
       9: this.delta,
       10: this.counters,
       11: this.contact.meta,
+      12: this.acousticSources,
     };
     const group = (key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod.step.bindGroup(key, entries);
@@ -454,6 +461,7 @@ export class GpuSolver {
       9: this.counters,
       10: this.fieldEvents,
       11: this.pullBits,
+      12: this.acousticSources,
     });
     for (const k of ['spanStrain', 'fieldUpdate', 'pull', 'couple']) this.bg[k] = this.bg.yarnField;
     for (let it = 0; it < MAX_NEWTON; it++) {
