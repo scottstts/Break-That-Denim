@@ -24,6 +24,8 @@ type Step =
   | { wait: number }
   // cut a U-shaped flap of half-size `half` lattice cells (hinge on its +v side) at a world point
   | { cut: [number, number]; half: number }
+  // cut a square piece free on all four sides and lay it `lift` m above the sheet, `shift` m along +x
+  | { scrap: [number, number]; half: number; lift: number; shift: number }
   // fold the cut flap over its hinge: wrapped around a fold of this radius (m), then flat on top
   | { foldover: number };
 
@@ -69,6 +71,8 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
   flap: [{ cut: [0.0, 0.0], half: 8 }, { wait: 2.5 }],
   // self-contact: a cut flap folded back over its hinge and dropped onto the sheet must rest on it,
   // not fall through
+  // debris against the cloth: a piece cut free is laid above intact cloth and falls onto it
+  scrap: [{ scrap: [-0.035, 0.03], half: 4, lift: 0.01, shift: 0.03 }, { wait: 1.2 }],
   // self-contact, deterministic: the cut flap is laid folded over the sheet 4 mm above it and drops
   drop: [{ cut: [-0.035, 0.03], half: 8 }, { foldover: 0.0025 }, { wait: 1.5 }],
   fold: [
@@ -229,6 +233,7 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
 };
 
 const scaleStep = (st: Step): Step =>
+  'scrap' in st ? { ...st, scrap: [st.scrap[0] * GESTURE_SCALE, st.scrap[1] * GESTURE_SCALE] } :
   'cut' in st ? { cut: [st.cut[0] * GESTURE_SCALE, st.cut[1] * GESTURE_SCALE], half: st.half } :
   'foldover' in st ? st :
   'grab' in st ? { grab: [st.grab[0] * GESTURE_SCALE, st.grab[1] * GESTURE_SCALE] } : 'to' in st ? { to: [st.to[0] * GESTURE_SCALE, st.to[1] * GESTURE_SCALE, st.to[2] * GESTURE_SCALE], t: st.t } : st;
@@ -293,6 +298,8 @@ export default async function main(args: string[]): Promise<void> {
   };
   let lastX = x0;
   let grabbed = -1;
+  // scrap fixture: the piece's centre node (its height against the sheet below it is logged)
+  let scrapCentre = -1;
   let grabT = 0;
   let slipFor = 0;
   let cutBox: number[] | null = null;
@@ -362,6 +369,17 @@ export default async function main(args: string[]): Promise<void> {
       maxDisp = Math.max(maxDisp, d);
       if (d > 0.3) far++;
       if (v[4 * n + 3] > solver.params.historyTolerance) gated++;
+    }
+    if (scrapCentre >= 0) {
+      const c = scrapCentre;
+      let best = 1e9;
+      let zs = 0;
+      for (let m = 0; m < N; m++) {
+        if (xs[4 * m + 3] > 0.5) continue;
+        const d = Math.hypot(xs[4 * m] - xs[4 * c], xs[4 * m + 1] - xs[4 * c + 1]);
+        if (d < best) [best, zs] = [d, xs[4 * m + 2]];
+      }
+      console.log(`  scrap centre x ${(xs[4 * c] * 1e3).toFixed(1)} z ${(xs[4 * c + 2] * 1e3).toFixed(2)} mm v ${Array.from(v.slice(4 * c, 4 * c + 3)).map((q) => q.toFixed(3)).join(',')} (state ${xs[4 * c + 3]}), sheet below ${(zs * 1e3).toFixed(2)} mm at ${(best * 1e3).toFixed(1)} mm in plan`);
     }
     if (process.env.TRACK) {
       for (const tn of process.env.TRACK.split(',').map(Number)) {
@@ -507,6 +525,57 @@ export default async function main(args: string[]): Promise<void> {
       }
       solver.setState(xs);
       lastX = xs;
+    } else if ('scrap' in s) {
+      let at = 0;
+      let best = 1e9;
+      for (let n = 0; n < N; n++) {
+        const d = Math.hypot(lastX[4 * n] - s.scrap[0], lastX[4 * n + 1] - s.scrap[1]);
+        if (d < best) [best, at] = [d, n];
+      }
+      const L = scene.layers[0];
+      const i0 = at % L.nx;
+      const j0 = Math.floor(at / L.nx);
+      const a = s.half;
+      // cut every yarn of the bordering spans in the field too, so the renderer sees the piece separate
+      const sg = new Uint32Array(await readBuffer(device, solver.segs));
+      const fw = new Uint32Array(await readBuffer(device, solver.field));
+      const F = scene.field[0];
+      const cutSpan = (i: number, j: number, f: number) => {
+        sg[8 * (2 * (j * L.nx + i) + f) + 5] |= 2;
+        sg[8 * (2 * (j * L.nx + i) + f) + 3] = 0xffffffff;
+        const P = f === 1 ? F.bv : F.bu;
+        const B = f === 1 ? F.bu : F.bv;
+        for (let q = 0; q < B; q++) {
+          for (let p = 0; p < P; p++) {
+            const c = f === 1 ? F.offset + (j * F.bv + Math.floor(F.bv / 2) + p) * F.K + i * F.bu + q : F.offset + (j * F.bv + q) * F.K + i * F.bu + Math.floor(F.bu / 2) + p;
+            fw[c] |= 0xff << (8 * f);
+          }
+        }
+      };
+      for (let j = j0 - a; j <= j0 + a; j++) {
+        cutSpan(i0 - a - 1, j, 0);
+        cutSpan(i0 + a, j, 0);
+      }
+      for (let i = i0 - a; i <= i0 + a; i++) {
+        cutSpan(i, j0 - a - 1, 1);
+        cutSpan(i, j0 + a, 1);
+      }
+      device.queue.writeBuffer(solver.segs, 0, sg);
+      device.queue.writeBuffer(solver.field, 0, fw);
+      device.queue.writeBuffer(solver.fieldEvents, 0, new Uint32Array([1]));
+      const xs = new Float32Array(await readBuffer(device, solver.x));
+      for (let j = j0 - a; j <= j0 + a; j++) {
+        for (let i = i0 - a; i <= i0 + a; i++) {
+          const n = j * L.nx + i;
+          xs[4 * n] += s.shift;
+          xs[4 * n + 2] += s.lift;
+        }
+      }
+      solver.setState(xs);
+      lastX = xs;
+      await topology?.request([]);
+      cutBox = [i0 - a, i0 + a, j0 - a, j0 + a];
+      scrapCentre = at;
     } else if ('cut' in s) {
       let at = 0;
       let best = 1e9;

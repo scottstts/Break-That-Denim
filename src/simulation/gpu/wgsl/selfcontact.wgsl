@@ -191,7 +191,9 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   for (var k = 0u; k < K; k++) { pairs[K * n + k] = NONE; }
-  if ((nodes[n].flags & NODE_PINNED) != 0u || !cloth(n)) {
+  // ballistic debris is bounded against the cloth too (it lands on it instead of falling through), but
+  // takes no penalty terms (step.wgsl commit clips its fall); retired nodes are out of the scene
+  if ((nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 1.5) {
     cmeta[n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
     return;
   }
@@ -265,7 +267,9 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
   }
-  for (var k = 0u; k < K; k++) { pairs[K * n + k] = best[k]; }
+  if (cloth(n)) {
+    for (var k = 0u; k < K; k++) { pairs[K * n + k] = best[k]; }
+  }
   // approach toward the nearest face limited to a share of the clearance above the hard core
   if (d0min < 0.5 * SU.grid.x) {
     cmeta[n] = vec4<f32>(n0, SU.law.w * max(d0min - HARD_CORE, 0.0));

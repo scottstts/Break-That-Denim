@@ -29,6 +29,10 @@ const RETIRE_R: f32 = 0.6;
 // Quadratic air drag of a cloth scrap per unit speed (1/m): 0.5 rho Cd / (areal density), with
 // Cd ~ 1 and 0.4 kg/m^2 denim; terminal fall speed sqrt(g / k) ~ 2.6 m/s.
 const DEBRIS_DRAG: f32 = 1.5;
+// Debris resting on cloth: within this bound (m, a share of the clearance above the core) it is
+// supported, with cloth/cloth friction
+const DEBRIS_REST: f32 = 0.5e-3;
+const DEBRIS_FRICTION: f32 = 0.5;
 
 fn lattice(l: u32) -> vec4<u32> { return P.layers[l].lattice; }
 
@@ -99,7 +103,27 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w = x[n].w;
   dx[n] = vec4<f32>(0.0);
   if (w > 1.5) { return; }
-  let p = x[n].xyz + d;
+  var d1 = d;
+  if (w > 0.5) {
+    // ballistic debris meeting the cloth: its approach toward the nearest face is clipped to the same
+    // share of the clearance as a cloth node's (selfcontact.wgsl detect), so it lands and rests on the
+    // cloth (the clipped normal velocity is lost, inelastic). Resting on it (within DEBRIS_REST of the
+    // core), Coulomb friction with the supporting component of gravity slows its sliding by up to
+    // mu |g.n| h per step: a scrap stays put on slopes below atan(mu)
+    let m = cmeta[n];
+    if (any(m.xyz != vec3<f32>(0.0))) {
+      let approach = -dot(d1, m.xyz);
+      if (approach > m.w) { d1 += (approach - m.w) * m.xyz; }
+      if (m.w < DEBRIS_REST) {
+        let dn = dot(d1, m.xyz) * m.xyz;
+        let dt = d1 - dn;
+        let lt = length(dt);
+        let slow = DEBRIS_FRICTION * abs(dot(P.hg.yzw, m.xyz)) * P.hg.x * P.hg.x;
+        d1 = dn + select(vec3<f32>(0.0), dt * ((lt - slow) / max(lt, 1e-12)), lt > slow);
+      }
+    }
+  }
+  let p = x[n].xyz + d1;
   if (w > 0.5 && (p.z < RETIRE_Z || length(p.xy) > RETIRE_R)) {
     // debris left the scene: freeze and hide it
     x[n] = vec4<f32>(p, 2.0);
@@ -107,9 +131,9 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
   // v.w carries the node's last Newton update into the history kernels
-  v[n] = vec4<f32>(d / P.hg.x, lastUpdate);
+  v[n] = vec4<f32>(d1 / P.hg.x, lastUpdate);
   // largest speed since the host last cleared it (rest detection)
-  atomicMax(&counters[2], bitcast<u32>(length(d) / P.hg.x));
+  atomicMax(&counters[2], bitcast<u32>(length(d1) / P.hg.x));
   x[n] = vec4<f32>(p, w);
 }
 
