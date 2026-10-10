@@ -338,6 +338,10 @@ struct Look {
   ao: f32,
 };
 
+// How well a feature of size `scale` (m) is resolved at pixel footprint `pix` (m): 0 below 0.75 px
+// (its variation averages out within the pixel and must not alias into noise), 1 from 3 px.
+fn resolved(scale: f32, pix: f32) -> f32 { return clamp((scale / max(pix, 1e-9) - 0.75) / 2.25, 0.0, 1.0); }
+
 // Ring-dyed indigo warp and undyed weft. `pix` is the pixel footprint in metres (filters fibre-scale
 // detail to its mean), `wear` the abrasion field, `crown` the exposure of this point on its yarn,
 // `loose` 1 for a yarn freed of the crossing yarns (a thread, a pick across a ladder): no longer
@@ -354,13 +358,17 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
   let fiberVis = clamp(1.6 - pix / 40e-6, 0.0, 1.0);
   let fiberIdx = u32(i32(floor(fiberCoord)) + 1048576);
   let fiberRnd = hash2f(seedY * 31u + 7u, fiberIdx);
+  // per-yarn and per-float variations are a yarn pitch across: they fade to their mean once the
+  // pitch falls below a few pixels (the twill itself is shaded from the prefiltered weave tile)
+  let pitchX = select(L.pitch.y, L.pitch.x, fam == 1u);
+  let rYarn = resolved(pitchX, pix);
   if (fam == 1u) {
     // per-yarn dye depth, slubs along the yarn (mm to cm scale) and per-float variation
-    let yarnDye = 0.95 + 0.1 * hash2f(seedY, 3u);
-    let slub = 0.6 * noise1(seedY + 11u, along / 0.0035) + 0.4 * noise1(seedY + 23u, along / 0.014);
-    let floatV = hash2f(seedY ^ 0x5bd1e995u, bitcast<u32>(float_));
+    let yarnDye = 1.0 + (0.1 * hash2f(seedY, 3u) - 0.05) * rYarn;
+    let slub = (0.6 * noise1(seedY + 11u, along / 0.0035) + 0.4 * noise1(seedY + 23u, along / 0.014)) * sqrt(rYarn);
+    let floatV = mix(0.5, hash2f(seedY ^ 0x5bd1e995u, bitcast<u32>(float_)), rYarn);
     // sub-millimetre streaks along the yarn: twist irregularity exposes more or less undyed fibre
-    let streak = 0.6 * noise1(seedY + 41u, along / 0.3e-3) + 0.4 * noise1(seedY + 53u, along / 0.85e-3);
+    let streak = 0.6 * noise1(seedY + 41u, along / 0.3e-3) * resolved(0.3e-3, pix) + 0.4 * noise1(seedY + 53u, along / 0.85e-3) * resolved(0.85e-3, pix);
     // exposure of the pale core: abrasion acts on the crowns of the floats
     let abr = clamp(wear * (0.35 + 0.65 * crown) * (0.6 + 0.8 * floatV) + 0.1 * floatV * crown, 0.0, 1.0);
     let dye = clamp(yarnDye * (1.0 + 0.12 * slub) * (1.0 - 0.75 * abr), 0.0, 1.5);
@@ -371,9 +379,11 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     // fibre clumps and uneven ring dyeing mottle the surface: elongated along the warp (slub-like,
     // ~3 mm long, ~0.5 mm wide) plus fine isotropic clumps; faded below the pixel footprint
     let pc = vec2<f32>(f32(yarn) * L.pitch.x + across, along);
-    let m1 = noise2(977u + layerIdx, pc / 0.4e-3) * clamp(1.5 - pix / 0.4e-3, 0.0, 1.0);
-    let m2 = noise2(1913u + layerIdx, pc / vec2<f32>(0.55e-3, 3.0e-3)) * clamp(1.5 - pix / 0.55e-3, 0.0, 1.0);
-    let mottle = 0.55 * m1 + 0.3 * m2;
+    let m1 = noise2(977u + layerIdx, pc / 0.4e-3) * resolved(0.4e-3, pix);
+    let m2 = noise2(1913u + layerIdx, pc / vec2<f32>(0.55e-3, 3.0e-3)) * resolved(0.55e-3, pix);
+    // uneven ring dyeing and fading over a few millimetres: the heathered look of worn denim
+    let m3 = 0.65 * noise2(2711u + layerIdx, pc / 1.8e-3) + 0.35 * noise2(2719u + layerIdx, pc / 4.5e-3);
+    let mottle = 0.55 * m1 + 0.3 * m2 + 0.9 * m3 * resolved(1.8e-3, pix);
     // mean fraction of undyed fibre showing on the surface; individual fibres alternate around it
     let paleMean = clamp(0.12 + 0.45 * (1.0 - min(dye, 1.0)) + 0.06 * streak + 0.1 * mottle, 0.0, 1.0);
     let paleFiber = select(0.0, 1.0, fiberRnd < paleMean);
@@ -386,7 +396,7 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     o.albedo = mix(o.albedo, mix(pale, vec3<f32>(0.6, 0.62, 0.66), 0.5), 0.45 * loose);
     o.fuzz = 0.25 + 0.6 * wear + 0.3 * loose;
   } else {
-    let v = 0.85 + 0.2 * hash2f(seedY, 5u) + 0.08 * noise1(seedY + 3u, along / 0.004);
+    let v = 0.95 + (0.2 * hash2f(seedY, 5u) - 0.1 + 0.08 * noise1(seedY + 3u, along / 0.004)) * rYarn;
     let fib = mix(1.0, 0.85 + 0.3 * fiberRnd, fiberVis);
     // undyed weft picks up indigo from neighbouring warps in washing; it is greyish while compacted
     // under the floats, until abrasion and loosening expose its raw, fluffy ecru cotton

@@ -5,12 +5,10 @@
 // warp) is a chain of nodes that carries the yarns' load and moves with it, and the thread is that
 // chain's Catmull-Rom curve through the spans that still hold. The chain is a one-dimensional strand:
 // mechanics resolves the bundle's motion, not where its yarns lie across it. Where a yarn is held in
-// the weave it keeps its woven place; away from it, freed of the crossing yarns, the bundle's yarns lie
-// together as one twisted cord (two in some bundles) of their combined cross-section around the chain,
-// over a free length of several millimetres (a short ladder keeps its picks at their woven places).
-// No shape is added that the chain does not have: a thread swings, sags and settles as its strand does.
-// Near a free end (a few millimetres at most: the bundle span beyond its last node) the yarn untwists
-// out of the cord and droops.
+// the weave it keeps its woven place; away from it, freed of the crossing yarns, the bundle's yarns
+// cling together side by side in one to three flat clumps around the chain. No shape is added that the
+// chain does not have: a thread swings, sags and settles as its strand does. Near a free end (a few
+// millimetres at most: the bundle span beyond its last node) the yarn leaves its clump and droops.
 
 struct RunInfo {
   layer: u32,
@@ -236,29 +234,41 @@ fn threadAt(ri: RunInfo, g: RunGeo, cA: vec3<f32>, cB: vec3<f32>, p: f32) -> Thr
   let eA = select(1e6, p - ri.pos + 0.5, ri.heldA);
   let eB = select(1e6, ri.pos + ri.n - 0.5 - p, ri.heldB);
   let e = max(min(eA, eB), 0.0);
-  // freed of the crossing yarns, the yarns drift together only over a free length of several
-  // millimetres: across a short ladder they stay at their woven places, held close by on both sides
+  // Freed of the crossing yarns, neighbouring yarns cling together side by side (fibre cohesion and
+  // entanglement) within a couple of millimetres of where they leave the weave: a bundle's yarns form
+  // one to three flat clumps, each near where its yarns were woven, so a ladder shows groups of pale
+  // strands with dark gaps between them rather than evenly spaced lines.
   let eMm = e * pitchAl * 1e3;
-  let gather = smoothstep(1.5, 10.0, eMm);
-  let gs = clamp((eMm - 1.5) / 8.5, 0.0, 1.0);
-  let dGather = select(0.0, 6.0 * gs * (1.0 - gs) / 8.5 * pitchAl * 1e3, e > 0.0 && e < 1e5) * select(1.0, -1.0, eA > eB);
+  let gather = smoothstep(0.3, 2.5, eMm);
+  let gs = clamp((eMm - 0.3) / 2.2, 0.0, 1.0);
+  let dGather = select(0.0, 6.0 * gs * (1.0 - gs) / 2.2 * pitchAl * 1e3, e > 0.0 && e < 1e5) * select(1.0, -1.0, eA > eB);
   let woven = (f32(q) - 0.5 * f32(Bcr - 1u)) * pitchCr;
-  // the cord: the whole bundle, or one of its halves in some bundles; packed yarns of radius rY
-  let split = Bcr >= 4u && hashf(seedB) < 0.3;
-  let half = Bcr / 2u;
-  let second = split && q >= half;
-  let cordN = select(Bcr, select(half, Bcr - half, second), split);
-  let slot = select(q, q - half, second);
-  let cordLat = select(0.0, select(-0.28, 0.28, second) * f32(Bcr) * pitchCr, split);
-  // packed side by side: each yarn about one yarn radius off the cord's axis (a few yarns lie around
-  // the axis, not on a wide helix)
-  let rc = select(0.0, rY * min(1.0, 0.45 * sqrt(f32(cordN))), cordN > 1u);
-  // loosely twisted together (pitch 10-20 mm, either hand), each yarn at its own angle
-  let twist = (10e-3 + 10e-3 * hashf(seedB + 3u)) * select(-1.0, 1.0, hashf(seedB + 4u) < 0.5);
-  let phi = 6.2831853 * (f32(slot) / f32(max(cordN, 1u)) + along / twist + hashf(seedB + 5u));
+  let hc = hashf(seedB);
+  let nClumps = select(select(3u, 2u, hc < 0.75), 1u, hc < 0.3 || Bcr < 3u);
+  // contiguous ranges of yarns, split at hashed points
+  let cut1 = 1u + u32(hashf(seedB + 21u) * f32(max(Bcr - 1u, 1u)));
+  let cut2 = 1u + u32(hashf(seedB + 22u) * f32(max(Bcr - 1u, 1u)));
+  let lo = min(cut1, cut2);
+  let hi = max(cut1, cut2);
+  var c0 = 0u;
+  var c1 = Bcr;
+  if (nClumps == 2u) {
+    if (q < cut1) { c1 = cut1; } else { c0 = cut1; }
+  } else if (nClumps == 3u) {
+    if (q < lo) { c1 = lo; } else if (q < hi || hi == lo) { c0 = lo; c1 = max(hi, lo + 1u); } else { c0 = hi; }
+  }
+  let cn = c1 - c0;
+  let slot = f32(q - c0) - 0.5 * f32(cn - 1u);
+  let clumpLat = (0.5 * f32(c0 + c1 - 1u) - 0.5 * f32(Bcr - 1u)) * pitchCr + (hashf(seedB + 23u + c0) - 0.5) * 0.4 * pitchCr;
+  // side by side, touching (loose yarns flatten against each other), the flat clump turning slowly
+  // about its axis (pitch 15-30 mm, either hand)
+  let spacing = 1.6 * rY;
+  let twist = (15e-3 + 15e-3 * hashf(seedB + 3u + c0)) * select(-1.0, 1.0, hashf(seedB + 4u + c0) < 0.5);
+  let phi = 6.2831853 * (along / twist + hashf(seedB + 5u + c0));
   let dPhi = 6.2831853 * pitchAl / twist;
-  let inCord = vec2<f32>(cos(phi), sin(phi)) * rc;
-  let dInCord = vec2<f32>(-sin(phi), cos(phi)) * (rc * dPhi);
+  let inCord = vec2<f32>(cos(phi), sin(phi)) * (slot * spacing);
+  let dInCord = vec2<f32>(-sin(phi), cos(phi)) * (slot * spacing * dPhi);
+  let cordLat = clumpLat;
   let lat = mix(woven, cordLat + inCord.x, gather);
   let up = gather * inCord.y;
   var P = c.p + S * lat + N * up;
