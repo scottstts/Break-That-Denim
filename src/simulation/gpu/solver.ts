@@ -12,6 +12,7 @@ import smoothWgsl from './wgsl/smooth.wgsl?raw';
 import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
 import yarnFieldWgsl from './wgsl/yarnfield.wgsl?raw';
+import { SHARE, shareReach } from '../yarnField';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
 import dragWgsl from './wgsl/drag.wgsl?raw';
@@ -132,6 +133,7 @@ function simParamsData(scene: CompiledScene, p: GpuSolverParams): ArrayBuffer {
     f[b + 23] = m.pitchU;
     f[b + 24] = m.pitchV;
     f[b + 25] = m.airDrag;
+    f[b + 26] = m.crossingNormal0;
   });
   return buf;
 }
@@ -186,7 +188,8 @@ export class GpuSolver {
   private readonly fieldU: GPUBuffer;
   /** [0] = 1 once a damage code changed; cleared by the renderer after rebuilding from the field. */
   readonly fieldEvents: GPUBuffer;
-  private readonly fieldCount: number;
+  /** Pull-out marks of one substep (yarnfield.wgsl pullMark / pullApply). */
+  private readonly pullBits: GPUBuffer;
   /**
    * [0] ruptures, [1] pulled-out spans, [2] max speed since last cleared (f32 bits), [3] line-search
    * step length of the current Newton iteration (f32 bits),
@@ -255,13 +258,16 @@ export class GpuSolver {
     this.dx = createBuffer(device, 'dx', 16 * N);
     this.pred = createBuffer(device, 'pred', 16 * N);
     this.segs = createBufferWith(device, 'segs', new Uint8Array(this.segData(scene)));
-    this.fieldCount = scene.fieldDamage.length / 2;
+    // the per-yarn field update addresses up to 16 yarns per span (yarnfield.wgsl MAX_BUNDLE_F)
+    if (scene.layers.some((L) => L.bundle[0] > 16 || L.bundle[1] > 16)) throw new Error('bundles of more than 16 yarns are not supported by the GPU field update');
     this.field = createBufferWith(device, 'field', packField(scene.fieldDamage, scene.fieldArea));
     this.fieldStrength = createBufferWith(device, 'fieldStrength', scene.fieldStrength);
     const fu = new Uint32Array(12);
-    scene.field.forEach((F, l) => fu.set([F.offset, F.K, F.M, 0], 4 * l));
+    // w: load-sharing reach along picks (bits 0-15) and along warps (16-31), in crossings
+    scene.field.forEach((F, l) => fu.set([F.offset, F.K, F.M, shareReach(scene.layers[l].weave, 0) | (shareReach(scene.layers[l].weave, 1) << 16)], 4 * l));
     this.fieldU = createBufferWith(device, 'fieldU', fu, UNIFORM);
     this.fieldEvents = createBufferWith(device, 'fieldEvents', new Uint32Array([1, 0, 0, 0]));
+    this.pullBits = createBuffer(device, 'pullBits', 4 * Math.ceil(scene.fieldDamage.length / 2 / 16));
     this.tails = createBufferWith(device, 'tails', Float32Array.from(scene.tails));
     this.ext = createBuffer(device, 'ext', 48 * N);
     this.counters = createBuffer(device, 'counters', 16 + 4 * MAX_NEWTON);
@@ -371,8 +377,10 @@ export class GpuSolver {
     this.pl.prolong = this.mod.mgCoarse.pipeline('prolongAdd');
     for (const e of ['matvecDot', 'dotPartial', 'reduceFinal', 'updateXR', 'updateP', 'clear2']) this.pl[e] = this.mod.pcg.pipeline(e);
     for (const e of ['predict', 'newtonApply', 'commit', 'slip']) this.pl[e] = this.mod.step.pipeline(e);
-    this.mod.yarnField = new ComputeModule(d, 'yarnField', commonWgsl + yarnFieldWgsl);
-    for (const e of ['spanStrain', 'fieldUpdate', 'couple']) this.pl[e] = this.mod.yarnField.pipeline(e);
+    // load-sharing constants from the reference definition (yarnField.ts SHARE)
+    const share = yarnFieldWgsl.replace('override SHARE_FRACTION: f32 = 0.6;', `const SHARE_FRACTION: f32 = ${SHARE.fraction.toFixed(6)};`).replace('override SHARE_RUN: u32 = 6u;', `const SHARE_RUN: u32 = ${SHARE.maxRun}u;`);
+    this.mod.yarnField = new ComputeModule(d, 'yarnField', commonWgsl + share);
+    for (const e of ['spanStrain', 'sepSnapshot', 'fieldUpdatePick', 'fieldUpdateWarp', 'pullMark', 'pullApply', 'couple']) this.pl[e] = this.mod.yarnField.pipeline(e);
     this.mod.gate = new ComputeModule(d, 'gate', gateWgsl);
     this.pl.gate = this.mod.gate.pipeline('gate');
     this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + dragWgsl + energyWgsl));
@@ -444,8 +452,9 @@ export class GpuSolver {
       8: this.fieldStrength,
       9: this.counters,
       10: this.fieldEvents,
+      11: this.pullBits,
     });
-    for (const k of ['spanStrain', 'fieldUpdate', 'couple']) this.bg[k] = this.bg.yarnField;
+    for (const k of ['spanStrain', 'fieldUpdate', 'pull', 'couple']) this.bg[k] = this.bg.yarnField;
     for (let it = 0; it < MAX_NEWTON; it++) {
       group(`newtonApply${it}`, { ...stepEntries, 1: this.slot(it) });
       this.bg[`gate${it}`] = this.mod.gate.bindGroup(`gate${it}`, { 0: this.slot(it), 1: this.counters, 2: this.gateArgs, 3: this.gateSizes });
@@ -576,11 +585,24 @@ export class GpuSolver {
     this.dispatch(pass, 'predict', 'predict', this.nodeGroups(this.N));
   }
 
+  /** Yarn damage field update and span coupling at the committed positions (yarnfield.wgsl). */
+  encodeDamage(pass: GPUComputePassEncoder): void {
+    this.dispatch(pass, 'spanStrain', 'spanStrain', this.nodeGroups(this.N));
+    // per span and yarn, one pass per family (yarnfield.wgsl MAX_BUNDLE_F invocations per node)
+    const pullGroups = Math.ceil(Math.ceil(this.scene.fieldDamage.length / 2 / 16) / 128);
+    // separated state before the step, read by the load sharing of the update
+    this.dispatch(pass, 'sepSnapshot', 'pull', pullGroups);
+    this.dispatch(pass, 'fieldUpdatePick', 'fieldUpdate', Math.ceil((16 * this.N) / 128));
+    this.dispatch(pass, 'fieldUpdateWarp', 'fieldUpdate', Math.ceil((16 * this.N) / 128));
+    // pull-out of loose ends: marked from the codes before the step, then applied
+    this.dispatch(pass, 'pullMark', 'pull', pullGroups);
+    this.dispatch(pass, 'pullApply', 'pull', pullGroups);
+    this.dispatch(pass, 'couple', 'couple', this.nodeGroups(2 * this.N));
+  }
+
   encodeFinalize(pass: GPUComputePassEncoder): void {
     this.dispatch(pass, 'commit', 'commit', this.nodeGroups(this.N));
-    this.dispatch(pass, 'spanStrain', 'spanStrain', this.nodeGroups(this.N));
-    this.dispatch(pass, 'fieldUpdate', 'fieldUpdate', Math.ceil(this.fieldCount / 128));
-    this.dispatch(pass, 'couple', 'couple', this.nodeGroups(2 * this.N));
+    this.encodeDamage(pass);
     for (let f = 0; f < 2; f++) for (let par = 0; par < 2; par++) this.dispatch(pass, 'slip', `slip${f}${par}`, this.nodeGroups(this.N));
   }
 

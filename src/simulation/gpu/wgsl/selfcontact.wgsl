@@ -283,12 +283,18 @@ fn terms(@builtin(global_invocation_id) gid: vec3<u32>) {
     let kf = mu * lam / max(length(ut), epsU);
     let g = -lam * nn + kf * ut;
     let H = kc * nnT + kf * (I3 - nnT);
-    addTerm(n, g, H);
+    // The operator takes contact as diagonal blocks only (the node-face coupling is non-local), so
+    // node and face each answer the contact force on their own. With the exact blocks (H on the node,
+    // w^2 H on a corner of weight w) a corner would correct by gap / w and the pair would overshoot
+    // and chatter. The stiffness is split instead so that the independent corrections add up to the
+    // closure the exact pair would make: 2 H on the node (half the gap) and 2 w H on each corner (the
+    // other half, by the barycentric weights).
+    addTerm(n, g, 2.0 * H);
     var cs = array<u32, 4>(c.x, c.y, c.z, c.w);
     var ws = array<f32, 4>(hit.w.x, hit.w.y, hit.w.z, hit.w.w);
     for (var q = 0u; q < 4u; q++) {
       if (ws[q] <= 0.0) { continue; }
-      addTerm(cs[q], -ws[q] * g, (ws[q] * ws[q]) * H);
+      addTerm(cs[q], -ws[q] * g, (2.0 * ws[q]) * H);
     }
   }
 }

@@ -39,22 +39,45 @@ export function bendPsiDelta(q0: number, q1: number, dq: number, a: number): num
 
 /**
  * Shear locking. Each cell carries a diagonal pair of springs (stiffness ks, rest length Ld). Woven
- * cloth shears freely until its yarns jam (denim: roughly 20 degrees), and it cannot shrink its area
- * by squeezing yarns together; beyond that it buckles out of plane instead. Both show up as a
- * compressed diagonal, so past a compressive strain SHEAR_JAM the diagonal stiffness ramps (over
- * SHEAR_RAMP of strain) up to SHEAR_LOCK times ks.
+ * cloth shears freely until its yarns jam (sound denim: about 17 degrees, a compressive diagonal strain
+ * SHEAR_JAM), and it cannot shrink its area by squeezing yarns together; beyond that it buckles out of
+ * plane instead. Both show up as a compressed diagonal, so past the jam strain the diagonal stiffness
+ * ramps (over SHEAR_RAMP of strain) up to SHEAR_LOCK times ks.
  */
 export const SHEAR_JAM = 0.16;
 export const SHEAR_RAMP = 0.08;
 export const SHEAR_LOCK = 40;
 
+/**
+ * Yarns jam when shear closes the spacing between them, p cos(gamma), down to their width d: the lock
+ * angle is acos(d / p). Abrasion thins the yarns (d ~ sqrt of the remaining cross-section), so worn
+ * weave turns much further before it locks, which is how a worn region distorts and lets a hole open
+ * around it. SHEAR_COS0 is d / p of sound cloth (the lock angle of SHEAR_JAM); for near-square cells
+ * the compressed diagonal's strain at shear angle gamma is sqrt(1 - sin gamma) - 1.
+ */
+export const SHEAR_COS0 = Math.sqrt(1 - Math.pow(1 - (1 - SHEAR_JAM) * (1 - SHEAR_JAM), 2));
+
+/** Jam strain (compressive diagonal strain) of a cell whose yarns keep the cross-section `area`. */
+export function shearJam(area: number): number {
+  const c = SHEAR_COS0 * Math.sqrt(Math.min(1, Math.max(0.02, area)));
+  return 1 - Math.sqrt(1 - Math.sqrt(1 - c * c));
+}
+
+/**
+ * Cross-section governing a cell's jam, from the intact fractions of its spans (bottom and top u
+ * spans, left and right v spans; a separated span counts 0): the denser family jams first.
+ */
+export function cellArea(cu: number, tu: number, cv: number, rv: number): number {
+  return Math.max(0.5 * (cu + tu), 0.5 * (cv + rv));
+}
+
 /** [force (tension positive), tangent stiffness, energy] of one diagonal at length l. */
-export function shearLaw(ks: number, Ld: number, l: number): [number, number, number] {
+export function shearLaw(ks: number, Ld: number, l: number, jam = SHEAR_JAM): [number, number, number] {
   const d = l - Ld;
   let f = ks * d;
   let k = ks;
   let e = 0.5 * ks * d * d;
-  const c = -d / Ld - SHEAR_JAM;
+  const c = -d / Ld - jam;
   if (c > 0) {
     const extra = ks * (SHEAR_LOCK - 1);
     if (c < SHEAR_RAMP) {

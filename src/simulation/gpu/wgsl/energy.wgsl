@@ -99,8 +99,10 @@ fn nodeDelta(n: u32) -> vec3<f32> {
     if (prev >= 0 && next >= 0 && spanOn(prev, f) && spanOn(i32(n), f)) {
       let a = u32(prev);
       let c = u32(next);
-      let Lm = 0.5 * (segs[2u * a + f].rest + segs[2u * n + f].rest);
-      let ke = y.bendRigidity / (Lm * Lm * Lm);
+      let sa = segs[2u * a + f];
+      let sn = segs[2u * n + f];
+      let Lm = 0.5 * (sa.rest + sn.rest);
+      let ke = y.bendRigidity * 0.5 * (sa.intact + sn.intact) / (Lm * Lm * Lm);
       let kd = ke * y.bendVisc / h;
       let rn = x[a].xyz - 2.0 * x[n].xyz + x[c].xyz;
       let r0 = rn + dx[a].xyz - 2.0 * d0 + dx[c].xyz;
@@ -131,7 +133,9 @@ fn nodeDelta(n: u32) -> vec3<f32> {
     let s0 = segs[2u * n].rest;
     let s1 = segs[2u * n + 1u].rest;
     let Ld = sqrt(s0 * s0 + s1 * s1);
-    let ks = mat.a.x;
+    let a = cellArea(select(0.0, segs[2u * n].intact, cu), select(0.0, segs[2u * u32(t)].intact, tu), select(0.0, segs[2u * n + 1u].intact, cv), select(0.0, segs[2u * u32(r) + 1u].intact, rv));
+    let ks = mat.a.x * st.n0 / mat.b.z;
+    let jam = shearJam(a);
     var pa = array<u32, 2>(n, u32(r));
     var pb = array<u32, 2>(u32(rt), u32(t));
     for (var q = 0; q < 2; q++) {
@@ -141,12 +145,12 @@ fn nodeDelta(n: u32) -> vec3<f32> {
       let ec = (x[o].xyz + dx[o].xyz) - (x[p].xyz + dx[p].xyz);
       let de = dir(o) - dir(p);
       let l0 = length(ec);
-      let f0 = shearLaw(ks, Ld, l0).x;
+      let f0 = shearLaw(ks, jam, Ld, l0).x;
       for (var k = 0u; k < 3u; k++) {
         let al = ALPHA;
         let rr = lenChange(ec, de, al[k], l0);
         // trapezoid of the shear force law (exact on its linear branch)
-        acc[k] += 0.5 * (f0 + shearLaw(ks, Ld, rr.y).x) * rr.x;
+        acc[k] += 0.5 * (f0 + shearLaw(ks, jam, Ld, rr.y).x) * rr.x;
       }
     }
   }

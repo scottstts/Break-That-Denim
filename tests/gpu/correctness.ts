@@ -35,8 +35,9 @@ function coupon(nu: number, nv: number, extra: Partial<LayerSpec> = {}): LayerSp
     compressV: 0.02,
     shear: 0.02,
     collarRows: 2,
-    wear: { center: [0, 0], axis: [1, 0], radii: [1, 1], amount: 0, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0, sparseFrom: 2 },
-    wearStrengthLoss: [0, 0],
+    // a worn coupon, so the wear-dependent terms (intact fractions, crossing compaction, shear jam) vary
+    wear: { center: [0, 0], axis: [1, 0], radii: [0.03, 0.03], amount: 1, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0, sparseFrom: 2 },
+    wearStrengthLoss: [0.45, 0.9],
     seed: 7,
     perturbation: 0.4e-3,
     ...extra,
@@ -334,6 +335,68 @@ async function torn(device: GPUDevice): Promise<void> {
   check('torn: line-search energy changes', eErr < 1e-2, `gpu [${eGpu.map((v) => v.toExponential(3)).join(', ')}] cpu [${eCpu.map((v) => v.toExponential(3)).join(', ')}]`);
 }
 
+/**
+ * Yarn damage field: a worn coupon stretched into the softening range of its yarns, then the damage
+ * update, pull-out and span coupling applied three times at fixed positions. Codes may differ by rounding near
+ * a threshold; cuts (and so the topology) must agree almost everywhere.
+ */
+async function damage(device: GPUDevice): Promise<void> {
+  console.log('--- yarn damage field: stretched worn coupon');
+  const wear = { center: [0, 0] as [number, number], axis: [1, 0] as [number, number], radii: [1, 1] as [number, number], amount: 1, cellSize: 0, featureScale: 0.01, defectThreshold: 2, defectDensity: 0, sparseFrom: 2 };
+  const scene = compileScene([coupon(48, 40, { wear, wearStrengthLoss: [0.9, 0.95], compressU: 0, compressV: 0, shear: 0, perturbation: 0 })]);
+  // a short softening range, so that separations occur at moderate strain
+  for (let q = 0; q < scene.softening.length; q++) scene.softening[q] *= 0.1;
+  const cpu = new ReferenceSolver(scene, { h: PARAMS.h, gravity: PARAMS.gravity, newtonIterations: 1, pcgIterations: 1, mg: MG });
+  const gpu = new GpuSolver(device, scene, PARAMS);
+  const N = scene.nodeCount;
+  let cx = 0;
+  let cy = 0;
+  for (let n = 0; n < N; n++) {
+    cx += cpu.x[3 * n] / N;
+    cy += cpu.x[3 * n + 1] / N;
+  }
+  // a smooth stretch, strongest in the middle, so strains vary across the yarns
+  for (let n = 0; n < N; n++) {
+    const dx = cpu.x[3 * n] - cx;
+    const dy = cpu.x[3 * n + 1] - cy;
+    const r = Math.hypot(dx, dy) / 0.03;
+    const k = 0.7 * Math.exp(-r * r);
+    cpu.x[3 * n] = cx + dx * (1 + k);
+    cpu.x[3 * n + 1] = cy + dy * (1 + 0.8 * k);
+  }
+  const { xs, vs } = copyState(cpu, N);
+  gpu.setState(xs, vs);
+  gpu.setSegments(cpu, cpu.tails);
+  gpu.setField(cpu.fieldDamage);
+  for (let round = 0; round < 3; round++) {
+    cpu.updateDamage();
+    await submit(device, (p) => gpu.encodeDamage(p));
+  }
+  const word = new Uint32Array(await readBuffer(device, gpu.field));
+  let codes = 0;
+  let damaged = 0;
+  let cuts = 0;
+  let pulled = 0;
+  let cutMismatch = 0;
+  let maxDiff = 0;
+  for (let c = 0; c < word.length; c++) {
+    for (let f = 0; f < 2; f++) {
+      const g = (word[c] >> (8 * f)) & 0xff;
+      const r = cpu.fieldDamage[2 * c + f];
+      codes++;
+      if (r > 0) damaged++;
+      if (r === 255) cuts++;
+      if (r === 254) pulled++;
+      // cut (255) and pulled out (254) must agree exactly; partial damage within rounding
+      if ((g >= 254 || r >= 254) && g !== r) cutMismatch++;
+      else if (g < 254) maxDiff = Math.max(maxDiff, Math.abs(g - r));
+    }
+  }
+  check('damage: some yarns soften, separate and pull out', damaged > 100 && cuts > 20 && pulled > 20, `${damaged} damaged, ${cuts} cut, ${pulled} pulled out of ${codes}`);
+  check('damage: separated yarns agree', cutMismatch <= Math.max(2, 0.01 * (cuts + pulled)), `${cutMismatch} mismatches of ${cuts + pulled}`);
+  check('damage: damage codes agree', maxDiff <= 3, `max code difference ${maxDiff}`);
+}
+
 /** Long yarn lines (as in the full scene): GPU smoother and PCG against the f64 reference. */
 async function longLines(device: GPUDevice): Promise<void> {
   console.log('--- long lines: 115 x 30 and 30 x 164 coupons');
@@ -376,6 +439,7 @@ export default async function main(): Promise<void> {
   await correctness(device);
   await convergedDynamics(device);
   await torn(device);
+  await damage(device);
   await longLines(device);
   device.destroy();
   const failed = results.filter((r) => !r.ok).length;

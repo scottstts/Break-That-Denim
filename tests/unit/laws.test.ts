@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BEND_S0, bendPsi, bendPsiDelta, SHEAR_JAM, SHEAR_RAMP, shearLaw } from '../../src/simulation/laws';
+import { BEND_S0, bendPsi, bendPsiDelta, cellArea, SHEAR_JAM, SHEAR_RAMP, shearJam, shearLaw } from '../../src/simulation/laws';
 
 const fd = (f: (x: number) => number, x: number, h: number) => (f(x + h) - f(x - h)) / (2 * h);
 
@@ -47,5 +47,19 @@ describe('shear locking', () => {
       expect(fd((x) => shearLaw(ks, Ld, x)[2], l, 1e-9) / f).toBeCloseTo(1, 5);
       expect(fd((x) => shearLaw(ks, Ld, x)[0], l, 1e-9) / k).toBeCloseTo(1, 5);
     }
+  });
+});
+
+describe('wear-dependent shear jam', () => {
+  it('keeps the sound jam and turns further as abrasion thins the yarns', () => {
+    expect(shearJam(1)).toBeCloseTo(SHEAR_JAM, 12);
+    // lock angle acos(cos0 sqrt(a)): area 0.5 locks near 47 degrees
+    const g = Math.asin(1 - (1 - shearJam(0.5)) ** 2);
+    expect((g * 180) / Math.PI).toBeGreaterThan(44);
+    expect((g * 180) / Math.PI).toBeLessThan(50);
+    for (let a = 0.05; a < 1; a += 0.05) expect(shearJam(a)).toBeGreaterThan(shearJam(a + 0.05));
+    // the denser family governs
+    expect(cellArea(1, 1, 0.2, 0.4)).toBe(1);
+    expect(cellArea(0, 0.4, 0.3, 0.3)).toBeCloseTo(0.3, 12);
   });
 });

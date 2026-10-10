@@ -1,6 +1,6 @@
 import { DENIM, FAMILY_U, FAMILY_V, bundleWeave, crossingMass, type WeaveMaterial } from './material';
 import { fbm, noise1, rand01, smoothstep } from '../shared/noise';
-import { DAMAGE_CUT, MAX_BUNDLE, areaCode, coupleSpans, fieldLayers, type FieldLayer } from './yarnField';
+import { DAMAGE_CUT, MAX_BUNDLE, areaCode, coupleSpans, fieldLayers, pullOut, type FieldLayer } from './yarnField';
 
 /**
  * Scene asset compilation: three independent woven lattices with explicit identities, mounts,
@@ -94,6 +94,8 @@ export interface CompiledScene {
   pinned: Uint8Array;
   /** Visible abrasion per node, 0..1 (drives optics and fuzz; strength uses the structural wear). */
   wear: Float32Array;
+  /** Structural wear per node, 0..1 (strength, extensibility). */
+  structuralWear: Float32Array;
   restLength: Float64Array;
   /** Softening opening of the span's yarns past their peak (m), see yarnField.ts. */
   softening: Float64Array;
@@ -121,7 +123,7 @@ export interface CompiledScene {
  * Version of the mechanical model (laws and their constants outside the material assets). Bump it
  * whenever equilibrium shapes change, so stale precomputed drapes are rejected.
  */
-export const MECHANICS_VERSION = 5;
+export const MECHANICS_VERSION = 9;
 
 /** Content hash of a compiled scene's initial state and mechanics (validates precomputed drapes). */
 export function sceneHash(s: CompiledScene): number {
@@ -169,8 +171,8 @@ function worley(seed: number, x: number, y: number): [number, number] {
 /**
  * Wear in [0, 1] at world-rest-plane point (x, y): [structural, visible]. Both share the worn zone's
  * envelope and fine variation; the cellular structure (worn cells, retained ligaments) governs the
- * yarns' remaining strength fully, but shows on the surface only faintly, as the abraded zone is
- * diffusely pale rather than drawn in cells.
+ * yarns' remaining strength fully, but shows on the surface only partly, as the abraded zone is
+ * diffusely pale rather than drawn in cells, and most where the wear is deepest.
  */
 export function wearAt(spec: WearSpec, seed: number, x: number, y: number): [number, number] {
   if (spec.amount <= 0) return [0, 0];
@@ -184,7 +186,7 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): [num
   const S = spec.featureScale;
   const warp = 0.32 * fbm(seed + 3, x / (1.4 * S), y / (1.4 * S), 4);
   const r = Math.hypot(a, b) + warp;
-  let w = 1 - smoothstep(0.25, 1.05, r);
+  let w = 1 - smoothstep(0.4, 1.1, r);
   let cells = 1;
   if (spec.cellSize > 0) {
     const jx = x + 0.4 * S * fbm(seed + 11, x / S, y / S, 3);
@@ -193,13 +195,15 @@ export function wearAt(spec: WearSpec, seed: number, x: number, y: number): [num
     // Worn hardest at cell centres, recovering toward the boundaries between neighbouring cells
     // (retained ligaments, nearly intact). Under load a cell then fails from its middle outward along
     // these contours, into a rounded opening that the ligaments around it arrest.
-    const interior = Math.pow(smoothstep(0.0, 0.55, f2 - f1), 0.8);
+    const interior = Math.pow(smoothstep(0.03, 0.3, f2 - f1), 0.7);
     cells = interior;
   }
   // Fine correlated abrasion variation.
   w *= (0.82 + 0.18 * fbm(seed + 7, x / (0.3 * S), y / (0.3 * S), 3)) * spec.amount;
   const clamp = (v: number) => Math.min(1, Math.max(0, v));
-  return [clamp(w * (0.12 + 0.88 * cells)), clamp(w * (0.78 + 0.22 * cells))];
+  // visible abrasion is concentrated where the cloth is most worn (around the damage), not spread
+  // over the whole zone the structural wear weakens
+  return [clamp(w * (0.12 + 0.88 * cells)), clamp(Math.pow(w, 1.8) * (0.65 + 0.35 * cells))];
 }
 
 export function compileLayer(spec: LayerSpec, index: number, nodeOffset: number): { info: LayerInfo } {
@@ -240,6 +244,7 @@ export function compileScene(specs: LayerSpec[]): CompiledScene {
     mass: new Float64Array(N),
     pinned: new Uint8Array(N),
     wear: new Float32Array(N),
+    structuralWear: new Float32Array(N),
     restLength: new Float64Array(2 * N),
     softening: new Float64Array(2 * N),
     segFlags: new Uint16Array(2 * N),
@@ -258,6 +263,8 @@ export function compileScene(specs: LayerSpec[]): CompiledScene {
     fillLayer(scene, specs[l], layers[l]);
     fillField(scene, specs[l], layers[l], fl.layers[l]);
   }
+  // the worn-through yarns' ends have recoiled as they would have when they broke
+  while (pullOut(fl.layers, scene.fieldArea, scene.fieldDamage) > 0);
   // span state from the initial field; spans that lost every yarn start separated
   const active = (q: number) => (scene.segFlags[q] & (SEG_EXISTS | SEG_BROKEN)) === SEG_EXISTS;
   const before = Uint16Array.from(scene.segFlags);
@@ -309,6 +316,7 @@ function fillLayer(scene: CompiledScene, spec: LayerSpec, info: LayerInfo): void
       const [rx, ry] = restPlanePoint(spec, info, u, v);
       const [w, wVisible] = wearAt(spec.wear, seed, rx, ry);
       scene.wear[n] = wVisible;
+      scene.structuralWear[n] = w;
       scene.crossingNormal0[n] = m.crossingNormal0 * (1 - 0.7 * w);
 
       for (let f = 0; f < 2; f++) {
@@ -382,28 +390,32 @@ function fillField(scene: CompiledScene, spec: LayerSpec, info: LayerInfo, fl: F
       const corr = sample(gCorr, u, v);
       for (let f = 0; f < 2; f++) {
         const loss = spec.wearStrengthLoss[f];
-        const wf = f === FAMILY_U ? Math.pow(w, 1.6) : Math.pow(w, 1.25);
+        const wf = f === FAMILY_U ? Math.pow(w, 1.3) : Math.pow(w, 1.25);
         const yarnIndex = f === FAMILY_V ? k : mm;
         const along = f === FAMILY_V ? v : u;
         const slub = 1 + 0.25 * noise1(seed + 4099 + 13 * yarnIndex + 7 * f, along / 0.0025);
         const z = (rand01(seed + 503, c, f) + rand01(seed + 617, c, f) - 1) * 2.45;
         const scatter = Math.exp((0.2 + 0.12 * w) * corr + (0.06 + 0.22 * w) * z);
-        // abrasion removes fibres: cross-section (stiffness) and strength fall together; scatter and
-        // slubs are local weak or strong places along the yarn
+        // abrasion removes fibres: cross-section, stiffness and strength fall together, so a worn yarn
+        // still fails at about the strain of a sound one. It acts on the warp floats of the face (the
+        // weft lies beneath them), so worn warp loses far more than worn weft: a worn cell gives way
+        // in its warps first and leaves its pale weft bridging the opening. The loosened weave turns
+        // further before jamming (laws.ts shearJam) and its yarns slip through their crossings.
+        // Scatter and slubs are local weak or strong places along the yarn
         const area = Math.max(0.02, 1 - loss * wf);
         scene.fieldArea[2 * c + f] = areaCode(area);
-        scene.fieldStrength[2 * c + f] = weave.yarns[f].strength * Math.max(0.01, area * scatter * slub);
+        scene.fieldStrength[2 * c + f] = weave.yarns[f].strength * Math.max(0.005, area * scatter * slub);
       }
       // the most worn cores have lost their warp floats altogether: small rounded ladder openings
       // whose picks are exposed before any pull; their outline wanders with the wear and per warp
-      const edge = thr + 0.05 * sample(gEdgeNoise, u, v) + 0.03 * (rand01(seed + 990, k) - 0.5);
+      const edge = thr + 0.04 * sample(gEdgeNoise, u, v) + 0.012 * (rand01(seed + 990, k) - 0.5);
       if (w > edge && rand01(seed + 991, k, mm) < spec.wear.defectDensity) scene.fieldDamage[2 * c + FAMILY_V] = DAMAGE_CUT;
       // around them, single warp floats are worn through: abrasion takes the float (the warp's run
       // over twillWarpOver picks on the face), exposing the pale pick beneath; ever more of them
       // toward the core
       const R = weave.twillRepeat;
       const float = Math.floor((mm - (k % R) + 4 * R) / R);
-      const pf = 0.55 * Math.pow(smoothstep(spec.wear.sparseFrom, thr, w), 2);
+      const pf = 0.02 * Math.pow(smoothstep(spec.wear.sparseFrom, thr, w), 2);
       const onFace = (((mm - k) % R) + R) % R < weave.twillWarpOver;
       if (pf > 0 && onFace && rand01(seed + 997, k, float) < pf) scene.fieldDamage[2 * c + FAMILY_V] = DAMAGE_CUT;
     }
@@ -434,15 +446,15 @@ export function defaultSceneSpecs(): LayerSpec[] {
       wear: {
         center: [0.01, -0.006],
         axis: [1, -1.15],
-        radii: [0.12, 0.08],
+        radii: [0.2, 0.14],
         amount: 1,
-        cellSize: 0.045,
-        featureScale: 0.032,
-        defectThreshold: 0.82,
-        defectDensity: 0.97,
-        sparseFrom: 0.45,
+        cellSize: 0.075,
+        featureScale: 0.05,
+        defectThreshold: 0.89,
+        defectDensity: 1,
+        sparseFrom: 0.6,
       },
-      wearStrengthLoss: [0.85, 0.985],
+      wearStrengthLoss: [0.45, 0.9],
       seed: 1001,
       perturbation: 2.5e-3,
     },

@@ -209,7 +209,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       if (!S.segActive(s0) || !S.segActive(s1)) continue;
       const yarn = S.layer(b).material.yarns[f];
       const Lm = 0.5 * (S.restLength[s0] + S.restLength[s1]);
-      const kb = yarn.bendRigidity / (Lm * Lm * Lm);
+      const kb = (yarn.bendRigidity * 0.5 * (S.intact[s0] + S.intact[s1])) / (Lm * Lm * Lm);
       // fold-stiffening energy: the exact Hessian kb (Psi' I + 2 Psi'' r r^T) is majorized by the
       // scalar kb (Psi' + 2 Psi'' |r|^2), which keeps the stencil's scalar-identity block form
       let q2 = 0;
@@ -240,7 +240,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
     const t = S.nbr[4 * n + 3];
     if (r < 0 || t < 0) continue;
     const rt = S.nbr[4 * r + 3];
-    const ks = S.layer(n).material.shearStiffness;
+    const [ks, jam] = S.cellShear(n);
     const Ld = Math.hypot(S.restLength[2 * n], S.restLength[2 * n + 1]);
     for (const [p, q, d] of [
       [n, rt, 0],
@@ -254,7 +254,7 @@ export function assembleFineOperator(S: ReferenceSolver): StencilOperator {
       }
       l = Math.sqrt(l);
       for (let z = 0; z < 3; z++) pa[z] /= l;
-      const [fsh, ksh] = shearLaw(ks, Ld, l);
+      const [fsh, ksh] = shearLaw(ks, Ld, l, jam);
       axialBlock(ksh, geomStiff(fsh) / l, pa, H);
       scatterPair(A, p, q, H);
     }

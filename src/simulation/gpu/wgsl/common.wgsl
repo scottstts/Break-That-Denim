@@ -18,7 +18,7 @@ struct LayerMat {
   yarn: array<Yarn, 2>,
   // shearStiffness, crossingFriction, crossingWrap, pitchU
   a: vec4<f32>,
-  // pitchV, normal air drag (N s / m^3), unused, unused
+  // pitchV, normal air drag (N s / m^3), crossing normal force of intact weave (N), unused
   b: vec4<f32>,
 };
 
@@ -164,11 +164,21 @@ fn bendPsiDelta(q0: f32, q1: f32, dq: f32, a: f32) -> f32 {
 const SHEAR_JAM: f32 = 0.16;
 const SHEAR_RAMP: f32 = 0.08;
 const SHEAR_LOCK: f32 = 40.0;
+const SHEAR_COS0: f32 = sqrt(1.0 - (1.0 - (1.0 - SHEAR_JAM) * (1.0 - SHEAR_JAM)) * (1.0 - (1.0 - SHEAR_JAM) * (1.0 - SHEAR_JAM)));
 
-fn shearLaw(ks: f32, Ld: f32, l: f32) -> vec2<f32> {
+// Diagonal strain at which a cell jams, from the remaining yarn cross-section (laws.ts shearJam).
+fn shearJam(area: f32) -> f32 {
+  let c = SHEAR_COS0 * sqrt(clamp(area, 0.02, 1.0));
+  return 1.0 - sqrt(1.0 - sqrt(1.0 - c * c));
+}
+
+// Cross-section of a cell's yarns from the intact fractions of its spans (laws.ts cellArea).
+fn cellArea(cu: f32, tu: f32, cv: f32, rv: f32) -> f32 { return max(0.5 * (cu + tu), 0.5 * (cv + rv)); }
+
+fn shearLaw(ks: f32, jam: f32, Ld: f32, l: f32) -> vec2<f32> {
   var f = ks * (l - Ld);
   var k = ks;
-  let c = (Ld - l) / Ld - SHEAR_JAM;
+  let c = (Ld - l) / Ld - jam;
   if (c > 0.0) {
     let extra = ks * (SHEAR_LOCK - 1.0);
     if (c < SHEAR_RAMP) {

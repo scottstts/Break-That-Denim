@@ -61,9 +61,12 @@ struct Triple {
 };
 
 fn triple(a: u32, b: u32, c: u32, f: u32, mat: LayerMat) -> Triple {
-  let L = 0.5 * (segs[2u * a + f].rest + segs[2u * b + f].rest);
+  let sa = segs[2u * a + f];
+  let sb = segs[2u * b + f];
+  let L = 0.5 * (sa.rest + sb.rest);
   let y = mat.yarn[f];
-  let kb = y.bendRigidity / (L * L * L);
+  // only the continuous fibres of the spans' yarns bend (laws.ts bendScale)
+  let kb = y.bendRigidity * 0.5 * (sa.intact + sb.intact) / (L * L * L);
   let kd = kb * y.bendVisc / P.hg.x;
   let rn = x[a].xyz - 2.0 * x[b].xyz + x[c].xyz;
   let r = rn + dx[a].xyz - 2.0 * dx[b].xyz + dx[c].xyz;
@@ -89,6 +92,18 @@ fn diagActive(lv: LevelInfo, l: u32, ci: i32, cj: i32, d: u32) -> bool {
   let tu = activeSeg(t, 0u);
   if (d == 0u) { return (cu && rv) || (cv && tu); }
   return (cu && cv) || (rv && tu);
+}
+
+fn intactOf(owner: i32, f: u32) -> f32 { return select(0.0, segAt(owner, f).intact, activeSeg(owner, f)); }
+
+// Shear stiffness and jam strain of the cell with lower-left corner (ci, cj): a worn, thinned weave
+// turns further before its yarns jam and resists turning less (laws.ts cellShear).
+fn cellShear(lv: LevelInfo, l: u32, ci: i32, cj: i32, mat: LayerMat) -> vec2<f32> {
+  let c = levelNode(lv, l, ci, cj);
+  let r = levelNode(lv, l, ci + 1, cj);
+  let t = levelNode(lv, l, ci, cj + 1);
+  let a = cellArea(intactOf(c, 0u), intactOf(t, 0u), intactOf(c, 1u), intactOf(r, 1u));
+  return vec2<f32>(mat.a.x * nodes[u32(c)].n0 / mat.b.z, shearJam(a));
 }
 
 fn shearRest(lv: LevelInfo, l: u32, ci: i32, cj: i32) -> f32 {
@@ -205,7 +220,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   // shear diagonals around n; partner order matches couplings 4..7: +u+v, -u-v, -u+v, +u-v
-  let ks = mat.a.x;
   var CD: array<Sym, 4>;
   for (var c = 0; c < 4; c++) {
     CD[c] = symZero();
@@ -221,7 +235,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = (x[p].xyz - x[n].xyz) + (dx[p].xyz - dx[n].xyz);
     let len = length(d);
     let e = d / len;
-    let sl = shearLaw(ks, shearRest(lv, l, ci, cj), len);
+    let cs = cellShear(lv, l, ci, cj, mat);
+    let sl = shearLaw(cs.x, cs.y, shearRest(lv, l, ci, cj), len);
     let fs = sl.x;
     g -= fs * e;
     let H = axialBlock(sl.y, max(fs, 0.0) / len, e);

@@ -4,7 +4,8 @@
  *   node tools/gpu/run.mjs tools/gpu/scripts/still.ts <state name> <out name> [width height]
  * CAMERA='{"distance":0.3,"target":[0.01,0,0]}' overrides the default camera; RENDERCOST=1 also reports
  * per-pass and whole-frame GPU time (minimum over repeated frames; pass
- * boundaries overlap on tile-based GPUs, so the frame total is the reliable figure).
+ * boundaries overlap on tile-based GPUs, so the frame total is the reliable figure); with REBUILD=1
+ * every measured frame also rebuilds the field-derived state (edge field, loose threads).
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -34,11 +35,14 @@ export default async function main(args: string[]): Promise<void> {
   renderer.resize(width, height);
   const camera = { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.CAMERA ?? '{}') as object) };
   const tex = device.createTexture({ size: [width, height], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
-  // render twice: the first frame builds per-node frames the second one uses
-  for (let k = 0; k < 2; k++) {
+  // SETTLE seconds (default 2) of frames at 30 Hz first: the loose threads' dynamics come to rest
+  const settle = Number(process.env.SETTLE ?? 2);
+  const frames = Math.max(2, Math.round(settle * 30));
+  for (let k = 0; k < frames; k++) {
     const enc = device.createCommandEncoder();
-    renderer.encode(enc, camera, 0, tex.createView());
+    renderer.encode(enc, camera, k / 30, tex.createView());
     device.queue.submit([enc.finish()]);
+    if (k % 8 === 7) await drain(device);
   }
   console.log(await saveTexture(device, tex, out));
   if (process.env.RENDERCOST) {
@@ -51,7 +55,9 @@ export default async function main(args: string[]): Promise<void> {
     for (let k = 0; k < frames; k++) {
       const rd = device.createBuffer({ size: 64, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const enc = device.createCommandEncoder();
-      renderer.encode(enc, camera, 0, tex.createView(), qs);
+      // REBUILD=1: rebuild the field-derived state every frame (the cost while yarns are separating)
+      if (process.env.REBUILD) renderer.resetTopology(enc);
+      renderer.encode(enc, camera, (frames + k) / 30, tex.createView(), qs);
       enc.resolveQuerySet(qs, 0, 8, res, 0);
       enc.copyBufferToBuffer(res, 0, rd, 0, 64);
       device.queue.submit([enc.finish()]);

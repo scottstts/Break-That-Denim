@@ -1,8 +1,9 @@
-// Edge field (render_common.wgsl): per crossing the distance to the nearest crossing with a separated
-// yarn, the intact fraction of its warp and pick, and the density of separated yarn ends around it,
+// Edge field (render_common.wgsl): per crossing the distance to the nearest opening (a crossing
+// where neither yarn is part of the cloth), the intact fraction of its warp and pick, and the density of separated yarn ends around it,
 // written to an rgba16float texture at crossing resolution. Distances come from jump flooding over the crossing grid with physical (anisotropic)
 // pitches: nearest seeds are propagated over steps 16, 8, 4, 2, 1, 1 crossings, enough for EDGE_RMAX.
-// Rebuilt only when the yarn field changed (edgeArgsMain consumes the solver's field event flag).
+// Rebuilt only when the yarn field changed (edgeArgsMain consumes the solver's field event flag) or a
+// piece was retired.
 
 @group(0) @binding(0) var<uniform> R: RenderU;
 // x: jump step (crossings)
@@ -11,12 +12,17 @@
 @group(0) @binding(3) var<storage, read> seedIn: array<u32>;
 @group(0) @binding(4) var<storage, read_write> seedOut: array<u32>;
 @group(0) @binding(5) var edgeOut: texture_storage_2d<rgba16float, write>;
-// [0] built at least once since the renderer was created or reset
+// [0] built at least once since the renderer was created or reset, [1] retired nodes at the last build
 @group(0) @binding(6) var<storage, read_write> edgeSig: array<u32>;
 // solver yarn field: [0] = 1 when a damage code changed since the last rebuild
 @group(0) @binding(7) var<storage, read_write> fieldEvents: array<u32>;
-// indirect dispatch of the rebuild passes (x, y, z)
+// indirect dispatches of the rebuild passes (x, y, z, unused): over crossings (128 per group), over
+// nodes, over cells, and a single invocation; all zero when nothing changed
 @group(0) @binding(8) var<storage, read_write> edgeArgs: array<u32>;
+// loose-thread bits per crossing (threads.wgsl, rebuilt before the edge field)
+@group(0) @binding(9) var<storage, read> threadBitsE: array<u32>;
+// thread counters (threads.wgsl): [2] retired nodes this frame
+@group(0) @binding(10) var<storage, read> threadCountE: array<u32>;
 
 const NO_SEED: u32 = 0xFFFFFFFFu;
 
@@ -48,12 +54,24 @@ fn fieldTotal() -> u32 {
 
 @compute @workgroup_size(1)
 fn edgeArgsMain() {
-  let changed = fieldEvents[0] != 0u || edgeSig[0] == 0u;
+  // new separations, or a torn-off piece fell out of the scene (its material leaves the cloth)
+  let ret = threadCountE[2];
+  let changed = fieldEvents[0] != 0u || edgeSig[0] == 0u || ret != edgeSig[1];
   fieldEvents[0] = 0u;
   edgeSig[0] = 1u;
+  edgeSig[1] = ret;
   edgeArgs[0] = select(0u, (fieldTotal() + 127u) / 128u, changed);
   edgeArgs[1] = 1u;
   edgeArgs[2] = 1u;
+  edgeArgs[4] = select(0u, (R.counts.x + 127u) / 128u, changed);
+  edgeArgs[5] = 1u;
+  edgeArgs[6] = 1u;
+  edgeArgs[8] = select(0u, (R.counts.z + 127u) / 128u, changed);
+  edgeArgs[9] = 1u;
+  edgeArgs[10] = 1u;
+  edgeArgs[12] = select(0u, 1u, changed);
+  edgeArgs[13] = 1u;
+  edgeArgs[14] = 1u;
 }
 
 @compute @workgroup_size(128)
@@ -61,9 +79,13 @@ fn seedInit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = gid.x;
   let t = texelOf(c);
   if (!t.valid) { return; }
+  // an opening: neither yarn is part of the cloth here (separated, or drawn as a loose thread). A
+  // worn-through float still has its pick covering the crossing, so it is not an edge
   let w = field[c];
-  let cut = yarnCode(w, 0u) == CUT_R || yarnCode(w, 1u) == CUT_R;
-  seedOut[c] = select(NO_SEED, t.k | (t.m << 16u), cut);
+  let tb = threadBitsE[c >> 4u] >> (2u * (c & 15u));
+  let openPick = yarnCode(w, 0u) >= PULLED_R || (tb & 1u) != 0u;
+  let openWarp = yarnCode(w, 1u) >= PULLED_R || (tb & 2u) != 0u;
+  seedOut[c] = select(NO_SEED, t.k | (t.m << 16u), openPick && openWarp);
 }
 
 fn seedDist(L: LayerR, k: u32, m: u32, s: u32) -> f32 {
@@ -107,8 +129,10 @@ fn edgeWrite(@builtin(global_invocation_id) gid: vec3<u32>) {
   let LR = R.layers[t.l];
   let w = field[c];
   let d = min(sqrt(seedDist(LR, t.k, t.m, seedIn[c])) * 1e3, EDGE_RMAX);
-  let warp = 1.0 - f32(yarnCode(w, 1u)) / 255.0;
-  let pick = 1.0 - f32(yarnCode(w, 0u)) / 255.0;
+  // a yarn drawn as a loose thread is not part of the cloth's filtered coverage
+  let tb = threadBitsE[c >> 4u] >> (2u * (c & 15u));
+  let warp = select(1.0 - f32(yarnCode(w, 1u)) / 255.0, 0.0, (tb & 2u) != 0u || yarnCode(w, 1u) >= PULLED_R);
+  let pick = select(1.0 - f32(yarnCode(w, 0u)) / 255.0, 0.0, (tb & 1u) != 0u || yarnCode(w, 0u) >= PULLED_R);
   // separated yarn segments within about 1.2 mm (7 warps x 5 picks), where the rim needs it
   var density = 0.0;
   if (d < EDGE_RMAX) {
@@ -121,7 +145,7 @@ fn edgeWrite(@builtin(global_invocation_id) gid: vec3<u32>) {
         let m = i32(t.m) + dm;
         if (k < 0 || m < 0 || k >= i32(F.y) || m >= i32(F.z)) { continue; }
         let ww = field[F.x + u32(m) * F.y + u32(k)];
-        cuts += select(0u, 1u, yarnCode(ww, 0u) == CUT_R) + select(0u, 1u, yarnCode(ww, 1u) == CUT_R);
+        cuts += select(0u, 1u, yarnCode(ww, 0u) >= PULLED_R) + select(0u, 1u, yarnCode(ww, 1u) >= PULLED_R);
         n += 2u;
       }
     }

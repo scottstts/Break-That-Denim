@@ -1,11 +1,12 @@
 // Yarn damage field (src/simulation/yarnField.ts, mirrored exactly): per crossing the damage of its
 // warp and pick segments, advanced after each substep from the strain interpolated from the active
 // parallel spans around it; the spans then take their intact fraction from it, and a span whose yarns
-// have all separated ruptures. Passes, in order: spanStrain (strain snapshot per span), fieldUpdate
-// (per crossing), couple (per span).
+// have all separated ruptures. Passes, in order: spanStrain (strain snapshot per span), fieldUpdatePick
+// and fieldUpdateWarp (per span and yarn, after sepSnapshot), pullMark and pullApply (per 16 crossings),
+// couple (per span).
 
 @group(0) @binding(0) var<uniform> P: SimParams;
-// per layer: first crossing, warps K, picks M, unused
+// per layer: first crossing, warps K, picks M, load-sharing reach along picks | along warps << 16
 @group(0) @binding(1) var<uniform> FU: array<vec4<u32>, 3>;
 @group(0) @binding(2) var<storage, read> nodes: array<NodeStatic>;
 @group(0) @binding(3) var<storage, read> x: array<vec4<f32>>;
@@ -22,9 +23,14 @@
 @group(0) @binding(9) var<storage, read_write> counters: array<atomic<u32>>;
 // [0] set to 1 whenever a damage code changed (the renderer clears it once it has rebuilt its edge field)
 @group(0) @binding(10) var<storage, read_write> fieldEvents: array<atomic<u32>>;
+// per 16 crossings, bit 2 e + f: the separated state before the step (sepSnapshot -> fieldUpdate*),
+// then the pull-out marks (pullMark -> pullApply)
+@group(0) @binding(11) var<storage, read_write> pullBits: array<u32>;
 
 const NO_STRAIN: f32 = 1e30;
 const CUT: u32 = 255u;
+// pulled out of the weave at the crossing (yarnField.ts DAMAGE_PULLED); codes >= PULLED separate it
+const PULLED: u32 = 254u;
 
 fn latticeOf(l: u32) -> vec4<u32> { return P.layers[l].lattice; }
 fn cloth(n: u32) -> bool { return x[n].w < 0.5; }
@@ -84,61 +90,232 @@ fn interpolatedStrain(l: u32, f: u32, k: u32, m: u32) -> f32 {
   return select(NO_STRAIN, num / den, den > 1e-6);
 }
 
+// ---------------------------------------------------------------- local load sharing (yarnField.ts)
+
+override SHARE_FRACTION: f32 = 0.6;
+override SHARE_RUN: u32 = 6u;
+
 @compute @workgroup_size(128)
-fn fieldUpdate(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let c = gid.x;
-  if (P.counts.z == 0u) { return; }
-  var l = 0u;
-  for (var q = 1u; q < P.counts.y; q++) {
-    if (c >= FU[q].x) { l = q; }
+fn sepSnapshot(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let w = gid.x;
+  let total = fieldTotalY();
+  if (w >= (total + 15u) / 16u || P.counts.z == 0u) { return; }
+  var bits = 0u;
+  for (var e = 0u; e < 16u; e++) {
+    let c = 16u * w + e;
+    if (c >= total) { break; }
+    for (var f = 0u; f < 2u; f++) {
+      if (damageAt(c, f) >= PULLED) { bits |= 1u << (2u * e + f); }
+    }
   }
-  let F = FU[l];
-  if (c >= F.x + F.y * F.z) { return; }
-  let local = c - F.x;
-  let k = local % F.y;
-  let m = local / F.y;
+  pullBits[w] = bits;
+}
+
+fn sepAt(c: u32, f: u32) -> bool { return ((pullBits[c >> 4u] >> (2u * (c & 15u) + f)) & 1u) == 1u; }
+
+// Overload of the yarn of family f at crossing (k, m) of layer field F, at most 1 + cap (shareFactor).
+fn shareFactor(F: vec4<u32>, f: u32, k: u32, m: u32, cap: f32) -> f32 {
+  let reach = i32(select(F.w & 0xFFFFu, F.w >> 16u, f == 1u));
+  let along = i32(select(k, m, f == 1u));
+  let lenAlong = i32(select(F.y, F.z, f == 1u));
+  let across = i32(select(m, k, f == 1u));
+  let lenAcross = i32(select(F.z, F.y, f == 1u));
+  var runs = 0u;
+  for (var side = 0; side < 2; side++) {
+    let dir = select(-1, 1, side == 1);
+    for (var d = 1; d <= i32(SHARE_RUN); d++) {
+      let y = across + dir * d;
+      if (y < 0 || y >= lenAcross) { break; }
+      var broken = false;
+      for (var a = max(0, along - reach); a <= min(lenAlong - 1, along + reach); a++) {
+        let c = F.x + u32(select(y * i32(F.y) + a, a * i32(F.y) + y, f == 1u));
+        if (sepAt(c, f)) {
+          broken = true;
+          break;
+        }
+      }
+      if (!broken) { break; }
+      runs++;
+    }
+  }
+  return 1.0 + min(SHARE_FRACTION * f32(runs) * 0.5, cap);
+}
+
+// Yarn q of the family-f span owned by node n (invocation n * MAX_BUNDLE_F + q): its crossings within
+// the span are in series and carry the same tension, so it softens at its weakest crossing only (the
+// lowest peak strain), at the yarn's strain interpolated across the bundle at the yarn and at the
+// middle of the span; mirrored exactly by updateField (yarnField.ts). One pass per family: within a
+// pass every crossing's byte of the field word has a single writer.
+const MAX_BUNDLE_F: u32 = 16u;
+
+fn fieldUpdateYarn(gid: u32, f: u32) {
+  let n = gid / MAX_BUNDLE_F;
+  let q = gid % MAX_BUNDLE_F;
+  if (n >= P.counts.x || P.counts.z == 0u) { return; }
+  let ijl = nodes[n].ijl;
+  let l = ijl >> 24u;
   let L = latticeOf(l);
+  let i = ijl & 0xFFFu;
+  let j = (ijl >> 12u) & 0xFFFu;
   let bu = bundleF(l, 1u);
   let bv = bundleF(l, 0u);
-  var word = field[c];
-  let st = strength[c];
-  for (var f = 0u; f < 2u; f++) {
-    let code = (word >> (8u * f)) & 0xFFu;
-    if (code == CUT) { continue; }
-    // the yarn's span and its index q in the bundle
-    var i: i32;
-    var j: i32;
-    var q: u32;
-    if (f == 1u) {
-      i = i32(k / bu);
-      j = (i32(m) - i32(bv / 2u)) / i32(bv);
-      if (i32(m) < i32(bv / 2u)) { j = -1; }
-      q = k - u32(max(i, 0)) * bu;
-      if (i >= i32(L.y) || j < 0 || j > i32(L.z) - 2) { continue; }
-    } else {
-      j = i32(m / bv);
-      i = (i32(k) - i32(bu / 2u)) / i32(bu);
-      if (i32(k) < i32(bu / 2u)) { i = -1; }
-      q = m - u32(max(j, 0)) * bv;
-      if (j >= i32(L.z) || i < 0 || i > i32(L.y) - 2) { continue; }
-    }
-    let a = L.x + u32(j) * L.y + u32(i);
-    let s = 2u * a + f;
-    let sg = segs[s];
-    if (!segActive(sg) || ((sg.cutMask >> q) & 1u) == 1u) { continue; }
-    let b = a + select(L.y, 1u, f == 0u);
-    if (!cloth(a) || !cloth(b)) { continue; }
-    let eps = interpolatedStrain(l, f, k, m);
-    if (eps >= 0.5 * NO_STRAIN) { continue; }
-    let B = f32(select(bv, bu, f == 1u));
-    let d = yarnDamage(P.layers[l].yarn[f], B, areaOfCode((word >> (16u + 8u * f)) & 0xFFu), st[f], sg.soft / sg.rest, eps);
-    let nc = select(min(u32(floor(d * 255.0)), 254u), CUT, d >= 1.0);
-    if (nc > code) { word = (word & ~(0xFFu << (8u * f))) | (nc << (8u * f)); }
+  let B = select(bv, bu, f == 1u);
+  if (q >= B) { return; }
+  let inside = select(j + 1u < L.z, i + 1u < L.y, f == 0u);
+  if (!inside) { return; }
+  let s = 2u * n + f;
+  let sg = segs[s];
+  if (!segActive(sg) || ((sg.cutMask >> q) & 1u) == 1u) { return; }
+  let b = n + select(L.y, 1u, f == 0u);
+  if (!cloth(n) || !cloth(b)) { return; }
+  let F = FU[l];
+  let Pn = select(bu, bv, f == 1u);
+  let soft = sg.soft / sg.rest;
+  // first crossing of the yarn in the span and the step along it
+  var k0: u32;
+  var m0: u32;
+  if (f == 1u) {
+    k0 = i * bu + q;
+    m0 = j * bv + bv / 2u;
+  } else {
+    k0 = i * bu + bu / 2u;
+    m0 = j * bv + q;
   }
-  if (word != field[c]) {
-    field[c] = word;
+  let dk = select(1u, 0u, f == 1u);
+  let dm = select(0u, 1u, f == 1u);
+  let eps = interpolatedStrain(l, f, k0 + (Pn >> 1u) * dk, m0 + (Pn >> 1u) * dm);
+  if (eps >= 0.5 * NO_STRAIN) { return; }
+  let y = P.layers[l].yarn[f];
+  // no crossing can soften even at the largest overload: nothing to do (exact early out; most yarns)
+  var minPeak = 1e30;
+  for (var p = 0u; p < Pn; p++) {
+    let c = F.x + (m0 + p * dm) * F.y + k0 + p * dk;
+    minPeak = min(minPeak, strainAtTension(y, strength[c][f] * f32(B) / areaAt(c, f)));
+  }
+  if (eps * (1.0 + SHARE_FRACTION * f32(SHARE_RUN)) <= minPeak) { return; }
+  // friction the crossings can pass to this yarn (shareCap): compaction of one crossing plus the wrap
+  // force of the crossing yarn's tension at the middle of the span
+  let g = 1u - f;
+  let kM = k0 + (Pn >> 1u) * dk;
+  let mM = m0 + (Pn >> 1u) * dm;
+  let ec = interpolatedStrain(l, g, kM, mM);
+  let Bg = select(bv, bu, g == 1u);
+  let tCross = select(max(0.0, axialTension(P.layers[l].yarn[g], ec)) * areaAt(F.x + mM * F.y + kM, g) / f32(Bg), 0.0, ec >= 0.5 * NO_STRAIN);
+  let reach = select(F.w & 0xFFFFu, F.w >> 16u, f == 1u);
+  let transfer = f32(2u * reach + 1u) * P.layers[l].a.y * (nodes[n].n0 / f32(bu * bv) + P.layers[l].a.z * tCross);
+  // where the yarn softens: where it already has, else where overload / peak strain is largest
+  var best = F.x + m0 * F.y + k0;
+  var bestScore = -1.0;
+  var bestOmega = 1.0;
+  var soft0 = 0xFFFFFFFFu;
+  var softCode = 0u;
+  for (var p = 0u; p < Pn; p++) {
+    let kk = k0 + p * dk;
+    let mm = m0 + p * dm;
+    let c = F.x + mm * F.y + kk;
+    let omega = shareFactor(F, f, kk, mm, transfer / strength[c][f]);
+    let peak = strainAtTension(y, strength[c][f] * f32(B) / areaAt(c, f));
+    let score = omega / peak;
+    if (score > bestScore) {
+      best = c;
+      bestScore = score;
+      bestOmega = omega;
+    }
+    let code = damageAt(c, f);
+    if (code > softCode) {
+      soft0 = c;
+      softCode = code;
+    }
+  }
+  if (soft0 != 0xFFFFFFFFu) {
+    best = soft0;
+    bestOmega = shareFactor(F, f, (best - F.x) % F.y, (best - F.x) / F.y, transfer / strength[best][f]);
+  }
+  let d = yarnDamage(y, f32(B), areaAt(best, f), strength[best][f], soft, eps * bestOmega);
+  let bestCode = select(min(u32(floor(d * 255.0)), PULLED - 1u), CUT, d >= 1.0);
+  let word = field[best];
+  if (bestCode > ((word >> (8u * f)) & 0xFFu)) {
+    field[best] = (word & ~(0xFFu << (8u * f))) | (bestCode << (8u * f));
     atomicStore(&fieldEvents[0], 1u);
   }
+}
+
+@compute @workgroup_size(128)
+fn fieldUpdatePick(@builtin(global_invocation_id) gid: vec3<u32>) { fieldUpdateYarn(gid.x, 0u); }
+
+@compute @workgroup_size(128)
+fn fieldUpdateWarp(@builtin(global_invocation_id) gid: vec3<u32>) { fieldUpdateYarn(gid.x, 1u); }
+
+// ---------------------------------------------------------------- pull-out (yarnField.ts pullOut)
+
+fn fieldTotalY() -> u32 {
+  let F = FU[P.counts.y - 1u];
+  return F.x + F.y * F.z;
+}
+
+// lowbias32 (shared/noise.ts hash32)
+fn hashY(x0: u32) -> u32 {
+  var v = x0;
+  v ^= v >> 16u;
+  v *= 0x7feb352du;
+  v ^= v >> 15u;
+  v *= 0x846ca68bu;
+  v ^= v >> 16u;
+  return v;
+}
+
+fn pullPasses(c: u32, f: u32, area: f32) -> bool {
+  let draw = f32(hashY(c * 2u + f + 0x632be5abu)) / 4294967296.0;
+  return draw < 0.5 + 0.38 * (1.0 - area);
+}
+
+// One invocation per 16 crossings: which ends pull out of their next crossing this substep.
+@compute @workgroup_size(128)
+fn pullMark(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let w = gid.x;
+  let total = fieldTotalY();
+  if (w >= (total + 15u) / 16u || P.counts.z == 0u) { return; }
+  var bits = 0u;
+  for (var e = 0u; e < 16u; e++) {
+    let c = 16u * w + e;
+    if (c >= total) { break; }
+    var l = 0u;
+    for (var q = 1u; q < P.counts.y; q++) {
+      if (c >= FU[q].x) { l = q; }
+    }
+    let F = FU[l];
+    let k = (c - F.x) % F.y;
+    let m = (c - F.x) / F.y;
+    for (var f = 0u; f < 2u; f++) {
+      if (damageAt(c, f) >= PULLED) { continue; }
+      let pos = select(m, k, f == 0u);
+      let len = select(F.z, F.y, f == 0u);
+      let stride = select(F.y, 1u, f == 0u);
+      let end = (pos > 0u && damageAt(c - stride, f) >= PULLED) || (pos + 1u < len && damageAt(c + stride, f) >= PULLED);
+      if (!end) { continue; }
+      if (pullPasses(c, f, areaAt(c, f))) { bits |= 1u << (2u * e + f); }
+    }
+  }
+  pullBits[w] = bits;
+}
+
+@compute @workgroup_size(128)
+fn pullApply(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let w = gid.x;
+  let total = fieldTotalY();
+  if (w >= (total + 15u) / 16u || P.counts.z == 0u) { return; }
+  let bits = pullBits[w];
+  if (bits == 0u) { return; }
+  for (var e = 0u; e < 16u; e++) {
+    let c = 16u * w + e;
+    if (c >= total) { break; }
+    var word = field[c];
+    for (var f = 0u; f < 2u; f++) {
+      if (((bits >> (2u * e + f)) & 1u) == 1u) { word = (word & ~(0xFFu << (8u * f))) | (PULLED << (8u * f)); }
+    }
+    field[c] = word;
+  }
+  atomicStore(&fieldEvents[0], 1u);
 }
 
 @compute @workgroup_size(128)
@@ -178,10 +355,10 @@ fn couple(@builtin(global_invocation_id) gid: vec3<u32>) {
       let d = damageAt(c, f);
       compliance += 1.0 / areaAt(c, f);
       dmax = max(dmax, d);
-      if (d == CUT && first < 0) { first = i32(p); }
+      if (d >= PULLED && first < 0) { first = i32(p); }
     }
-    sum += (1.0 - f32(dmax) / 255.0) * (f32(Pn) / compliance);
-    if (dmax == CUT) {
+    sum += select(1.0 - f32(dmax) / 255.0, 0.0, dmax >= PULLED) * (f32(Pn) / compliance);
+    if (dmax >= PULLED) {
       mask |= 1u << q;
       site += (f32(first) + 0.5) / f32(Pn);
     }

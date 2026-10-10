@@ -1,6 +1,7 @@
 // Yarn damage field map of a dumped session state (session.ts DUMP=1), cropped to the damage, rest
 // chart (rows stretched to the pick / warp pitch ratio): black = both yarns cut, cream = warp cut
-// (pick shows), cyan = pick cut, blue shades = warp damage. Lattice size is the default scene's.
+// (pick shows), cyan = pick cut, magenta = warp pulled out, green = pick pulled out, blue shades = warp
+// damage. Lattice size is the default scene's.
 //   node tools/gpu/fieldmap.mjs artifacts/captures/<name>.state out.png [pixels per crossing]
 import { readFileSync, writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
@@ -24,6 +25,8 @@ for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
   let c;
   if (dp === 255 && dw === 255) c = [0, 0, 0];
   else if (dw === 255) c = [235, 225, 200];
+  else if (dw === 254) c = [200, 120, 220];
+  else if (dp === 254) c = [120, 230, 120];
   else if (dp === 255) c = [90, 200, 230];
   else { const t = dw / 255; c = [Math.round(40 + 120 * t), Math.round(60 + 60 * t), Math.round(140 - 40 * t)]; }
   img.set(c, 3 * (y * W + x));

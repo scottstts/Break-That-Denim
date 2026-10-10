@@ -1,8 +1,8 @@
 import { axialEnergyDensity, spanResponse } from '../axial';
-import { bendPsi, bendPsiDelta, shearLaw } from '../laws';
+import { bendPsi, bendPsiDelta, cellArea, shearJam, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
 import { SEG_BROKEN, SEG_EXISTS, type CompiledScene, type LayerInfo } from '../scene';
-import { coupleSpans, updateField } from '../yarnField';
+import { coupleSpans, pullOut, updateField } from '../yarnField';
 import { newtonStepPCG, resetLaggedLevels, type MGConfig } from './newtonMultigrid';
 
 /**
@@ -283,7 +283,8 @@ export class ReferenceSolver {
   bendCoeffs(b: number, f: number, s0: number, s1: number): [number, number, number] {
     const yarn = this.layer(b).material.yarns[f];
     const Lm = 0.5 * (this.restLength[s0] + this.restLength[s1]);
-    const kb = yarn.bendRigidity / (Lm * Lm * Lm);
+    // only the continuous fibres of the spans' yarns bend: rigidity scales with their intact fraction
+    const kb = (yarn.bendRigidity * 0.5 * (this.intact[s0] + this.intact[s1])) / (Lm * Lm * Lm);
     return [kb, (kb * yarn.bendViscosity) / this.params.h, 4 * Lm * Lm];
   }
 
@@ -350,6 +351,19 @@ export class ReferenceSolver {
     return out.filter(([cell, p, d]) => p >= 0 && this.diagActive(cell, d)).map(([cell, p]) => [cell, p]);
   }
 
+  /**
+   * Shear stiffness and jam strain of the cell with lower-left corner `cell`: shear resistance comes
+   * from the crossings' compaction (wear-reduced), the jam from the yarns' remaining cross-section
+   * (laws.ts shearJam; mirrors cellShear in assemble.wgsl).
+   */
+  cellShear(cell: number): [number, number] {
+    const r = this.nbr[4 * cell + 1];
+    const t = this.nbr[4 * cell + 3];
+    const io = (s: number) => (this.segActive(s) ? this.intact[s] : 0);
+    const m = this.layer(cell).material;
+    return [(m.shearStiffness * this.scene.crossingNormal0[cell]) / m.crossingNormal0, shearJam(cellArea(io(2 * cell), io(2 * t), io(2 * cell + 1), io(2 * r + 1)))];
+  }
+
   shearRest(cell: number): number {
     return Math.hypot(this.restLength[2 * cell], this.restLength[2 * cell + 1]);
   }
@@ -377,15 +391,15 @@ export class ReferenceSolver {
       }
       this.addBendingGradient(n, f, g);
     }
-    const ks = this.layer(n).material.shearStiffness;
     for (const [cell, partner] of this.shearPartners(n)) {
+      const [ks, jam] = this.cellShear(cell);
       this.pos(n, this.pa);
       this.pos(partner, this.pb);
       const d0 = this.pb[0] - this.pa[0];
       const d1 = this.pb[1] - this.pa[1];
       const d2 = this.pb[2] - this.pa[2];
       const l = Math.hypot(d0, d1, d2);
-      const fs = shearLaw(ks, this.shearRest(cell), l)[0];
+      const fs = shearLaw(ks, this.shearRest(cell), l, jam)[0];
       g[0] -= (fs * d0) / l;
       g[1] -= (fs * d1) / l;
       g[2] -= (fs * d2) / l;
@@ -465,7 +479,7 @@ export class ReferenceSolver {
         const t = this.nbr[4 * n + 3];
         const rt = this.nbr[4 * r + 3];
         const Ld = this.shearRest(n);
-        const ks = mat.shearStiffness;
+        const [ks, jam] = this.cellShear(n);
         for (const [p, q, d] of [
           [n, rt, 0],
           [r, t, 1],
@@ -476,10 +490,10 @@ export class ReferenceSolver {
           const dp = dirOf(p);
           const de = [dq[0] - dp[0], dq[1] - dp[1], dq[2] - dp[2]];
           const l0 = Math.hypot(ec[0], ec[1], ec[2]);
-          const f0 = shearLaw(ks, Ld, l0)[0];
+          const f0 = shearLaw(ks, Ld, l0, jam)[0];
           alphas.forEach((a, k) => {
             const [dl, la] = lenChange(ec, de, a, l0);
-            out[k] += 0.5 * (f0 + shearLaw(ks, Ld, la)[0]) * dl;
+            out[k] += 0.5 * (f0 + shearLaw(ks, Ld, la, jam)[0]) * dl;
           });
         }
       }
@@ -534,7 +548,7 @@ export class ReferenceSolver {
       const r = this.nbr[4 * n + 1];
       const t = this.nbr[4 * n + 3];
       const rt = this.nbr[4 * r + 3];
-      const ks = this.layer(n).material.shearStiffness;
+      const [ks, jam] = this.cellShear(n);
       const Ld = this.shearRest(n);
       for (const [p, q, d] of [
         [n, rt, 0],
@@ -544,7 +558,7 @@ export class ReferenceSolver {
         this.pos(p, this.pa);
         this.pos(q, this.pb);
         const l = Math.hypot(this.pb[0] - this.pa[0], this.pb[1] - this.pa[1], this.pb[2] - this.pa[2]);
-        E += shearLaw(ks, Ld, l)[2];
+        E += shearLaw(ks, Ld, l, jam)[2];
       }
     }
     return E;
@@ -608,14 +622,16 @@ export class ReferenceSolver {
   }
 
   /**
-   * Yarn damage field update and span coupling (yarnField.ts): strain snapshot, per-yarn damage at
-   * every crossing, then each span's intact fraction and ruptures.
+   * Yarn damage field update and span coupling (yarnField.ts):
+   * strain snapshot, per-yarn damage at every crossing, one pull-out step, then each span's intact
+   * fraction and ruptures.
    */
   updateDamage(): void {
     const active = (q: number) => this.segActive(q);
     for (let q = 0; q < 2 * this.N; q++) this.strain[q] = active(q) ? this.segLength(q) / this.restLength[q] - 1 : NaN;
     const spans = { restLength: this.restLength, softening: this.scene.softening, segFlags: this.segFlags, intact: this.intact, cutMask: this.cutMask, failSite: this.failSite, tails: this.tails };
-    updateField(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, spans, this.strain, active);
+    updateField(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, spans, this.strain, active, this.scene.crossingNormal0);
+    pullOut(this.scene.field, this.scene.fieldArea, this.fieldDamage);
     this.brokenCount += coupleSpans(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, spans, active, SEG_BROKEN);
   }
 

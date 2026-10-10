@@ -1,11 +1,13 @@
 // Woven cloth surface. Intact cells: one instance per lattice cell, S x S sub-quads of the refined
-// bicubic surface. Torn cells (a separated span) are drawn per corner group (vsTorn): the group's
-// leader draws the whole cell on the group's own control net (torn.wgsl) and keeps the crossings its
-// yarns connect it to, so a free edge runs where the yarns separated, at the yarn pitch.
+// bicubic surface. Cells near damage (pieces.wgsl gives a node of theirs a connection field, or a span
+// of theirs has separated) are drawn per crossing instead (vsFine): one quad per crossing that has
+// surface material, each placed from the cell's corners it is connected to (material_map.wgsl), so
+// the cloth opens exactly where its yarns separated and is drawn only where material is.
 // The fragment shader evaluates the woven yarn surface at the four MSAA sample positions: each sample
-// is either a yarn (shaded) or a gap (uncovered): a gap in stretched weave, or a yarn the damage field
-// says has separated there (the yarn below shows through, or nothing). Near a free edge (edge field)
-// the cloth turns into its torn rim: an abraded halo, then a pale, fibrous, slightly rolled band.
+// is either a yarn (shaded) or a gap (uncovered): a gap in stretched weave, or a yarn that is not part
+// of the cloth surface there (separated, or drawn as a loose thread), where the yarn below shows
+// through, or nothing. Near a free edge (edge field) the cloth turns into its torn rim: an abraded
+// halo, then a pale fibrous band.
 
 @group(0) @binding(0) var<uniform> F: FrameU;
 @group(0) @binding(1) var<uniform> R: RenderU;
@@ -15,13 +17,17 @@
 @group(0) @binding(5) var shadowSampler: sampler_comparison;
 @group(0) @binding(6) var weaveTile: texture_2d_array<f32>;
 @group(0) @binding(7) var tileSampler: sampler;
-@group(0) @binding(8) var<storage, read> tornGeo: array<vec4<f32>>;
+// render lists: fine cells from FINE_BASE (refine.wgsl)
+@group(0) @binding(8) var<storage, read> lists: array<u32>;
 @group(0) @binding(9) var edgeTex: texture_2d<f32>;
 @group(0) @binding(10) var edgeSampler: sampler;
 @group(0) @binding(11) var<storage, read> fieldR: array<u32>;
+// per 16 crossings, 2 bits each: the pick / warp there belongs to a loose thread (threads.wgsl)
+@group(0) @binding(12) var<storage, read> threadBitsR: array<u32>;
+@group(0) @binding(13) var<storage, read> x: array<vec4<f32>>;
+@group(0) @binding(14) var<storage, read> tframe: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read> kappaM: array<u32>;
 
-// sub-quads per edge of a torn group's patch (over the whole cell)
-const TQ: u32 = 4u;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -33,7 +39,7 @@ struct VOut {
   @location(5) @interpolate(flat) layer: u32,
   // cell (i, j), unused, unused
   @location(6) @interpolate(flat) cell: vec4<u32>,
-  // torn groups: 1, cell meta (render_common.wgsl), leader corner, torn-cell index; x = 0 for surface cells
+  // x: 1 for a fine (per-crossing) quad, 0 for an intact cell
   @location(7) @interpolate(flat) torn: vec4<u32>,
 };
 
@@ -55,8 +61,7 @@ fn surfaceVertex(vi: u32, cell: u32) -> VOut {
   let l = layerOfCell(cell);
   let LR = R.layers[l];
   if (cell >= R.counts.z) { return degenerate(); }
-  let flags = cellFlags[cell];
-  if (flags == 0u) { return degenerate(); }
+  if ((cellFlags[cell] & 1u) == 0u) { return degenerate(); }
   let L = LR.lattice;
   let S = LR.twill.z;
   let local = cell - LR.refine.z;
@@ -85,76 +90,114 @@ fn surfaceVertex(vi: u32, cell: u32) -> VOut {
   return o;
 }
 
-// ---------------------------------------------------------------- torn groups
+// ---------------------------------------------------------------- cells near damage, per crossing
 
-fn crS(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> vec3<f32> {
-  let t2 = t * t;
-  let t3 = t2 * t;
-  return 0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3);
-}
-fn crdS(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, p3: vec3<f32>, t: f32) -> vec3<f32> {
-  return 0.5 * ((p2 - p0) + 2.0 * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t + 3.0 * (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t);
+fn debrisS(c: u32, total: u32) -> bool { return ((threadBitsR[debrisWord(c, total)] >> (c & 31u)) & 1u) == 1u; }
+
+// The yarn of family f at crossing c is part of the cloth surface (not separated, not a thread).
+fn surfaceYarnS(c: u32, f: u32) -> bool {
+  return yarnCode(fieldR[c], f) < PULLED_R && ((threadBitsR[c >> 4u] >> (2u * (c & 15u) + f)) & 1u) == 0u;
 }
 
-fn tornVertex(vi: u32, ii: u32) -> VOut {
-  let k = ii >> 2u;
-  let c = ii & 3u;
-  let base = k * TORN_STRIDE;
-  let slot = tornSlot(k, c);
-  if (tornGeo[slot].w < 0.0) { return degenerate(); }
-  let info = tornInfo(tornGeo[base]);
-  let l = info.w;
+// Vertex vi of instance ii (a fine cell): six per crossing quad of the cell's crossing grid. A quad
+// covers its crossing's area clipped to the cell, so the cells tile; each vertex is placed with the
+// connections of its own crossing to the corners, averaged with the neighbouring crossings around
+// the vertex that its material reaches directly (along a pick or a warp both are part of): within a
+// piece of cloth neighbouring quads meet exactly, across a crack they part.
+fn fineVertex(vi: u32, ii: u32) -> VOut {
+  let cell = lists[FINE_BASE + ii];
+  let l = layerOfCell(cell);
   let LR = R.layers[l];
   let L = LR.lattice;
-  let local = info.x - LR.refine.z;
+  let local = cell - LR.refine.z;
   let ci = local % (L.y - 1u);
   let cj = local / (L.y - 1u);
+  let g = cellGrid(LR, ci, cj);
   let q = vi / 6u;
-  let k6 = vi % 6u;
-  var cuo = array<u32, 6>(0u, 1u, 1u, 0u, 1u, 0u);
-  var cvo = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
-  let s = f32(q % TQ + cuo[k6]) / f32(TQ);
-  let t = f32(q / TQ + cvo[k6]) / f32(TQ);
-  var rows: array<vec3<f32>, 4>;
-  var drows: array<vec3<f32>, 4>;
-  for (var r = 0u; r < 4u; r++) {
-    let p0 = tornGeo[slot + 4u * r].xyz;
-    let p1 = tornGeo[slot + 4u * r + 1u].xyz;
-    let p2 = tornGeo[slot + 4u * r + 2u].xyz;
-    let p3 = tornGeo[slot + 4u * r + 3u].xyz;
-    rows[r] = crS(p0, p1, p2, p3, s);
-    drows[r] = crdS(p0, p1, p2, p3, s);
-  }
-  let W = crS(rows[0], rows[1], rows[2], rows[3], t);
-  var o: VOut;
-  o.world = W;
-  o.dPs = crS(drows[0], drows[1], drows[2], drows[3], t);
-  o.dPt = crdS(rows[0], rows[1], rows[2], rows[3], t);
-  // wear from the cell's refined corner samples
-  let S = LR.twill.z;
-  let r00 = LR.refine.x + (cj * S) * LR.refine.y + ci * S;
-  let w00 = rsurf[3u * r00].w;
-  let w10 = rsurf[3u * (r00 + S)].w;
-  let w01 = rsurf[3u * (r00 + S * LR.refine.y)].w;
-  let w11 = rsurf[3u * (r00 + S * LR.refine.y + S)].w;
-  o.wearV = mix(mix(w00, w10, s), mix(w01, w11, s), t);
+  let qk = q % FINE_QK;
+  let qm = q / FINE_QK;
+  if (qk >= g.z || qm >= g.w) { return degenerate(); }
+  let k = i32(g.x + qk);
+  let m = i32(g.y + qm);
+  let c = fieldIndexR(LR, u32(k), u32(m));
+  if (!surfaceYarnS(c, 0u) && !surfaceYarnS(c, 1u)) { return degenerate(); }
   let bu = f32(bundleOf(LR, 1u));
   let bv = f32(bundleOf(LR, 0u));
-  o.uv = vec2<f32>((f32(ci) + s) * bu + 0.5 * (bu - 1.0), (f32(cj) + t) * bv + 0.5 * (bv - 1.0));
+  let ua = f32(ci) * bu + 0.5 * (bu - 1.0);
+  let va = f32(cj) * bv + 0.5 * (bv - 1.0);
+  let u0 = max(ua, f32(k) - 0.5);
+  let u1 = min(ua + bu, f32(k) + 0.5);
+  let v0 = max(va, f32(m) - 0.5);
+  let v1 = min(va + bv, f32(m) + 0.5);
+  if (u1 - u0 < 1e-4 || v1 - v0 < 1e-4) { return degenerate(); }
+  var cuo = array<u32, 6>(0u, 1u, 1u, 0u, 1u, 0u);
+  var cvo = array<u32, 6>(0u, 0u, 1u, 0u, 1u, 1u);
+  let cu = cuo[vi % 6u];
+  let cv = cvo[vi % 6u];
+  let U = select(u0, u1, cu == 1u);
+  let V = select(v0, v1, cv == 1u);
+  // neighbouring crossings around the vertex (where it lies on a crossing corner, not clipped)
+  let sx = select(-1, 1, cu == 1u);
+  let sy = select(-1, 1, cv == 1u);
+  let onX = abs(U - (f32(k) + 0.5 * f32(sx))) < 1e-4;
+  let onY = abs(V - (f32(m) + 0.5 * f32(sy))) < 1e-4;
+  let K = i32(LR.field.y);
+  let M = i32(LR.field.z);
+  let kx = k + sx;
+  let my = m + sy;
+  let inX = onX && kx >= 0 && kx < K;
+  let inY = onY && my >= 0 && my < M;
+  let cx = fieldIndexR(LR, u32(clamp(kx, 0, K - 1)), u32(m));
+  let cy = fieldIndexR(LR, u32(k), u32(clamp(my, 0, M - 1)));
+  let cxy = fieldIndexR(LR, u32(clamp(kx, 0, K - 1)), u32(clamp(my, 0, M - 1)));
+  // joined along a yarn, within one piece (cloth or a falling piece)
+  let total = fieldTotalOf(R.layers[R.counts.y - 1u]);
+  let deb = debrisS(c, total);
+  let linkX = inX && surfaceYarnS(c, 0u) && surfaceYarnS(cx, 0u) && debrisS(cx, total) == deb;
+  let linkY = inY && surfaceYarnS(c, 1u) && surfaceYarnS(cy, 1u) && debrisS(cy, total) == deb;
+  let linkXY = inX && inY && debrisS(cxy, total) == deb && ((linkX && surfaceYarnS(cx, 1u) && surfaceYarnS(cxy, 1u)) || (linkY && surfaceYarnS(cy, 0u) && surfaceYarnS(cxy, 0u)));
+  let n00 = L.x + cj * L.y + ci;
+  var nc = array<u32, 4>(n00, n00 + 1u, n00 + L.y, n00 + L.y + 1u);
+  var kap = vec4<f32>(0.0);
+  var cnt = 0.0;
+  for (var e = 0u; e < 4u; e++) {
+    var kk = k;
+    var mm = m;
+    var take = e == 0u;
+    if (e == 1u) {
+      kk = kx;
+      take = linkX;
+    } else if (e == 2u) {
+      mm = my;
+      take = linkY;
+    } else if (e == 3u) {
+      kk = kx;
+      mm = my;
+      take = linkXY;
+    }
+    if (!take) { continue; }
+    kap += vec4<f32>(kappaAt(l, nc[0], kk, mm), kappaAt(l, nc[1], kk, mm), kappaAt(l, nc[2], kk, mm), kappaAt(l, nc[3], kk, mm));
+    cnt += 1.0;
+  }
+  kap /= cnt;
+  let mp = matPoint(l, ci, cj, (U - ua) / bu, (V - va) / bv, kap);
+  if (!mp.valid) { return degenerate(); }
+  var o: VOut;
+  o.world = mp.p;
+  o.wearV = mp.wear;
+  o.dPs = mp.ds;
+  o.dPt = mp.dt;
+  o.uv = vec2<f32>(U, V);
   o.layer = l;
   o.cell = vec4<u32>(ci, cj, 0u, 0u);
-  o.torn = vec4<u32>(1u, info.y, c, k);
-  o.pos = F.viewProj * vec4<f32>(W, 1.0);
+  o.torn = vec4<u32>(1u, 0u, 0u, 0u);
+  o.pos = F.viewProj * vec4<f32>(mp.p, 1.0);
   return o;
 }
 
-// Label of crossing idx of a torn cell (labels at word base): the leader corner of the group that
-// owns it, NO_LABEL when none does.
-fn tornLabel(base: u32, idx: u32) -> u32 { return labelIn(bitcast<vec4<u32>>(tornGeo[base + (idx >> 5u)]), idx); }
-
-// Damage code of the yarn segment hit at fine point uv: a warp at its nearest pick, a pick at its
+// Crossing of the yarn segment hit at fine point uv: a warp at its nearest pick, a pick at its
 // nearest warp.
-fn hitDamage(L: LayerR, h: Hit, uv: vec2<f32>) -> u32 {
+fn hitCrossing(L: LayerR, h: Hit, uv: vec2<f32>) -> u32 {
   var k: i32;
   var m: i32;
   if (h.fam == 1u) {
@@ -166,36 +209,39 @@ fn hitDamage(L: LayerR, h: Hit, uv: vec2<f32>) -> u32 {
   }
   k = clamp(k, 0, i32(L.field.y) - 1);
   m = clamp(m, 0, i32(L.field.z) - 1);
-  return yarnCode(fieldR[fieldIndexR(L, u32(k), u32(m))], h.fam);
+  return fieldIndexR(L, u32(k), u32(m));
+}
+
+// Damage code of the yarn segment hit at fine point uv.
+fn hitDamage(L: LayerR, h: Hit, uv: vec2<f32>) -> u32 {
+  return yarnCode(fieldR[hitCrossing(L, h, uv)], h.fam);
+}
+
+// The yarn segment hit at uv is gone from the cloth: separated, or a loose thread drawn on its own.
+fn hitAbsent(L: LayerR, h: Hit, uv: vec2<f32>) -> bool {
+  let c = hitCrossing(L, h, uv);
+  if (yarnCode(fieldR[c], h.fam) >= PULLED_R) { return true; }
+  return ((threadBitsR[c >> 4u] >> (2u * (c & 15u) + h.fam)) & 1u) == 1u;
 }
 
 // A yarn with damage code d is missing at a sample: separated, or (weakened, loosened) frayed through
 // at random fibre positions fs, more often the more it is damaged.
 fn yarnGone(d: u32, fs: u32) -> bool {
-  if (d == CUT_R) { return true; }
+  if (d >= PULLED_R) { return true; }
   let t = f32(d) / 255.0;
   return hashf(fs) < 0.55 * t * t;
 }
 
 @vertex
-fn vsTorn(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  return tornVertex(vi, ii);
+fn vsFine(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  return fineVertex(vi, ii);
 }
 
 @vertex
-fn vsTornShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  var o = tornVertex(vi, ii);
-  if (o.pos.z < -1.0) { return o; }
-  o.pos = F.lightViewProj * vec4<f32>(o.world, 1.0);
-  return o;
-}
-
-// Torn groups cast shadows only where they keep material.
-@fragment
-fn fsTornShadow(in: VOut) {
-  let LR = R.layers[in.layer];
-  let g = cellGrid(LR, in.cell.x, in.cell.y);
-  if (tornLabel(in.torn.w * TORN_STRIDE + TORN_LABELS, gridIndex(g, in.uv.x, in.uv.y)) != in.torn.z) { discard; }
+fn vsFineShadow(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> @builtin(position) vec4<f32> {
+  let o = fineVertex(vi, ii);
+  if (o.pos.z < -1.0) { return o.pos; }
+  return F.lightViewProj * vec4<f32>(o.world, 1.0);
 }
 
 @vertex
@@ -231,9 +277,11 @@ struct Rim {
   ao: f32,
 };
 
-// d: distance to the free edge (mm), dir: unit rest-chart gradient of d, rest: rest point (m),
-// density: separated yarn ends around it (edge field). A few cut yarns fray a little; an opening
-// whose edge is all yarn ends has the full loosened, rolled rim.
+// d: distance to the nearest opening (mm), dir: unit rest-chart gradient of d, rest: rest point (m),
+// density: separated yarn ends around it (edge field). A torn edge is abraded and loosened: its
+// yarns untwist into a dense band of pale fibre (the rim) inside a wider abraded halo, so it reads as
+// a fuzzy pale border, not a cut. A few cut yarns fray a little; an opening whose edge is all yarn
+// ends has the full rim.
 fn rimAt(d: f32, dir: vec2<f32>, rest: vec2<f32>, layer: u32, density: f32) -> Rim {
   var o: Rim;
   if (d >= EDGE_RMAX) {
@@ -244,21 +292,18 @@ fn rimAt(d: f32, dir: vec2<f32>, rest: vec2<f32>, layer: u32, density: f32) -> R
     o.ao = 1.0;
     return o;
   }
-  // the rim's width wanders along the edge: tufted stretches next to nearly bare ones
+  // the loosened band is the yarns beside the cut that lost the crossings holding them: a crossing or
+  // a few wide, wandering along the edge from nearly bare stretches to tufted ones
   let n = 0.65 * noise2(4441u + layer, rest / 0.0065) + 0.35 * noise2(4447u + layer, rest / 0.0022);
   let edge = smoothstep(0.03, 0.22, density);
-  let w = clamp(2.6 + 1.8 * n, 1.0, 4.6) * mix(0.25, 1.0, edge);
+  let w = clamp(1.3 + 1.2 * n, 0.35, 2.6) * mix(0.5, 1.0, edge);
   let x = d / w;
-  o.rim = (1.0 - smoothstep(0.0, 1.0, x)) * mix(0.15, 1.0, edge);
-  o.halo = (1.0 - smoothstep(0.0, EDGE_RMAX, d)) * edge;
-  // the loosened edge rolls up a little: height H x/x0 exp(1 - x/x0), peaking a third into the rim
-  let x0 = 0.32;
-  let H = min(0.28 * w, 1.0);
-  let ex = exp(1.0 - x / x0);
-  o.slope = select(0.0, (H / (w * x0)) * ex * (1.0 - x / x0), x < 4.0) * edge;
+  o.rim = (1.0 - smoothstep(0.0, 1.0, x)) * mix(0.3, 1.0, edge);
+  o.halo = (1.0 - smoothstep(0.0, 6.5, d)) * edge;
+  // a loosened edge does not roll into a lip: its relief is the fibre itself (no normal tilt)
+  o.slope = 0.0;
   o.dir = dir;
-  // the fold where the roll meets the flat cloth is partly shaded; its outer wall is loose, lit fibre
-  o.ao = mix(0.88, 1.0, smoothstep(0.0, 0.22, x)) * mix(1.0, 0.86, exp(-pow((x - 0.75) / 0.25, 2.0)));
+  o.ao = 1.0;
   return o;
 }
 
@@ -273,17 +318,17 @@ fn rimFibres(rest: vec2<f32>, dir: vec2<f32>, layer: u32, pix: f32) -> vec4<f32>
   let tuft = noise2(5009u + layer, rest / 0.6e-3);
   let clump = noise2(5021u + layer, rest / 2.2e-3);
   let blue = 0.5 + 0.5 * noise2(5011u + layer, rest / 1.6e-3);
-  let pale = vec3<f32>(0.36, 0.38, 0.44);
-  let dyed = vec3<f32>(0.12, 0.17, 0.32);
-  let alb = mix(pale, dyed, 0.55 * blue) * (0.88 + 0.22 * (0.6 * streak + 0.4 * tuft) * fine);
-  let cover = clamp(0.72 + 0.25 * clump + 0.35 * (0.65 * streak + 0.35 * tuft) * fine, 0.0, 1.0);
+  // undyed weft and the pale cores of untwisted warp, with some fibre that keeps its indigo
+  let pale = vec3<f32>(0.64, 0.67, 0.73);
+  let dyed = vec3<f32>(0.2, 0.28, 0.5);
+  let alb = mix(pale, dyed, 0.3 * blue) * (0.86 + 0.26 * (0.6 * streak + 0.4 * tuft) * fine);
+  let cover = clamp(0.8 + 0.2 * clump + 0.3 * (0.65 * streak + 0.35 * tuft) * fine, 0.0, 1.0);
   return vec4<f32>(alb, cover);
 }
 
 @fragment
 fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let LR = R.layers[in.layer];
-  let torn = in.torn.x != 0u;
   let rest = restOfUV(LR, in.uv);
   let dx = dpdx(in.uv);
   let dy = dpdy(in.uv);
@@ -327,12 +372,8 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let dist = length(F.camPos.xyz - in.world);
   let pix = F.camPos.w * dist;
   let fy = max(length(dx), length(dy));
-  // yarns near the pixel size: the prefiltered tile shades the weave. Torn groups still evaluate the
-  // exact weave per sample for their coverage, so both kinds of cell share one appearance
-  let intactCell = !torn;
+  // yarns near the pixel size: the prefiltered tile shades the weave
   let lodTile = smoothstep(0.28, 0.55, fy);
-  let lod = select(smoothstep(0.45, 1.1, fy), 0.0, intactCell);
-  var warpTop = 0.0;
 
   let key = keyLight(in.world);
   let sh = shadowFactor(in.world, Nf);
@@ -344,18 +385,11 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let rimAlb = fib.rgb;
   let rimFuzz = 0.9 * rim.rim;
 
-  // torn groups keep only the crossings their yarns connect them to (torn.wgsl)
-  var grid = vec4<u32>(0u, 0u, 1u, 1u);
-  var labelBase = 0u;
-  if (torn) {
-    grid = cellGrid(LR, in.cell.x, in.cell.y);
-    labelBase = in.torn.w * TORN_STRIDE + TORN_LABELS;
-  }
 
   // 4x MSAA standard sample offsets (pixel units, y down); each also jittered over the hairiness
   // radius (~45 um, wider in the loosened rim), which blurs the weave the way loose fibres do
   var offs = array<vec2<f32>, 4>(vec2<f32>(-0.125, -0.375), vec2<f32>(0.375, -0.125), vec2<f32>(-0.375, 0.125), vec2<f32>(0.125, 0.375));
-  let hairy = 45e-6 * (1.0 + 5.0 * rim.rim);
+  let hairy = 45e-6 * (1.0 + 2.5 * rim.rim);
   let fuzzR = vec2<f32>(hairy / (LR.pitch.x * su), hairy / (LR.pitch.y * sv));
   let rotSeed = hash11(u32(in.pos.x) * 7919u + u32(in.pos.y));
   let rot = hashf(rotSeed) * 6.2831853;
@@ -374,11 +408,10 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   var cnt = 0.0;
   var mask = 0u;
   for (var k = 0u; k < 4u; k++) {
-    if (lodTile >= 1.0 && intactCell) { break; }
+    if (lodTile >= 1.0) { break; }
     let ang = rot + f32(k) * 2.39996;
     let jr = sqrt((f32(k) + 0.5) / 4.0);
     let uvk = in.uv + dx * offs[k].x + dy * offs[k].y + vec2<f32>(cos(ang), sin(ang)) * jr * fuzzR;
-    if (torn && tornLabel(labelBase, gridIndex(grid, uvk.x, uvk.y)) != in.torn.z) { continue; }
     let w2 = weave2(LR, uvk.x, uvk.y, su, sv, front, 0.018e-3);
     // the yarn damage field: a separated yarn is gone here (the one below shows, if any), a weakened
     // one is loosened: frayed through in places, pale and fuzzy
@@ -389,15 +422,15 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     if (present) {
       let fs = hash11(rotSeed + 977u * k + 13u);
       let ca = hitDamage(LR, w2.a, uvk);
-      if (yarnGone(ca, fs)) {
-        present = w2.b.covered && hitDamage(LR, w2.b, uvk) != CUT_R;
+      if (yarnGone(ca, fs) || hitAbsent(LR, w2.a, uvk)) {
+        present = w2.b.covered && !hitAbsent(LR, w2.b, uvk);
         hit = w2.b;
         if (!present && w2.a.fam == 1u) {
           // a warp worn through over its pick: the loosened pick spreads into the gap, over its full
           // pitch at rest (stretched cloth still opens between picks)
           let m = round(uvk.y);
           let wh = weftHit(LR, i32(m), uvk.x, uvk.y, su, sv);
-          if (abs(uvk.y - m) * sv < 0.5 && hitDamage(LR, wh, uvk) != CUT_R) {
+          if (abs(uvk.y - m) * sv < 0.5 && !hitAbsent(LR, wh, uvk)) {
             hit = wh;
             hit.x = clamp(hit.x * LR.weft.x / LR.pitch.y, -0.95, 0.95);
             // no longer in the groove under a float: exposed to the light, near the face of the weave
@@ -410,17 +443,11 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
         dmg = select(0.0, f32(hitDamage(LR, hit, uvk)) / 255.0, present);
       } else {
         dmg = f32(ca) / 255.0;
-        if (wb > 0.02 && w2.b.covered && hitDamage(LR, w2.b, uvk) == CUT_R) { wb = 0.0; }
+        if (wb > 0.02 && w2.b.covered && hitAbsent(LR, w2.b, uvk)) { wb = 0.0; }
       }
     }
-    if (present || lod >= 0.99) { mask |= (1u << k); }
+    if (present) { mask |= (1u << k); }
     if (!present) { continue; }
-    warpTop += select(0.0, 1.0, hit.fam == 1u) * (1.0 - wb) + select(0.0, 1.0, w2.b.covered && w2.b.fam == 1u) * wb;
-    // yarns below the pixel: the prefiltered tile shades a torn group, its samples only decide coverage
-    if (lodTile >= 1.0) {
-      cnt += 1.0;
-      continue;
-    }
     let look = yarnLook(LR, in.layer, hit.fam, hit.yarn, hit.float_, hit.along, hit.x, min(1.0, wearF + 0.7 * dmg), pix);
     var albedo = look.albedo;
     var slope = hit.slope;
@@ -470,7 +497,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     // where warps are worn through, the picks beneath them show
     let wfTile0 = select(1.0 - tex.x, tex.x, front);
     let wfTile = wfTile0 * warpP / max(wfTile0 * warpP + (1.0 - wfTile0) * pickP, 1e-3);
-    let wf = select(warpTop / max(cnt, 1.0), wfTile, intactCell || cnt == 0.0);
+    let wf = wfTile;
     let ts = 1.0 - 0.6 * rim.rim;
     let Ny = normalize(Nf - sgn * ts * (tex.z * Tu + tex.w * Tv));
     let kk = i32(round(in.uv.x));
@@ -486,8 +513,8 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let fz = mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak;
     var ct = fiberShade(Ny, Tf, Vv, key.xyz, albedo * mix(0.55, 1.0, ao), fz) * (key.w * sh) + amb * albedo * ao;
     ct = mix(ct, (key.w * sh * max(dot(Nf, key.xyz), 0.0) * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
-    color = select(mix(color, ct, lodTile), ct, cnt == 0.0 || (!intactCell && lodTile >= 1.0));
-    if (intactCell && lodTile >= 1.0) {
+    color = select(mix(color, ct, lodTile), ct, cnt == 0.0);
+    if (lodTile >= 1.0) {
       // coverage of the filtered cloth: holes where both families are gone, dithered over the samples
       let cover = 1.0 - (1.0 - warpP) * (1.0 - pickP);
       mask = 0u;
@@ -495,15 +522,6 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
         if (cover > (f32(k) + hashf(rotSeed + 31u * k)) * 0.25) { mask |= 1u << k; }
       }
     }
-  }
-  if (lod > 0.0) {
-    // filtered appearance once the weave is below the pixel footprint
-    let mw = yarnLook(LR, in.layer, 1u, i32(round(in.uv.x)), 0, in.uv.y * LR.pitch.y, 0.4, wearF, 1.0);
-    let mf = yarnLook(LR, in.layer, 0u, i32(round(in.uv.y)), 0, in.uv.x * LR.pitch.x, 0.4, wearF, 1.0);
-    let albedo = mix(select(mix(mw.albedo, mf.albedo, 0.14), mix(mf.albedo, mw.albedo, 0.25), !front), rimAlb, rimPale);
-    let Tf = select(Tu, Tv, front);
-    let cm = fiberShade(Nf, Tf, Vv, key.xyz, albedo, mw.fuzz + rimFuzz) * (key.w * sh) * 0.85 + amb * albedo * 0.8 * rim.ao;
-    color = mix(color, cm, lod);
   }
   if (mask == 0u) { discard; }
   var o: FsOut;

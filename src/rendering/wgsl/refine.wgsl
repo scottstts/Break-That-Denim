@@ -1,7 +1,7 @@
 // Per-frame geometry preparation from the accepted mechanical state:
 //  - nodeFrame: per-node unit normal and +u / +v tangents from connected yarn neighbours (holes never
 //    bridge; a missing direction completes the frame and an isolated node keeps its last frame),
-//  - classify: per-cell intact flag, compact lists of torn cells and of the spans beside them (threads),
+//  - classify: per-cell flags and the compact list of fine cells (drawn per crossing, surface.wgsl),
 //  - refine: bicubic (Catmull-Rom) surface samples on an S x S grid per cell with exact derivatives,
 //  - args: indirect draw arguments from the list counters.
 
@@ -16,20 +16,10 @@
 @group(0) @binding(9) var<storage, read_write> drawArgs: array<u32>;
 // per node: +u unit tangent with the node's wear in w (static), +v unit tangent
 @group(0) @binding(10) var<storage, read_write> tframe: array<vec4<f32>>;
+// connection fields of nodes near damage (pieces.wgsl): a cell with such a corner is drawn fine
+@group(0) @binding(11) var<storage, read> kappaC: array<u32>;
 
-// lists layout: [0] thread span count, [1] unused, [2] torn cell count, [3] unused, then thread
-// spans at SPAN_BASE, an unused region of MAX_TAILS entries, torn cells after it
-const SPAN_BASE: u32 = 4u;
-override MAX_SPANS: u32 = 65536u;
-override MAX_TAILS: u32 = 65536u;
-override MAX_TORN: u32 = 16384u;
-override TORN_VERTS: u32 = 96u;
-override TAIL_VERTS: u32 = 14u;
-override FUZZ_VERTS: u32 = 14u;
-override FUZZ_PER_TAIL: u32 = 6u;
-override STRAND_VERTS: u32 = 18u;
-// Instances per loose bundle span: up to MAX_STRANDS threads, each drawn in two halves.
-const BUNDLE_INSTANCES: u32 = 18u;
+// lists layout: [2] fine cell count, then the fine cells from FINE_BASE (render_common.wgsl)
 
 // Node still in the scene (retired debris, x.w = 2, is not drawn).
 fn live(n: u32) -> bool { return x[n].w < 1.5; }
@@ -43,8 +33,6 @@ fn segOk(owner: u32, f: u32) -> bool {
 
 fn layerOf(n: u32) -> u32 { return nodes[n].ijl >> 24u; }
 
-// Bundled yarns of span (owner, f) that are absent or separated (bit k = yarn k).
-fn yarnMask(owner: u32, f: u32) -> u32 { return min(segw[2u * (2u * owner + f)].w, 0xFu); }
 fn nodeI(n: u32) -> i32 { return i32(nodes[n].ijl & 0xFFFu); }
 fn nodeJ(n: u32) -> i32 { return i32((nodes[n].ijl >> 12u) & 0xFFFu); }
 
@@ -104,7 +92,9 @@ fn cellOf(layer: u32, ci: u32, cj: u32) -> u32 {
   return L.refine.z + cj * (L.lattice.y - 1u) + ci;
 }
 
-// Per cell (lower-left node): 1 if all four spans carry material.
+// Per cell (lower-left node): bit 0 = drawn as intact surface, bit 1 = all four spans carry material.
+// A cell is drawn fine (per crossing) when a span of it no longer carries material or a corner of it
+// has a connection field (material near it is cut off from it somewhere).
 @compute @workgroup_size(128)
 fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
@@ -114,81 +104,44 @@ fn classifyCells(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = u32(nodeI(n));
   let j = u32(nodeJ(n));
   if (i + 1u >= L.y || j + 1u >= L.z) { return; }
-  // bit 0: the cell is drawn as surface (all four spans carry material); bits 8..23: yarn masks of
-  // its left / right warp spans and bottom / top pick spans (yarns gone from the woven surface)
-  var flags = 0u;
   let cell = cellOf(l, i, j);
-  if (segOk(n, 0u) && segOk(n, 1u) && segOk(n + 1u, 1u) && segOk(n + L.y, 0u)) {
-    flags = 1u | (yarnMask(n, 1u) << 8u) | (yarnMask(n + 1u, 1u) << 12u) | (yarnMask(n, 0u) << 16u) | (yarnMask(n + L.y, 0u) << 20u);
+  let spans = segOk(n, 0u) && segOk(n, 1u) && segOk(n + 1u, 1u) && segOk(n + L.y, 0u);
+  let cut = kappaC[KAPPA_TABLE + n] != KAPPA_NONE || kappaC[KAPPA_TABLE + n + 1u] != KAPPA_NONE || kappaC[KAPPA_TABLE + n + L.y] != KAPPA_NONE || kappaC[KAPPA_TABLE + n + L.y + 1u] != KAPPA_NONE;
+  var flags = select(0u, 2u, spans);
+  if (spans && !cut) {
+    flags |= 1u;
   } else if (live(n) || live(n + 1u) || live(n + L.y) || live(n + L.y + 1u)) {
-    // torn: each live corner draws its own quarter of the cell (surface.wgsl vsTorn)
     let k = atomicAdd(&lists[2], 1u);
-    if (k < MAX_TORN) { atomicStore(&lists[SPAN_BASE + MAX_SPANS + MAX_TAILS + k], cell); }
+    if (k < MAX_FINE) { atomicStore(&lists[FINE_BASE + k], cell); }
   }
   cellFlags[cell] = flags;
 }
 
-// Spans beside a torn cell are listed for the thread pass (yarn_geom.wgsl): there, a yarn whose
-// crossing yarns have separated runs on alone, outside the woven cloth the cell draws.
-@compute @workgroup_size(128)
-fn classifySpans(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let n = gid.x;
-  if (n >= R.counts.x || !live(n)) { return; }
-  let l = layerOf(n);
-  let L = R.layers[l].lattice;
-  let i = u32(nodeI(n));
-  let j = u32(nodeJ(n));
-  for (var f = 0u; f < 2u; f++) {
-    let inside = select(j + 1u < L.z, i + 1u < L.y, f == 0u);
-    if (!inside || (segw[2u * (2u * n + f) + 1u].y & SEG_EXISTS_R) == 0u) { continue; }
-    if (!live(n + select(L.y, 1u, f == 0u))) { continue; }
-    // the cells on either side of the span
-    var torn = false;
-    if (f == 0u) {
-      if (j > 0u) { torn = torn || cellFlags[cellOf(l, i, j - 1u)] == 0u; }
-      if (j + 1u < L.z) { torn = torn || cellFlags[cellOf(l, i, j)] == 0u; }
-    } else {
-      if (i > 0u) { torn = torn || cellFlags[cellOf(l, i - 1u, j)] == 0u; }
-      if (i + 1u < L.y) { torn = torn || cellFlags[cellOf(l, i, j)] == 0u; }
-    }
-    if (!torn) { continue; }
-    let k = atomicAdd(&lists[0], 1u);
-    if (k < MAX_SPANS) { atomicStore(&lists[SPAN_BASE + k], 2u * n + f); }
-  }
-}
-
-// Indirect arguments: draws [threads, unused, edge fibres, thread fibres, torn groups] x (vertexCount,
-// instanceCount, 0, 0), then the torn-geometry dispatch (x, y, z).
+// Indirect arguments: draws [unused, unused, unused, unused, fine cells] x (vertexCount,
+// instanceCount, 0, 0). Loose threads and edge fibres have their own (threads.wgsl, pieces.wgsl).
 @compute @workgroup_size(1)
 fn args() {
-  let torn = min(atomicLoad(&lists[2]), MAX_TORN);
-  let bundles = min(atomicLoad(&lists[0]), MAX_SPANS);
-  // instances per tail: the larger bundle (extra instances of the smaller family are empty)
-  let b = bundleMax(R.layers[0]);
-  drawArgs[0] = STRAND_VERTS;
-  drawArgs[1] = bundles * BUNDLE_INSTANCES;
+  let fine = min(atomicLoad(&lists[2]), MAX_FINE);
+  drawArgs[0] = 0u;
+  drawArgs[1] = 0u;
   drawArgs[2] = 0u;
   drawArgs[3] = 0u;
   drawArgs[4] = 0u;
   drawArgs[5] = 0u;
   drawArgs[6] = 0u;
   drawArgs[7] = 0u;
-  drawArgs[8] = FUZZ_VERTS;
-  drawArgs[9] = torn * FIBERS_PER_CELL;
+  drawArgs[8] = 0u;
+  drawArgs[9] = 0u;
   drawArgs[10] = 0u;
   drawArgs[11] = 0u;
-  drawArgs[12] = FUZZ_VERTS;
-  drawArgs[13] = bundles * BUNDLE_INSTANCES * FUZZ_PER_TAIL;
+  drawArgs[12] = 0u;
+  drawArgs[13] = 0u;
   drawArgs[14] = 0u;
   drawArgs[15] = 0u;
-  drawArgs[16] = TORN_VERTS;
-  drawArgs[17] = torn * 4u;
+  drawArgs[16] = 6u * FINE_QK * FINE_QM;
+  drawArgs[17] = fine;
   drawArgs[18] = 0u;
   drawArgs[19] = 0u;
-  drawArgs[20] = (torn * 4u + 127u) / 128u;
-  drawArgs[21] = 1u;
-  drawArgs[22] = 1u;
-  drawArgs[23] = 0u;
 }
 
 // ---------------------------------------------------------------- bicubic surface samples
@@ -259,17 +212,17 @@ fn refine(@builtin(global_invocation_id) gid: vec3<u32>) {
   let J = rl / rnx;
   var ci = min(I / S, L.y - 2u);
   var cj = min(J / S, L.z - 2u);
-  // a vertex on a cell boundary is shared by its neighbours: take its tangents from a neighbour drawn
-  // as surface, never from a torn cell's net (its far corners may have separated, which would tilt
+  // a vertex on a cell boundary is shared by its neighbours: take its tangents from a neighbour whose
+  // spans all hold, never from a torn cell's net (its far corners may have separated, which would tilt
   // the boundary normals of the intact cell beside it past the vertical)
-  if (cellFlags[cellOf(l, ci, cj)] == 0u) {
+  if ((cellFlags[cellOf(l, ci, cj)] & 2u) == 0u) {
     let onI = I == ci * S && ci > 0u;
     let onJ = J == cj * S && cj > 0u;
-    if (onI && cellFlags[cellOf(l, ci - 1u, cj)] != 0u) {
+    if (onI && (cellFlags[cellOf(l, ci - 1u, cj)] & 2u) != 0u) {
       ci -= 1u;
-    } else if (onJ && cellFlags[cellOf(l, ci, cj - 1u)] != 0u) {
+    } else if (onJ && (cellFlags[cellOf(l, ci, cj - 1u)] & 2u) != 0u) {
       cj -= 1u;
-    } else if (onI && onJ && cellFlags[cellOf(l, ci - 1u, cj - 1u)] != 0u) {
+    } else if (onI && onJ && (cellFlags[cellOf(l, ci - 1u, cj - 1u)] & 2u) != 0u) {
       ci -= 1u;
       cj -= 1u;
     }

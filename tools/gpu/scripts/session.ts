@@ -167,6 +167,50 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: 0.6 },
   ],
+  // a user opening the worn cells one by one: a pinch at each cell's core pulled outward from the
+  // cluster (mostly in plane, slightly lifted), released, then a pull at the cluster's middle
+  cells: [
+    { grab: [-0.0026, 0.0138] },
+    { to: [-0.004, 0.014, 0.008], t: 0.9 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.0088, -0.0048] },
+    { to: [-0.014, -0.006, 0.008], t: 0.9 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.0182, -0.0043] },
+    { to: [0.014, -0.004, 0.008], t: 0.9 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [0.0005, 0.0033] },
+    { to: [0.01, -0.012, 0.006], t: 0.9 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.0078, 0.0307] },
+    { to: [-0.004, 0.012, 0.006], t: 0.9 },
+    { release: true },
+    { wait: 0.3 },
+    { grab: [-0.0203, 0.0095] },
+    { to: [-0.012, 0.0, 0.006], t: 0.9 },
+    { release: true },
+    { wait: 1.0 },
+  ],
+  // a hard drag through the worn zone, released, then left to settle for a long time (restlessness)
+  settle: [
+    { grab: [0.003, -0.002] },
+    { to: [0.0, 0.035, 0.012], t: 0.7 },
+    { to: [0.01, 0.05, 0.02], t: 0.4 },
+    { release: true },
+    { wait: Number(process.env.WAIT ?? 3) },
+  ],
+  // a long, hard drag that rips a large hole with hanging flaps, then a long settle
+  rip: [
+    { grab: [0.003, -0.002] },
+    { to: [0.0, 0.03, 0.01], t: 0.5 },
+    { to: [0.0, 0.07, 0.02], t: 0.6 },
+    { release: true },
+    { wait: Number(process.env.WAIT ?? 4) },
+  ],
   intact: [
     { grab: [-0.035, 0.03] },
     { to: [-0.03, 0.0, 0.015], t: 0.8 },
@@ -206,6 +250,9 @@ export default async function main(args: string[]): Promise<void> {
   const renderer = new Renderer(device, format, solver, scene);
   renderer.resize(W, Hh);
   const tex = device.createTexture({ size: [W, Hh], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  const snaps = (process.env.SNAPS ?? '').split(',').filter((q) => q.length > 0).map(Number).sort((a, b) => a - b);
+  const [snapW, snapH] = (process.env.SNAPSIZE ?? '1320x1624').split('x').map(Number);
+  const snapTex = device.createTexture({ size: [snapW, snapH], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
   const h = solver.params.h;
   const perFrame = Math.round(H_FRAME / h);
   const x0 = new Float32Array(await readBuffer(device, solver.x));
@@ -341,11 +388,40 @@ export default async function main(args: string[]): Promise<void> {
     const line = `t=${t.toFixed(2)} rupt=${c[0]} pull=${c[1]} freed=${topology?.freedCount ?? 0} vmax=${new Float32Array(c.buffer)[2].toFixed(3)} maxDisp=${(maxDisp * 1e3).toFixed(1)}mm far=${far} nonfinite=${bad} gatedNodes=${gated}`;
     log.push(line);
     if (frame % every === 0 || bad > 0) console.log(line);
-    if (frame % every === 0) {
+    {
+      // every frame is rendered (the loose threads' dynamics advance with the presented frames, as in
+      // the product); every `every`-th is captured
       const enc = device.createCommandEncoder();
       renderer.encode(enc, { ...DEFAULT_CAMERA, ...(JSON.parse(process.env.CAMERA ?? "{}") as object) }, t, tex.createView());
       device.queue.submit([enc.finish()]);
-      tiles.push(await pixels(device, tex));
+    }
+    if (snaps.length > 0 && t >= snaps[0] - 1e-6) {
+      // SNAPS='1.2,3.4': full-size stills at those times (SNAPSIZE, SNAPCAMERA; reference framing by
+      // default), e.g. the cloth while a pull is held
+      const st = snaps.shift()!;
+      renderer.resize(snapW, snapH);
+      const enc = device.createCommandEncoder();
+      renderer.encode(enc, { ...DEFAULT_CAMERA, distance: 1.086, ...(JSON.parse(process.env.SNAPCAMERA ?? '{}') as object) }, t, snapTex.createView());
+      device.queue.submit([enc.finish()]);
+      writeFileSync(resolve(CAPTURES, `${name}-t${st}.png`), encodePng(snapW, snapH, await pixels(device, snapTex)));
+      renderer.resize(W, Hh);
+    }
+    if (frame % every === 0) {
+      const px = await pixels(device, tex);
+      if (process.env.MOTION && tiles.length > 0) {
+        // image change since the previous rendered frame: mean absolute difference and the fraction
+        // of pixels that changed visibly (restlessness of the presented image, independent of KE)
+        const prev = tiles[tiles.length - 1];
+        let sum = 0;
+        let moved = 0;
+        for (let q = 0; q < px.length; q += 4) {
+          const d = Math.abs(px[q] - prev[q]) + Math.abs(px[q + 1] - prev[q + 1]) + Math.abs(px[q + 2] - prev[q + 2]);
+          sum += d;
+          if (d > 24) moved++;
+        }
+        console.log(`  MOTION t=${t.toFixed(2)} meanAbs=${(sum / (px.length / 4)).toFixed(3)} changed=${((100 * moved) / (px.length / 4)).toFixed(3)}%`);
+      }
+      tiles.push(px);
       labels.push(t.toFixed(2));
     }
     frame++;
@@ -464,6 +540,43 @@ export default async function main(args: string[]): Promise<void> {
     await rd.mapAsync(GPUMapMode.READ);
     const tq = new BigUint64Array(rd.getMappedRange().slice(0));
     console.log('RENDER ' + ['prep', 'shadow', 'main', 'post'].map((nm, k) => `${nm} ${(Number(tq[2 * k + 1] - tq[2 * k]) / 1e6).toFixed(2)} ms`).join(', '));
+  }
+  if (process.env.RESTLESS) {
+    // nodes still moving at the end: where they are, how they are attached (degree, and the size of
+    // the cloth piece reachable from them within 12 spans)
+    const xs = new Float32Array(await readBuffer(device, solver.x));
+    const v = new Float32Array(await readBuffer(device, solver.v));
+    const sg = new Uint32Array(await readBuffer(device, solver.segs));
+    const L = scene.layers[0];
+    const act = (q: number) => (sg[8 * q + 5] & 3) === 1;
+    const nbrs = (n: number) => {
+      const i = n % L.nx;
+      const j = Math.floor(n / L.nx);
+      const o: number[] = [];
+      if (i < L.nx - 1 && act(2 * n)) o.push(n + 1);
+      if (i > 0 && act(2 * (n - 1))) o.push(n - 1);
+      if (j < L.ny - 1 && act(2 * n + 1)) o.push(n + L.nx);
+      if (j > 0 && act(2 * (n - L.nx) + 1)) o.push(n - L.nx);
+      return o.filter((m) => xs[4 * m + 3] < 0.5);
+    };
+    const fast: string[] = [];
+    let count = 0;
+    for (let n = 0; n < N; n++) {
+      if (xs[4 * n + 3] > 0.5) continue;
+      const sp = Math.hypot(v[4 * n], v[4 * n + 1], v[4 * n + 2]);
+      if (sp < 0.01) continue;
+      count++;
+      if (fast.length >= 12) continue;
+      const seen = new Set([n]);
+      let front = [n];
+      for (let d = 0; d < 12 && front.length; d++) {
+        const nf: number[] = [];
+        for (const a of front) for (const b of nbrs(a)) if (!seen.has(b)) { seen.add(b); nf.push(b); }
+        front = nf;
+      }
+      fast.push(`(${n % L.nx},${Math.floor(n / L.nx)}) v=${(sp * 100).toFixed(1)}cm/s deg=${nbrs(n).length} reach12=${seen.size}`);
+    }
+    console.log(`RESTLESS ${count} nodes above 1 cm/s`, fast);
   }
   const finalRuptures = new Uint32Array(await readBuffer(device, solver.counters, 16))[0];
   if (cutBox) {

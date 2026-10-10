@@ -36,6 +36,8 @@ struct LayerR {
   edge: vec4<f32>,
   // yarn damage field: first crossing, warps K, picks M, unused
   field: vec4<u32>,
+  // loose (freed, round) yarn radius of a pick and of a warp (m), unused, unused
+  loose: vec4<f32>,
 };
 
 struct RenderU {
@@ -189,78 +191,11 @@ fn weftHit(L: LayerR, m: i32, U: f32, V: f32, su: f32, sv: f32) -> Hit {
   return o;
 }
 
-// ---------------------------------------------------------------- torn cells: yarn-level ownership
-//
-// A torn cell has crossing edges: spans that no longer join two live corners (separated, or leading
-// to debris that fell away) and still have a live end. Its live corners split into groups joined by
-// intact spans (the lattice's coarse topology). Which yarns each group carries is decided at the
-// yarn level from the damage field: the cell's crossings are flooded from each group's corners through
-// uncut yarn segments (a warp links a crossing to the next pick, a pick to the next warp), so the
-// boundary between groups runs exactly where the yarns separated, at the real yarn pitch and in any
-// direction. Only woven crossings (both yarns present) are flooded, plus two crossings of yarn end
-// beyond them; a yarn running on alone is a thread (yarn_geom.wgsl), and material no group reaches
-// has fallen away. Each group draws the whole cell on its own control net and keeps its
-// crossings, so a separating group carries its yarns away with it.
-//
-// Positions k = 0..3 run counter-clockwise over the corners (ccwCorner); edge k joins positions k and
-// k + 1: 0 bottom (c0-c1), 1 right (c1-c3), 2 top (c3-c2), 3 left (c2-c0).
+// ---------------------------------------------------------------- lattice cells at yarn resolution
 
-// tornGeo record per torn cell (torn.wgsl): info (cell, cm, unused, layer as bits); crossing labels
-// (TORN_LABELS: 4 vec4 = 128 4-bit labels, the leader corner of the owning group or 0xF); then per
-// corner a 16-point control net (w < 0: the corner does not lead a group).
-const TORN_STRIDE: u32 = 69u;
-const TORN_LABELS: u32 = 1u;
-fn tornSlot(k: u32, c: u32) -> u32 { return k * TORN_STRIDE + 5u + 16u * c; }
-// Crossings of a cell's label grid: at most 16 columns x 8 rows.
+// Crossings of a cell's grid at most (columns x rows); cells near damage are drawn per crossing.
 const CELL_MAX_K: u32 = 16u;
 const CELL_MAX_M: u32 = 8u;
-const NO_LABEL: u32 = 0xFu;
-// Edge fibres rooted along the free edges of one torn cell (fuzz.wgsl).
-const FIBERS_PER_CELL: u32 = 96u;
-
-fn tornInfo(geo: vec4<f32>) -> vec4<u32> { return bitcast<vec4<u32>>(geo); }
-
-// Cell meta word: crossing edges (bits 0-3), dead corners (4-7, by corner index).
-fn makeMeta(mask: u32, dead: u32) -> u32 { return mask | (dead << 4u); }
-fn metaMask(m: u32) -> u32 { return m & 0xFu; }
-fn metaDead(m: u32) -> u32 { return (m >> 4u) & 0xFu; }
-
-// Corner index (bit 0: +i, bit 1: +j) at counter-clockwise position k (an involution: it also maps a
-// corner index to its position).
-fn ccwCorner(k: u32) -> u32 { return (k & 3u) ^ ((k & 3u) >> 1u); }
-
-// Span (2 * owner + family) of edge e of the cell whose lower-left node is n00, in a lattice of row
-// length nx.
-fn edgeSpan(n00: u32, nx: u32, e: u32) -> u32 {
-  switch e {
-    case 0u: { return 2u * n00; }
-    case 1u: { return 2u * (n00 + 1u) + 1u; }
-    case 2u: { return 2u * (n00 + nx); }
-    default: { return 2u * n00 + 1u; }
-  }
-}
-
-// Group of the corner at counter-clockwise position k: the crossing edges entering (a) and leaving (b)
-// its run of corners, packed a | b << 2. With fewer than two crossing edges the cell is one group.
-fn groupOf(mask: u32, k: u32) -> u32 {
-  var a = (k + 3u) & 3u;
-  for (var q = 0u; q < 4u; q++) {
-    if (((mask >> a) & 1u) == 1u) { break; }
-    a = (a + 3u) & 3u;
-  }
-  var b = k & 3u;
-  for (var q = 0u; q < 4u; q++) {
-    if (((mask >> b) & 1u) == 1u) { break; }
-    b = (b + 1u) & 3u;
-  }
-  return a | (b << 2u);
-}
-
-// The group's leader: its first corner counter-clockwise, which draws the group.
-fn groupLeader(mask: u32, g: u32) -> u32 {
-  if (countOneBits(mask) < 2u) { return 0u; }
-  return ccwCorner((g & 3u) + 1u);
-}
 
 // Crossing grid of cell (ci, cj): first warp and pick (fine indices) and the counts inside the cell
 // (crossings on its edge lines included).
@@ -276,29 +211,40 @@ fn cellGrid(L: LayerR, ci: u32, cj: u32) -> vec4<u32> {
   return vec4<u32>(k0, m0, nk, nm);
 }
 
-// Label of crossing idx from the label vec4 holding it (tornGeo[base + TORN_LABELS + idx / 32]).
-fn labelIn(words: vec4<u32>, idx: u32) -> u32 { return (words[(idx >> 3u) & 3u] >> (4u * (idx & 7u))) & 0xFu; }
-
-// Index of the crossing of fine point (U, V) in cell grid g (nearest, clamped into the cell).
-fn gridIndex(g: vec4<u32>, U: f32, V: f32) -> u32 {
-  let kc = u32(clamp(i32(round(U)) - i32(g.x), 0, i32(g.z) - 1));
-  let mc = u32(clamp(i32(round(V)) - i32(g.y), 0, i32(g.w) - 1));
-  return mc * CELL_MAX_K + kc;
-}
-
 // ---------------------------------------------------------------- yarn damage field and edge field
 //
 // The yarn damage field (simulation/yarnField.ts) holds per crossing the damage code of its pick (bits
-// 0-7) and warp (bits 8-15) segment, 255 = separated. The edge field is a texture at crossing
+// 0-7) and warp (bits 8-15) segment, 255 = cut, 254 = pulled out of the weave (yarnField.ts). The edge field is a texture at crossing
 // resolution over each layer's field (layers stacked vertically, LayerR.edge): r = distance (mm) to the
-// nearest crossing with a separated yarn (EDGE_RMAX beyond), g / b = intact fraction of the warp / pick
-// there, a = density of separated yarn segments around it (how much of an edge it is). edgefield.wgsl rebuilds it whenever new yarns separated. The torn rim, its fringe and the
+// nearest opening, a crossing where neither yarn is part of the cloth (EDGE_RMAX beyond), g / b =
+// intact fraction of the warp / pick there (0 for a yarn drawn as a loose thread), a = density of separated yarn segments around it (how much of an edge it is). edgefield.wgsl rebuilds it whenever new yarns separated. The torn rim, its fringe and the
 // abraded halo are material features at a distance from the free edge, so they follow it smoothly;
 // g and b let a weave below the pixel footprint still lose its worn-through yarns.
+
+// Loose threads (threads.wgsl): runs of at least MIN_RUN lone crossings, drawn in chunks of CHUNK
+// crossings (THREAD_VERTS: two per centre-line sample, two samples per crossing) with
+// FIBERS_PER_CHUNK fibres each (FIBER_VERTS vertices).
+const MIN_RUN: u32 = 4u;
+const CHUNK: u32 = 8u;
+const THREAD_VERTS: u32 = 34u;
+const FIBERS_PER_CHUNK: u32 = 12u;
+const FIBER_VERTS: u32 = 14u;
+// vec4 per run of the per-frame thread geometry (thread_prep.wgsl)
+const RUN_GEO: u32 = 7u;
+
+// The material at crossing c belongs to a falling piece: bit c of the debris region of the thread bits
+// (threads.wgsl), which starts after the 2-bit-per-crossing region of fieldTotal crossings.
+fn debrisWord(c: u32, fieldTotal: u32) -> u32 { return (fieldTotal + 15u) / 16u + (c >> 5u); }
+
+// Crossings of all layers' yarn fields, from the last layer.
+fn fieldTotalOf(last: LayerR) -> u32 { return last.field.x + last.field.y * last.field.z; }
 
 // Largest stored distance (mm); everything beyond is intact cloth.
 const EDGE_RMAX: f32 = 7.0;
 const CUT_R: u32 = 255u;
+// pulled out of the weave at the crossing: the end has slid back toward where the yarn is held, so
+// the crossing no longer has this yarn (drawn like a cut, yarnField.ts DAMAGE_PULLED)
+const PULLED_R: u32 = 254u;
 
 fn fieldIndexR(L: LayerR, k: u32, m: u32) -> u32 { return L.field.x + m * L.field.y + k; }
 fn yarnCode(word: u32, fam: u32) -> u32 { return (word >> (8u * fam)) & 0xFFu; }
@@ -408,7 +354,7 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
   let fiberRnd = hash2f(seedY * 31u + 7u, fiberIdx);
   if (fam == 1u) {
     // per-yarn dye depth, slubs along the yarn (mm to cm scale) and per-float variation
-    let yarnDye = 0.92 + 0.16 * hash2f(seedY, 3u);
+    let yarnDye = 0.95 + 0.1 * hash2f(seedY, 3u);
     let slub = 0.6 * noise1(seedY + 11u, along / 0.0035) + 0.4 * noise1(seedY + 23u, along / 0.014);
     let floatV = hash2f(seedY ^ 0x5bd1e995u, bitcast<u32>(float_));
     // sub-millimetre streaks along the yarn: twist irregularity exposes more or less undyed fibre
@@ -424,12 +370,15 @@ fn yarnLook(L: LayerR, layerIdx: u32, fam: u32, yarn: i32, float_: i32, along: f
     let pc = vec2<f32>(f32(yarn) * L.pitch.x + across, along);
     let m1 = noise2(977u + layerIdx, pc / 0.4e-3) * clamp(1.5 - pix / 0.4e-3, 0.0, 1.0);
     let m2 = noise2(1913u + layerIdx, pc / vec2<f32>(0.55e-3, 3.0e-3)) * clamp(1.5 - pix / 0.55e-3, 0.0, 1.0);
-    let mottle = 0.3 * m1 + 0.7 * m2;
+    let mottle = 0.55 * m1 + 0.3 * m2;
     // mean fraction of undyed fibre showing on the surface; individual fibres alternate around it
     let paleMean = clamp(0.12 + 0.45 * (1.0 - min(dye, 1.0)) + 0.06 * streak + 0.1 * mottle, 0.0, 1.0);
     let paleFiber = select(0.0, 1.0, fiberRnd < paleMean);
     let paleFrac = mix(paleMean, paleFiber, fiberVis * 0.2);
-    o.albedo = mix(deep * (0.75 + 0.5 * min(dye, 1.2)), pale, paleFrac);
+    // floats differ from one another (twist, hairiness, how far they stand out): the face of the
+    // twill reads as a pebbly run of separate floats along each wale, not a printed stripe
+    let floatB = 0.78 + 0.44 * floatV;
+    o.albedo = mix(deep * (0.75 + 0.5 * min(dye, 1.2)), pale, paleFrac) * floatB;
     o.fuzz = 0.25 + 0.6 * wear;
   } else {
     let v = 0.85 + 0.2 * hash2f(seedY, 5u) + 0.08 * noise1(seedY + 3u, along / 0.004);
