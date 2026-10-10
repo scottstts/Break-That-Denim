@@ -294,6 +294,7 @@ export default async function main(args: string[]): Promise<void> {
   let lastX = x0;
   let grabbed = -1;
   let grabT = 0;
+  let slipFor = 0;
   let cutBox: number[] | null = null;
 
   const runFrame = async (goal: [number, number, number] | null) => {
@@ -323,6 +324,20 @@ export default async function main(args: string[]): Promise<void> {
     }
     await drain(device);
     t += perFrame * h;
+    // the product's grip slip (worker.ts SLIP_EXCESS / SLIP_TIME): pulled 4 cm beyond what the bounded grip
+    // force can make the cloth follow for 0.2 s, the cloth slips out of the fingers
+    if (handle && !process.env.NOSLIP) {
+      const excess = await interaction.gripExcess();
+      if (excess !== null && excess >= 0.04) {
+        slipFor += perFrame * h;
+        if (slipFor >= 0.3) {
+          console.log(`  slip at t=${(t + perFrame * h).toFixed(2)}`);
+          interaction.release();
+          handle = null;
+          slipFor = 0;
+        }
+      } else slipFor = 0;
+    }
     const xs = new Float32Array(await readBuffer(device, solver.x));
     const v = new Float32Array(await readBuffer(device, solver.v));
     const c = new Uint32Array(await readBuffer(device, solver.counters, 64));

@@ -37,8 +37,8 @@ const MAX_DRAG_LIFT = 0.05;
  * follow (the requested handle beyond SLIP_EXCESS of the force cap's reach for SLIP_TIME), the cloth
  * slips out of the fingers and the grip is lost, as with a hand pulling taut, strong cloth.
  */
-const SLIP_EXCESS = 0.025;
-const SLIP_TIME = 0.2;
+const SLIP_EXCESS = 0.04;
+const SLIP_TIME = 0.3;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
 const REST_SPEED = 0.003;
 const REST_TIME = 0.4;

@@ -36,7 +36,7 @@ export default async function main(args: string[]): Promise<void> {
   }
   const p0: [number, number, number] = [x0[4 * picked], x0[4 * picked + 1], x0[4 * picked + 2]];
   for (const name of args) {
-    const cfg = { ...GPU_DEFAULTS, ...config(name) };
+    const cfg = { ...GPU_DEFAULTS, ...config(name), ...(name === "conv" ? {} : (JSON.parse(process.env.SOLVER ?? "{}") as object)) };
     const h = cfg.h;
     const per = Math.round(0.05 / h);
     const solver = new GpuSolver(device, scene, cfg);
