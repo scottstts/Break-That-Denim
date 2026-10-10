@@ -3,6 +3,7 @@ import { readBuffer } from '../gpu/util';
 import { DEFAULT_CAMERA, Renderer, cameraMatrices, type CameraState } from '../rendering/renderer';
 import { add, dot, normalize, scale, sub, transformPoint, type Vec3 } from '../rendering/math';
 import { Interaction } from '../simulation/gpu/interaction';
+import { GRIP, pinchScale } from '../simulation/grip';
 import { GPU_DEFAULTS, GpuSolver } from '../simulation/gpu/solver';
 import { loadDrape, settleDrape } from '../simulation/gpu/settle';
 import { Topology } from '../simulation/gpu/topology';
@@ -25,6 +26,19 @@ const SIM_FRAME_INTERVAL = 1 / 30 - 0.002;
 /** Grip handle: maximum speed (m/s) and engagement lift toward the camera (m). */
 const HANDLE_MAX_SPEED = 2.5;
 const ENGAGE_LIFT = 0.002;
+/**
+ * A hand that pinches cloth lifts what it pulls: the handle rises toward the viewer by this fraction of
+ * its drag from the grab point, up to MAX_DRAG_LIFT (the wheel adds or removes depth on top).
+ */
+const LIFT_PER_DRAG = 0.35;
+const MAX_DRAG_LIFT = 0.05;
+/**
+ * A pinch holds the cloth by friction: pulled further than its bounded force can make the cloth
+ * follow (the requested handle beyond SLIP_EXCESS of the force cap's reach for SLIP_TIME), the cloth
+ * slips out of the fingers and the grip is lost, as with a hand pulling taut, strong cloth.
+ */
+const SLIP_EXCESS = 0.025;
+const SLIP_TIME = 0.2;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
 const REST_SPEED = 0.003;
 const REST_TIME = 0.4;
@@ -37,6 +51,8 @@ interface GripState {
   target: Vec3;
   depth: number;
   engageTime: number;
+  /** Since when the pull has exceeded what the grip can hold (ms), or null. */
+  slipSince: number | null;
 }
 
 class Engine {
@@ -221,7 +237,7 @@ class Engine {
     if (token !== this.pickToken || !this.pointerDown || !hit) return;
     const forward = normalize(sub(this.camera.target, m.eye));
     const p = hit.position as Vec3;
-    this.grip = { node: hit.node, plane: p, normal: forward, handle: p, target: p, depth: 0, engageTime: performance.now() };
+    this.grip = { node: hit.node, plane: p, normal: forward, handle: p, target: p, depth: 0, engageTime: performance.now(), slipSince: null };
     this.interaction.attach(hit.node, p);
     this.wake();
     send({ type: 'cursor', cursor: 'grabbing' });
@@ -261,14 +277,35 @@ class Engine {
   private stepHandle(h: number): void {
     const g = this.grip;
     if (!g) return;
-    const engage = Math.min(1, (performance.now() - g.engageTime) / 150);
-    const lift = -(ENGAGE_LIFT * engage + g.depth);
+    const since = (performance.now() - g.engageTime) / 1000;
+    const engage = Math.min(1, since / GRIP.engageTime);
+    const drag = Math.hypot(g.target[0] - g.plane[0], g.target[1] - g.plane[1], g.target[2] - g.plane[2]);
+    const lift = -(ENGAGE_LIFT * engage + Math.min(MAX_DRAG_LIFT, LIFT_PER_DRAG * drag) + g.depth);
     const goal = add(g.target, scale(g.normal, lift));
+    this.interaction.setPinch(pinchScale(since));
     const d = sub(goal, g.handle);
     const len = Math.hypot(d[0], d[1], d[2]);
     const maxStep = HANDLE_MAX_SPEED * h;
     g.handle = len <= maxStep ? goal : add(g.handle, scale(d, maxStep / len));
     this.interaction.setTarget(g.handle);
+  }
+
+  /** Lose the grip if the pull has exceeded what it can hold for SLIP_TIME (SLIP_EXCESS). */
+  private probeSlip(now: number): void {
+    const g = this.grip;
+    if (!g) return;
+    void this.interaction.gripExcess().then((excess) => {
+      if (excess === null || this.grip !== g) return;
+      if (excess < SLIP_EXCESS) {
+        g.slipSince = null;
+        return;
+      }
+      g.slipSince ??= now;
+      if ((now - g.slipSince) / 1000 >= SLIP_TIME) {
+        this.pickToken++;
+        this.endGrip();
+      }
+    });
   }
 
   /** Asynchronously read the largest nodal speed since the last probe (rest detection). */
@@ -337,6 +374,7 @@ class Engine {
       this.device.queue.submit([se.finish()]);
     }
     if (steps > 0) this.probeRest(steps);
+    if (steps > 0 && this.grip) this.probeSlip(now);
     this.substepsDone += steps;
     const enc = this.device.createCommandEncoder({ label: 'frame' });
     this.renderer.encode(enc, this.camera, now / 1000, this.context.getCurrentTexture().createView());

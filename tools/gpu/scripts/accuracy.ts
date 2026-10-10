@@ -13,10 +13,12 @@ import { settledSolver } from './render';
 
 function config(name: string): Partial<GpuSolverParams> {
   if (name === 'conv') return { newtonIterations: 6, newtonMax: 6, pcgIterations: 4, maxCoarsestNodes: 48, coarseSweeps: 6 };
-  const m = /^(\d)x(\d)(-lean)?(@240|@60|@80)?$/.exec(name);
+  // "-lean": production multigrid levels; "-c<N>": coarsest level of at most N nodes
+  const m = /^(\d)x(\d)(-lean|-c\d+)?(@240|@60|@80|@100)?$/.exec(name);
   if (!m) throw new Error(`bad config ${name}`);
   const n = Number(m[1]);
-  return { newtonIterations: n, newtonMax: n, pcgIterations: Number(m[2]), ...(m[3] ? {} : { maxCoarsestNodes: 48, coarseSweeps: 6 }), ...(m[4] ? { h: 1 / Number(m[4].slice(1)) } : {}) };
+  const levels = m[3] === '-lean' ? {} : m[3] ? { maxCoarsestNodes: Number(m[3].slice(2)) } : { maxCoarsestNodes: 48, coarseSweeps: 6 };
+  return { newtonIterations: n, newtonMax: n, pcgIterations: Number(m[2]), ...levels, ...(m[4] ? { h: 1 / Number(m[4].slice(1)) } : {}) };
 }
 
 export default async function main(args: string[]): Promise<void> {

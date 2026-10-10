@@ -18,7 +18,21 @@ export const GRIP = {
   maxForce: 120,
   /** Largest lead of the handle over the patch centroid, m. */
   maxLead: 0.006,
+  /**
+   * A pinch gathers the cloth between the fingers: over the engagement the patch's targets contract
+   * toward the pinch point to this fraction of their spread at grab time (a 16 mm patch to about 5 mm),
+   * so the cloth bunches into the grip and folds radiate from it.
+   */
+  pinch: 0.3,
+  /** Time over which the fingers close and lift the cloth, s. */
+  engageTime: 0.15,
 };
+
+/** Fraction of the grab-time patch spread kept by the closing pinch, `t` seconds after the grab. */
+export function pinchScale(t: number): number {
+  const e = Math.min(1, Math.max(0, t / GRIP.engageTime));
+  return 1 - (1 - GRIP.pinch) * e * e * (3 - 2 * e);
+}
 
 export interface GripPatch {
   nodes: number[];

@@ -7,7 +7,8 @@ const GRIP_ADDS: bool = true;
 struct GripU {
   // handle target (xyz), entry count (w as f32)
   goal: vec4<f32>,
-  // stiffness per unit weight (N/m), largest handle lead (m), picked node (bitcast), unused
+  // stiffness per unit weight (N/m), largest handle lead (m), picked node (bitcast), pinch scale of the
+  // grab-time offsets (grip.ts pinchScale)
   params: vec4<f32>,
 };
 
@@ -38,7 +39,8 @@ struct GripEntry {
 @group(0) @binding(8) var<storage, read_write> ext: array<vec4<f32>>; // 3 per node (see assemble.wgsl)
 @group(0) @binding(9) var<storage, read_write> pick: array<atomic<u32>>; // [depthKey, distKey]
 @group(0) @binding(10) var<storage, read_write> pickOut: array<vec4<f32>>;
-@group(0) @binding(11) var<storage, read_write> gripGoal: array<vec4<f32>>; // [0] effective handle
+// [0] effective handle (xyz) and how far the requested handle is beyond the force cap's reach (w, m)
+@group(0) @binding(11) var<storage, read_write> gripGoal: array<vec4<f32>>;
 
 var<workgroup> leadSum: array<vec4<f32>, 256>;
 
@@ -50,7 +52,7 @@ fn gripLead(@builtin(local_invocation_index) t: u32) {
   var acc = vec4<f32>(0.0);
   for (var k = t; k < count; k += 256u) {
     let e = grip[k];
-    acc += vec4<f32>(e.w * (x[e.node].xyz - e.offset.xyz), e.w);
+    acc += vec4<f32>(e.w * (x[e.node].xyz - G.params.w * e.offset.xyz), e.w);
   }
   leadSum[t] = acc;
   workgroupBarrier();
@@ -65,8 +67,9 @@ fn gripLead(@builtin(local_invocation_index) t: u32) {
     let c = leadSum[0].xyz / max(leadSum[0].w, 1e-12);
     var lead = G.goal.xyz - c;
     let l = length(lead);
+    let excess = max(0.0, l - G.params.y);
     if (l > G.params.y) { lead *= G.params.y / l; }
-    gripGoal[0] = vec4<f32>(c + lead, 0.0);
+    gripGoal[0] = vec4<f32>(c + lead, excess);
   }
 }
 
@@ -76,7 +79,7 @@ fn gripTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (k >= u32(G.goal.w)) { return; }
   let e = grip[k];
   let y = x[e.node].xyz + dx[e.node].xyz;
-  let d = y - (gripGoal[0].xyz + e.offset.xyz);
+  let d = y - (gripGoal[0].xyz + G.params.w * e.offset.xyz);
   let kg = G.params.x * e.w;
   let force = kg * d;
   let stiff = kg;

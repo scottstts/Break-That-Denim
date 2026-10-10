@@ -12,7 +12,7 @@ import { readBuffer } from '../../../src/gpu/util';
 import { DEFAULT_CAMERA, Renderer } from '../../../src/rendering/renderer';
 import { Interaction } from '../../../src/simulation/gpu/interaction';
 import { Topology } from '../../../src/simulation/gpu/topology';
-import { GRIP } from '../../../src/simulation/grip';
+import { GRIP, pinchScale } from '../../../src/simulation/grip';
 import { CAPTURES, drain, encodePng, gpuDevice } from '../env';
 import { settledSolver } from './render';
 
@@ -211,6 +211,15 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { release: true },
     { wait: Number(process.env.WAIT ?? 4) },
   ],
+  // a mouse drag as the product maps it: in-plane targets only (AUTOLIFT=1 adds the worker's drag lift),
+  // pulled out from the worn zone, held, then released
+  drag: [
+    { grab: [0.004, -0.003] },
+    { to: [0.025, 0.012, 0], t: 0.8 },
+    { wait: 0.5 },
+    { release: true },
+    { wait: 0.6 },
+  ],
   intact: [
     { grab: [-0.035, 0.03] },
     { to: [-0.03, 0.0, 0.015], t: 0.8 },
@@ -279,10 +288,12 @@ export default async function main(args: string[]): Promise<void> {
     anchor = [lastX[4 * picked], lastX[4 * picked + 1], lastX[4 * picked + 2]];
     grabbed = picked;
     handle = [...anchor];
+    grabT = t;
     interaction.attach(picked, anchor);
   };
   let lastX = x0;
   let grabbed = -1;
+  let grabT = 0;
   let cutBox: number[] | null = null;
 
   const runFrame = async (goal: [number, number, number] | null) => {
@@ -297,6 +308,7 @@ export default async function main(args: string[]): Promise<void> {
         const st = HANDLE_MAX_SPEED * h;
         for (let q = 0; q < 3; q++) handle[q] = len <= st ? goal[q] : handle[q] + (d[q] * st) / len;
         interaction.setTarget(handle);
+        if (!process.env.NOPINCH) interaction.setPinch(pinchScale(t + k * h - grabT));
       }
       const hunting = process.env.HUNT && t > Number(process.env.HUNT);
       if (hunting) snapshot(device, solver, true);
@@ -515,6 +527,9 @@ export default async function main(args: string[]): Promise<void> {
       for (let q = 0; q < Math.round(s.wait / H_FRAME); q++) await runFrameS(null);
     } else {
       const goal: [number, number, number] = [anchor[0] + s.to[0], anchor[1] + s.to[1], anchor[2] + s.to[2]];
+      // the product's drag lift (worker.ts LIFT_PER_DRAG): the handle rises toward the viewer with the
+      // in-plane distance dragged from the grab point
+      if (process.env.AUTOLIFT) goal[2] += Math.min(0.05, 0.35 * Math.hypot(goal[0] - anchor[0], goal[1] - anchor[1]));
       // the pointer target moves linearly over the step; the handle follows at bounded speed
       const start = handle ? ([...handle] as [number, number, number]) : goal;
       const frames = Math.max(1, Math.round(s.t / H_FRAME));
