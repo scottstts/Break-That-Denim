@@ -1,4 +1,4 @@
-// Acoustic analysis of a recorded fabric tear (refs/fabric_tear_sound_sample.mp3): the measurements
+// Acoustic analysis of a recorded fabric tear (public/fabric_tear_sound_sample.mp3): the measurements
 // the procedural tear voice (src/audio/) is grounded in. Prints envelope segments, grain (crackle)
 // statistics, the long-term spectrum of active vs quiet passages, loudness/brightness coupling and the
 // mean grain shape.
@@ -6,7 +6,7 @@
 //   node tools/audio/analyze.mjs [file]
 import { execFileSync } from 'node:child_process';
 
-const file = process.argv[2] ?? 'refs/fabric_tear_sound_sample.mp3';
+const file = process.argv[2] ?? 'public/fabric_tear_sound_sample.mp3';
 const SR = 48000;
 const raw = execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', file, '-ar', String(SR), '-f', 'f32le', '-acodec', 'pcm_f32le', '-'], {
   maxBuffer: 1 << 28,

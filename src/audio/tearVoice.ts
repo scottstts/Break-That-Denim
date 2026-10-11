@@ -1,7 +1,7 @@
 import { RECORD_FLOATS, SOURCES, SRC, sourceAt } from './record';
 
 /**
- * The tear sound: the recorded denim tear (refs/fabric_tear_sound_sample.mp3) carries the sound; the
+ * The tear sound: the recorded denim tear (public/fabric_tear_sound_sample.mp3) carries the sound; the
  * mechanics only say, per sound source (one per finger), whether the cloth is tearing there, how hard,
  * and where (docs/decisions/2026-10-10-tear-sound-sample.md).
  *

@@ -3,7 +3,7 @@
 // spectrum and autocorrelation of the 0.8-8 kHz band, per-octave band kurtosis, cross-band coherence
 // of the fine envelopes. The recording's own tears sit 1.8-2.8 from their pooled metrics.
 //   node tools/audio/metrics.mjs file t0:t1[,t0:t1...]
-// prints the metrics and the distance to refs/fabric_tear_sound_sample.mp3 (its three tears).
+// prints the metrics and the distance to public/fabric_tear_sound_sample.mp3 (its three tears).
 import { execFileSync } from 'node:child_process';
 export function load(file) {
   const SR = 48000;
@@ -75,7 +75,7 @@ export function distance(a, r) {
 if (process.argv[1].endsWith('metrics.mjs')) {
   const f = (a, d = 2) => a.map((v) => v.toFixed(d)).join(' ');
   const show = (m) => `K ${m.kurt.toFixed(1)} crest ${m.crest.toFixed(1)} | mod ${f(m.mod, 1)} | acf ${f(m.acf)} | band K ${f(m.bk, 1)} | coh ${f(m.coh)}`;
-  const ref = metrics(load(new URL('../../refs/fabric_tear_sound_sample.mp3', import.meta.url).pathname), '0.6:1.25,2.3:2.75,3.85:5.0');
+  const ref = metrics(load(new URL('../../public/fabric_tear_sound_sample.mp3', import.meta.url).pathname), '0.6:1.25,2.3:2.75,3.85:5.0');
   const m = metrics(load(process.argv[2]), process.argv[3]);
   const r = distance(m, ref);
   console.log(`recording  ${show(ref)}\nthis       ${show(m)}\ndistance ${r.d.toFixed(2)} (${Object.entries(r.parts).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')})`);

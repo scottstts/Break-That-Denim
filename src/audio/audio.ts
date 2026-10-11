@@ -1,6 +1,7 @@
 import workletUrl from './worklet.ts?worker&url';
-import recordingUrl from '../../refs/fabric_tear_sound_sample.mp3?url';
 import { prepareSource } from './tearVoice';
+
+const recordingUrl = `${import.meta.env.BASE_URL}fabric_tear_sound_sample.mp3`;
 
 /**
  * Main-thread setup of the tear sound. Browsers start audio only from a user gesture, so the context

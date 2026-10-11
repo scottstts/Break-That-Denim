@@ -7,7 +7,7 @@ notes still hold for the records' transport, multi-touch sources and the measure
 
 ## Model (src/audio/tearVoice.ts)
 
-- Content: refs/fabric_tear_sound_sample.mp3 itself, its three tearing passages only (0.58-1.13,
+- Content: public/fabric_tear_sound_sample.mp3 itself, its three tearing passages only (0.58-1.13,
   2.40-2.75, 3.87-5.02 s; the quiet stretches before them are hands handling cloth). Mono, high-passed
   at 70 Hz, slow loudness (60 ms RMS) divided out; played as 100 ms slices from random places with
   half-overlapping power-complementary (sine) windows, at original speed and pitch. The rasp, events,
@@ -19,7 +19,7 @@ notes still hold for the records' transport, multi-touch sources and the measure
 - Stop (tear stops or finger released): fall-off of 60 dB in 0.3 s, the recording's own tail rate.
   Records of a released finger are ignored; time since the last cut runs on audio time (records stop
   when the cloth rests). Onset 20 ms.
-- Loading: the main thread fetches the mp3 at start, decodes it at the context's rate when audio starts,
+- Loading: the main thread fetches the public mp3 at start using the app's base URL, decodes it at the context's rate when audio starts,
   prepares it (`prepareSource`) and transfers it to the worklet; silent until then.
 
 GPU records shrink to fracture energy, its position and yarns cut (`ACOUSTIC_STRIDE` 6). The synthetic

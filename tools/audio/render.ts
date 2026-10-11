@@ -35,7 +35,7 @@ export default async function main(args: string[]): Promise<void> {
   const J = Number(process.env.JITTER ?? 0);
   const jitter = (frame: number) => J * ((Math.sin(frame * 12.9898) * 43758.5453) % 1 + 1) % 1;
   const voice = new TearVoice(fs, Number(process.env.SEED ?? 1));
-  const raw = execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', 'refs/fabric_tear_sound_sample.mp3', '-ar', String(fs), '-ac', '1', '-f', 'f32le', '-acodec', 'pcm_f32le', '-'], { maxBuffer: 1 << 28 });
+  const raw = execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', 'public/fabric_tear_sound_sample.mp3', '-ar', String(fs), '-ac', '1', '-f', 'f32le', '-acodec', 'pcm_f32le', '-'], { maxBuffer: 1 << 28 });
   voice.setSource(prepareSource(new Float32Array(raw.buffer, raw.byteOffset, raw.byteLength / 4).slice(), fs));
   const total = records.length * h + 0.5;
   const N = Math.ceil((total * fs) / 128) * 128;

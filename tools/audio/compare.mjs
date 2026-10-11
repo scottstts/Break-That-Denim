@@ -1,4 +1,4 @@
-// Side-by-side waveforms of two recordings (the tear voice against refs/fabric_tear_sound_sample.mp3):
+// Side-by-side waveforms of two recordings (the tear voice against public/fabric_tear_sound_sample.mp3):
 // for each time scale (s), a strip of A (cyan) above a strip of B (orange), starting at tA and tB,
 // each normalised to its peak over the following second. Grid lines every tenth of the strip.
 //   node tools/audio/compare.mjs A tA B tB out.png [scales, default 1,0.2,0.04,0.01]
