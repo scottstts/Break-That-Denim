@@ -21,6 +21,7 @@ import postWgsl from './wgsl/post.wgsl?raw';
 import weaveTileWgsl from './wgsl/weave_tile.wgsl?raw';
 import edgeFieldWgsl from './wgsl/edgefield.wgsl?raw';
 import edgeRootsWgsl from './wgsl/edge_roots.wgsl?raw';
+import { FLOOR_Z } from '../simulation/floor';
 import floorWgsl from './wgsl/floor.wgsl?raw';
 import coverageWgsl from './wgsl/coverage.wgsl?raw';
 import mipgenWgsl from './wgsl/mipgen.wgsl?raw';
@@ -31,6 +32,8 @@ export { DEFAULT_CAMERA, cameraMatrices, type CameraState, type ViewMatrices } f
 const SAMPLES = 4;
 /** Bytes per layer in the RenderU uniform (render_common.wgsl LayerR). */
 const LAYER_BYTES = 144;
+/** Byte offset of RenderU.floor. */
+const RENDER_U_FLOOR = 16 + 3 * LAYER_BYTES;
 /** Texels per side of the prefiltered weave tile (one twill repeat) at mip level 0. */
 const TILE_SIZE = 128;
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -223,11 +226,10 @@ export class Renderer {
   overColor: Vec3 = [1.0, 0.92, 0.82];
   overAngle = 0.065;
   /**
-   * Floor beneath the cloth (m): parallel to the mount and below everything the cloth hangs to (pulled
-   * flaps reach ~6 cm, a grip pushes 3 cm), so it never meets the cloth; and its material's texture
-   * repeat (m, the scanned set's real size).
+   * Floor beneath the cloth (m; the plane the cloth collides with, GpuSolver.setFloor) and its material's
+   * texture repeat (m, the scanned set's real size).
    */
-  floorZ = -0.12;
+  floorZ = FLOOR_Z;
   floorTile = 2.5;
   /** Texels per tile of the floor's base colour and normal maps (public/texture holds their centre crop). */
   floorDetailTexels = 8192;
@@ -257,6 +259,8 @@ export class Renderer {
   private readonly floorLayout: GPUBindGroupLayout;
   private readonly mountCorners: GPUBuffer;
   private readonly renderU: GPUBuffer;
+  /** The floor last written to renderU (the solver's; null: none). */
+  private tailFloor: number | null = null;
   private readonly nrm: GPUBuffer;
   /** Per node: unit +u tangent with the node's wear in w, unit +v tangent. */
   private readonly tframe: GPUBuffer;
@@ -923,7 +927,8 @@ export class Renderer {
   }
 
   private renderParams(): ArrayBuffer {
-    const buf = new ArrayBuffer(16 + 3 * LAYER_BYTES);
+    // the floor (RENDER_U_FLOOR) follows the solver's, written per frame
+    const buf = new ArrayBuffer(RENDER_U_FLOOR + 16);
     const u = new Uint32Array(buf);
     const f = new Float32Array(buf);
     const s = this.scene;
@@ -1035,6 +1040,11 @@ export class Renderer {
     const floor = this.floorGroup !== null && this.showFloor;
     const axis = normalize(sub(aim, key));
     const fu = new Float32Array(FRAME_BYTES / 4);
+    // loose tails rest on the floor the cloth collides with
+    if (this.solver.floorZ !== this.tailFloor) {
+      this.tailFloor = this.solver.floorZ;
+      this.device.queue.writeBuffer(this.renderU, RENDER_U_FLOOR, new Float32Array([this.tailFloor ?? 0, this.tailFloor === null ? 0 : 1, 0, 0]));
+    }
     fu.set(m.viewProj, 0);
     fu.set(this.lightMatrix(anchor), 16);
     fu.set([...m.eye, camera.fovY / this.height], 32);

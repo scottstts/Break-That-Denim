@@ -13,6 +13,7 @@ import pcgWgsl from './wgsl/pcg.wgsl?raw';
 import stepWgsl from './wgsl/step.wgsl?raw';
 import yarnFieldWgsl from './wgsl/yarnfield.wgsl?raw';
 import { SHARE, shareReach } from '../yarnField';
+import { FLOOR_CONTACT } from '../floor';
 import { LINK_MIN_INTACT } from '../reference/newtonMultigrid';
 import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS } from '../../audio/record';
 import gateWgsl from './wgsl/gate.wgsl?raw';
@@ -20,6 +21,7 @@ import energyWgsl from './wgsl/energy.wgsl?raw';
 import dragWgsl from './wgsl/drag.wgsl?raw';
 import rigidFrameWgsl from './wgsl/rigid_frame.wgsl?raw';
 import rigidApplyWgsl from './wgsl/rigid_apply.wgsl?raw';
+import rigidSpinWgsl from './wgsl/rigid_spin.wgsl?raw';
 
 export interface GpuSolverParams {
   h: number;
@@ -115,9 +117,12 @@ interface Level {
   pw: GPUBuffer | null;
 }
 
-/** Packs SimParams (see common.wgsl). */
+/** Byte offset of SimParams.floor (after the three layers; see common.wgsl). */
+const SIM_PARAMS_FLOOR = 32 + 3 * 112;
+
+/** Packs SimParams (see common.wgsl); the floor starts off (setFloor). */
 function simParamsData(scene: CompiledScene, p: GpuSolverParams): ArrayBuffer {
-  const buf = new ArrayBuffer(32 + 3 * 112);
+  const buf = new ArrayBuffer(SIM_PARAMS_FLOOR + 32);
   const f = new Float32Array(buf);
   const u = new Uint32Array(buf);
   f[0] = p.h;
@@ -153,6 +158,7 @@ function simParamsData(scene: CompiledScene, p: GpuSolverParams): ArrayBuffer {
     f[b + 24] = m.pitchV;
     f[b + 25] = m.airDrag;
     f[b + 26] = m.crossingNormal0;
+    f[b + 27] = m.thickness;
   });
   return buf;
 }
@@ -228,9 +234,13 @@ export class GpuSolver {
   private readonly pieceOf: GPUBuffer;
   private readonly pieceFrame: GPUBuffer;
   private readonly pieceStep: GPUBuffer;
+  /** Per node of a detached piece: the direction's rigid rotation and its arm (energy.wgsl curveRef). */
+  readonly curveRef: GPUBuffer;
   /** Per node (detached only): the blocks the rigid-mode correction sums (assemble.wgsl rigidK). */
   private readonly rigidK: GPUBuffer;
   private pieceCount = 0;
+  /** Height of the floor the cloth collides with (setFloor), or null. */
+  private floor: number | null = null;
   /** Encoding the dry Newton iteration that records dispatch sizes (every optional pass included). */
   private recordingSizes = false;
   readonly gateArgs: GPUBuffer;
@@ -316,6 +326,7 @@ export class GpuSolver {
     this.pieceFrame = createBuffer(device, 'pieces.frame', 160 * MAX_PIECES);
     this.pieceStep = createBuffer(device, 'pieces.step', 32 * MAX_PIECES);
     this.rigidK = createBuffer(device, 'pieces.rigidK', 48 * N);
+    this.curveRef = createBuffer(device, 'pieces.curveRef', 32 * N);
 
     // ---- levels
     const fineLayers: LatticeLayer[] = scene.layers.map((L) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
@@ -439,6 +450,11 @@ export class GpuSolver {
     this.pl.rigidReduce = this.mod.rigidApply.pipeline('rigidReduce');
     this.pl.rigidApply = this.mod.rigidApply.pipeline('rigidApply');
     this.pl.rigidResidual = this.mod.rigidApply.pipeline('rigidResidual');
+    this.mod.rigidSpin = new ComputeModule(d, 'rigidSpin', patch('rigid', commonWgsl + rigidSpinWgsl));
+    this.pl.spinReduce = this.mod.rigidSpin.pipeline('spinReduce');
+    this.pl.spinApply = this.mod.rigidSpin.pipeline('spinApply');
+    this.pl.curveSet = this.mod.rigidSpin.pipeline('curveSet');
+    this.pl.curveApply = this.mod.energy.pipeline('curveApply');
   }
 
   private createBindGroups(): void {
@@ -474,6 +490,7 @@ export class GpuSolver {
     }
     group('pcg', 'initP', { 0: Fi, 1: this.slot(0xffffffff), 4: this.p, 5: L0.X, 10: this.scal });
     group('rigidFrame', 'rigidFrame', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.rigidK, 5: this.pieceStart, 6: this.pieceNodes, 7: this.pieceFrame });
+    group('rigidSpin', 'rigidSpin', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.v, 4: this.dx, 5: this.pieceStart, 6: this.pieceNodes, 7: this.pieceOf, 8: this.pieceStep, 9: this.pieceFrame, 10: this.curveRef });
     group('rigidApply', 'rigidApply', { 0: this.simParams, 1: this.x, 2: this.dx, 3: this.pieceStart, 4: this.pieceNodes, 5: this.pieceOf, 6: this.pieceFrame, 7: this.pieceStep, 8: L0.B, 9: this.delta, 10: this.Ap });
     group('pcg', 'matvecDelta', { 0: Fi, 2: L0.op, 3: L0.fixed, 4: this.delta, 5: this.Ap, 9: this.partial });
   }
@@ -528,6 +545,7 @@ export class GpuSolver {
       7: this.ext,
       8: this.partial4,
       9: this.counters,
+      11: this.curveRef,
     });
   }
 
@@ -652,11 +670,15 @@ export class GpuSolver {
     this.device.queue.writeBuffer(this.pieceStart, 0, header);
     if (nodes.length > 0) this.device.queue.writeBuffer(this.pieceNodes, 0, nodes);
     this.device.queue.writeBuffer(this.pieceOf, 0, of);
+    // no piece left: no node steps along a rotation (curveSet no longer runs)
+    if (count === 0 && this.pieceCount > 0) this.device.queue.writeBuffer(this.curveRef, 0, new Float32Array(8 * this.N));
     this.pieceCount = count;
   }
 
   /** Line search after a PCG solve: energy changes along delta and the chosen step length. */
   encodeLineSearch(pass: GPUComputePassEncoder): void {
+    // detached pieces step along their rigid rotation (energy.wgsl steps)
+    if (this.hasPieces) this.dispatch(pass, 'curveSet', 'rigidSpin', this.nodeGroups(this.N));
     this.dispatch(pass, 'energyDelta', 'energy', DOT_GROUPS);
     this.dispatch(pass, 'lineChoose', 'energy', 1);
   }
@@ -669,11 +691,17 @@ export class GpuSolver {
     this.encodeAssemble(pass, it === 0);
     this.encodePCG(pass);
     this.encodeLineSearch(pass);
+    if (this.hasPieces) this.dispatch(pass, 'curveApply', 'energy', this.nodeGroups(this.N));
     this.dispatch(pass, 'newtonApply', `newtonApply${it}`, this.nodeGroups(this.N));
   }
 
   encodePredict(pass: GPUComputePassEncoder): void {
     this.dispatch(pass, 'predict', 'predict', this.nodeGroups(this.N));
+    // detached pieces start from their rotation over the substep (rigid_spin.wgsl)
+    if (this.pieceCount > 0) {
+      this.dispatch(pass, 'spinReduce', 'rigidSpin', PIECE_GROUPS);
+      this.dispatch(pass, 'spinApply', 'rigidSpin', this.nodeGroups(this.N));
+    }
   }
 
   /** Yarn damage field update and span coupling at the committed positions (yarnfield.wgsl). */
@@ -712,10 +740,8 @@ export class GpuSolver {
     const pass = encoder.beginComputePass({ label: 'substep' });
     this.encodePredict(pass);
     this.preSubstep?.(pass);
-    if (this.contactEnabled) {
-      this.contact.encodeDetect(pass);
-      this.dispatch(pass, 'projectStart', 'project', this.nodeGroups(this.N));
-    }
+    if (this.contactEnabled) this.contact.encodeDetect(pass);
+    if (this.contactEnabled || this.floor !== null) this.dispatch(pass, 'projectStart', 'project', this.nodeGroups(this.N));
     const newtonIterations = Math.min(MAX_NEWTON, Math.max(this.params.newtonIterations, minIterations));
     const newtonMax = Math.min(MAX_NEWTON, Math.max(this.params.newtonMax, newtonIterations, maxIterations));
     for (let it = 0; it < newtonMax; it++) {
@@ -756,6 +782,22 @@ export class GpuSolver {
   setNewtonTolerance(tolerance: number): void {
     this.params.newtonTolerance = tolerance;
     this.device.queue.writeBuffer(this.gateSizes, 4, new Float32Array([tolerance]));
+  }
+
+  /** Height of the floor the cloth collides with (m), or null. */
+  get floorZ(): number | null {
+    return this.floor;
+  }
+
+  /**
+   * The floor the cloth lands and lies on (FLOOR_CONTACT; common.wgsl floorLowest) at height z (m), or
+   * none (null). Takes effect for subsequently submitted work.
+   */
+  setFloor(z: number | null): void {
+    const c = FLOOR_CONTACT;
+    this.floor = z;
+    const data = new Float32Array([z ?? 0, c.bulge, c.stiffness, c.friction, c.frictionSpeed, z === null ? 0 : 1, 0, 0]);
+    this.device.queue.writeBuffer(this.simParams, SIM_PARAMS_FLOOR, data);
   }
 
   /** Change the timestep (takes effect for subsequently submitted work). */

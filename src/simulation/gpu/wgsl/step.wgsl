@@ -74,13 +74,24 @@ fn feasible(n: u32, d: vec3<f32>) -> vec3<f32> {
   return bound(bound(bound(d, own), recip), own);
 }
 
+// The step d of node n bounded against the floor, from its iterate step lin (common.wgsl floorLowest).
+fn floorBound(n: u32, lin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
+  if (P.floorAux.y < 0.5) { return d; }
+  let half = 0.5 * P.layers[nodes[n].ijl >> 24u].b.w;
+  let delta = half + P.floor.y;
+  let sWeight = floorWeightDepth(nodes[n].mass, length(P.hg.yzw), delta, P.floor.z);
+  let z0 = x[n].z;
+  let lowest = floorLowest(z0 + lin.z, P.floor.x, delta, half, sWeight);
+  return vec3<f32>(d.xy, max(d.z, lowest - z0));
+}
+
 // After contact detection: the predicted step made feasible (the first Newton iteration starts from a
 // state that respects the bounds; the clipped approach is lost, as in an inelastic contact).
 @compute @workgroup_size(128)
 fn projectStart(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x || pinnedN(n)) { return; }
-  dx[n] = vec4<f32>(feasible(n, dx[n].xyz), dx[n].w);
+  dx[n] = vec4<f32>(floorBound(n, vec3<f32>(0.0), feasible(n, dx[n].xyz)), dx[n].w);
 }
 
 @compute @workgroup_size(128)
@@ -93,7 +104,7 @@ fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   let alpha = bitcast<f32>(atomicLoad(&counters[3]));
   // firewall: a non-finite direction never enters the state
   let dn = select(vec3<f32>(0.0), delta[n].xyz, finite3(delta[n].xyz) && finite1(alpha));
-  let nd = feasible(n, old + alpha * dn);
+  let nd = floorBound(n, old, feasible(n, old + alpha * dn));
   // w keeps the size of this node's latest Newton update (local convergence for history updates)
   dx[n] = vec4<f32>(nd, length(nd - old));
   // non-negative f32 bit patterns order like their values

@@ -236,6 +236,27 @@ fn tailSolve(ri: RunInfo, q: vec3<f32>, dir0: vec3<f32>, root: u32, k: u32, len:
         if (into < 0.0) { nxt -= c.n * into; }
       }
     }
+    // the floor, likewise: a segment that would pass below it (its axis a radius above the plane) ends
+    // where it touches and the rest lies along the floor
+    let zf = R.floor.x + rY;
+    if (R.floor.y > 0.5 && nxt.z < zf) {
+      let dz = p.z - nxt.z;
+      let touch = mix(p, nxt, select(0.0, clamp((p.z - zf) / dz, 0.0, 1.0), dz > 1e-12));
+      var dir = touch - p;
+      if (dot(dir, dir) < 1e-14) { dir = vec3<f32>(t[i].xy, 0.0); }
+      let dl = length(dir);
+      if (dl > 1e-9) {
+        dir /= dl;
+        let ax = cross(t[i], dir);
+        let al = length(ax);
+        if (al > 1e-6) {
+          let phi = atan2(al, dot(t[i], dir));
+          for (var j = i + 1u; j < TAIL_SEGS; j++) { t[j] = turn(t[j], ax / al, phi); }
+        }
+        nxt = p + dir * h;
+      }
+      nxt.z = max(nxt.z, min(zf, p.z));
+    }
     tails[b + i + 1u] = vec4<f32>(nxt, 0.0);
     p = nxt;
   }

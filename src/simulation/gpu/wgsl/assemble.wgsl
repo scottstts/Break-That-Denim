@@ -188,6 +188,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let He = Sym(vec3<f32>(e1.x, e1.w, e2.y), vec3<f32>(e1.y, e1.z, e2.x));
   D = symAdd(D, He);
   Kx = symAdd(symAdd(Kx, Dd), He);
+  // floor contact (common.wgsl floorLowest): penalty along +z, friction on the step
+  var onFloorCore = false;
+  if (P.floorAux.y > 0.5) {
+    let half = 0.5 * mat.b.w;
+    let delta = half + P.floor.y;
+    let zc = x[n].z + dx[n].z;
+    let s = delta - (zc - P.floor.x);
+    if (s > 0.0) {
+      let kc = P.floor.z;
+      let lam = kc * s * s / delta;
+      let ut = dx[n].xy;
+      let kf = P.floor.w * lam / max(length(ut), P.floorAux.x * h);
+      g += vec3<f32>(kf * ut, -lam);
+      let Hf = Sym(vec3<f32>(kf, kf, 2.0 * kc * s / delta), vec3<f32>(0.0));
+      D = symAdd(D, Hf);
+      Kx = symAdd(Kx, Hf);
+      onFloorCore = zc <= P.floor.x + half * (1.0 + 1e-3);
+    }
+  }
 
   // couplings: [+u, -u, +v, -v] axial/bending, scalars [+2u, -2u, +2v, -2v]
   var C1: array<Sym, 4>;
@@ -295,6 +314,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       D = symAdd(D, axialBlock(kAct, 0.0, m.xyz));
       Kx = symAdd(Kx, axialBlock(kAct, 0.0, m.xyz));
     }
+  }
+  // the floor's hard limit (half the thickness above it) likewise, where the forces still press down
+  if (onFloorCore && g.z > 0.0) {
+    D = symAdd(D, axialBlock(kAct, 0.0, vec3<f32>(0.0, 0.0, 1.0)));
+    Kx = symAdd(Kx, axialBlock(kAct, 0.0, vec3<f32>(0.0, 0.0, 1.0)));
   }
   if (detached) {
     rigidK[3u * n] = vec4<f32>(Kx.d.x, Kx.o.x, Kx.o.y, Kx.d.y);

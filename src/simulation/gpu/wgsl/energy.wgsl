@@ -4,6 +4,9 @@
 // that decides whether a difference is conclusive (lineChoose). Each node owns its inertia/external/drag terms, its "+" spans, the
 // bending triples centred on it and the shear diagonals of the cell it is the lower-left corner of.
 // Mirrors the reference line search (reference/newtonMultigrid.ts) up to the axial quadrature.
+// A detached piece's nodes step along the rotation of the direction's rigid part (rigid_apply.wgsl
+// pieceStep w) rather than its tangent: alpha delta + rotationCurve(alpha w, r) (common.wgsl); once
+// alpha is chosen, curveApply bends delta so that newtonApply moves them so.
 
 @group(0) @binding(0) var<uniform> P: SimParams;
 @group(0) @binding(1) var<storage, read> nodes: array<NodeStatic>;
@@ -11,12 +14,15 @@
 @group(0) @binding(3) var<storage, read> dx: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> pred: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> segs: array<Seg>;
-@group(0) @binding(6) var<storage, read> delta: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> delta: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> ext: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> partial4: array<vec4<f32>>;
 // [3] receives the chosen step length (f32 bits); [12] counts directions along which no evaluated
 // step decreased the potential
 @group(0) @binding(9) var<storage, read_write> counters: array<u32>;
+// 2 per node of a detached piece (rigid_spin.wgsl curveSet): its piece's rigid rotation in the
+// direction (xyz; w = 1 where set), and its arm from the piece's centroid at the iterate
+@group(0) @binding(11) var<storage, read> curveRef: array<vec4<f32>>;
 
 const GROUPS: u32 = 256u;
 var<workgroup> red: array<vec4<f32>, 256>;
@@ -50,21 +56,34 @@ fn spanOn(owner: i32, f: u32) -> bool {
   return segActive(segs[2u * u32(owner) + f]);
 }
 
-// alpha-scaled direction (pinned nodes never move)
+// direction (pinned nodes never move)
 fn dir(n: u32) -> vec3<f32> { return select(delta[n].xyz, vec3<f32>(0.0), pinned(n)); }
 
 const ALPHA: vec4<f32> = vec4<f32>(1.0, 0.5, 0.25, 0.125);
 
-// Quadratic term change: alpha g.d + 1/2 alpha^2 q for the four step lengths.
-fn quad(gd: f32, q: f32) {
-  acc += ALPHA * gd + 0.5 * ALPHA * ALPHA * q;
-  mag += abs(ALPHA * gd) + abs(0.5 * ALPHA * ALPHA * q);
+// Node n's step at the four step lengths.
+fn steps(n: u32) -> array<vec3<f32>, 4> {
+  let d = dir(n);
+  var s = array<vec3<f32>, 4>(ALPHA.x * d, ALPHA.y * d, ALPHA.z * d, ALPHA.w * d);
+  let cw = curveRef[2u * n];
+  if (cw.w < 0.5 || pinned(n)) { return s; }
+  let r = curveRef[2u * n + 1u].xyz;
+  for (var k = 0u; k < 4u; k++) { s[k] += rotationCurve(ALPHA[k] * cw.xyz, r); }
+  return s;
 }
 
-// |e0 + a de| - |e0| computed without cancellation.
-fn lenChange(e0: vec3<f32>, de: vec3<f32>, a: f32, l0: f32) -> vec2<f32> {
-  let la = length(e0 + a * de);
-  return vec2<f32>((2.0 * a * dot(e0, de) + a * a * dot(de, de)) / max(la + l0, 1e-12), la);
+// Change of a quadratic node term (gradient g, Hessian H at this iterate) over the steps s.
+fn quad(g: vec3<f32>, H: Sym, s: array<vec3<f32>, 4>) {
+  for (var k = 0u; k < 4u; k++) {
+    add1(k, dot(g, s[k]));
+    add1(k, 0.5 * dot(s[k], symMul(H, s[k])));
+  }
+}
+
+// |e0 + s| - |e0| computed without cancellation, and |e0 + s|.
+fn lenChange(e0: vec3<f32>, s: vec3<f32>, l0: f32) -> vec2<f32> {
+  let la = length(e0 + s);
+  return vec2<f32>((2.0 * dot(e0, s) + dot(s, s)) / max(la + l0, 1e-12), la);
 }
 
 fn nodeDelta(n: u32) {
@@ -77,22 +96,36 @@ fn nodeDelta(n: u32) {
   let mat = P.layers[l];
   let h = P.hg.x;
   let d0 = dx[n].xyz;
-  let dn = dir(n);
+  let stepN = steps(n);
   // a mounted node has no inertial, external or drag terms, but the spans, bending triples and shear
   // cells it owns still act on their free nodes (the gradient includes them)
   if (!pinned(n)) {
     // inertia
     let w = st.mass / (h * h);
-    quad(w * dot(dn, d0 - pred[n].xyz), w * dot(dn, dn));
+    quad(w * (d0 - pred[n].xyz), symId(w), stepN);
     // external terms (grip, contact): quadratic model from their gradient and Hessian at this iterate
     let e0 = ext[3u * n];
     let e1 = ext[3u * n + 1u];
     let e2 = ext[3u * n + 2u];
     let He = Sym(vec3<f32>(e1.x, e1.w, e2.y), vec3<f32>(e1.y, e1.z, e2.x));
-    quad(dot(e0.xyz, dn), dot(dn, symMul(He, dn)));
+    quad(e0.xyz, He, stepN);
+    // floor contact (common.wgsl): as the other contacts, its quadratic model at this iterate. The
+    // cubic has no curvature where contact begins, so a direction from an iterate just outside it runs
+    // deep into the floor; the bound (step.wgsl floorBound) keeps the step where the model holds, and
+    // the exact cubic along the unbounded direction would reject it.
+    if (P.floorAux.y > 0.5) {
+      let reach = 0.5 * mat.b.w + P.floor.y;
+      let s0 = reach - (x[n].z + d0.z - P.floor.x);
+      if (s0 > 0.0) {
+        let kc = P.floor.z;
+        let lam = kc * s0 * s0 / reach;
+        let kf = P.floor.w * lam / max(length(d0.xy), P.floorAux.x * h);
+        quad(vec3<f32>(kf * d0.xy, -lam), Sym(vec3<f32>(kf, kf, 2.0 * kc * s0 / reach), vec3<f32>(0.0)), stepN);
+      }
+    }
     // air drag (drag.wgsl): quadratic with a fixed block
     let Dd = airDragBlock(n);
-    quad(dot(symMul(Dd, d0), dn), dot(dn, symMul(Dd, dn)));
+    quad(symMul(Dd, d0), Dd, stepN);
   }
   for (var f = 0u; f < 2u; f++) {
     let du = select(0, 1, f == 0u);
@@ -106,14 +139,13 @@ fn nodeDelta(n: u32) {
       let L = s.rest;
       let en = x[b].xyz - x[n].xyz;
       let ec = en + dx[b].xyz - d0;
-      let de = dir(b) - dn;
+      let stepB = steps(b);
       let l0 = length(ec);
       let ln = length(en);
       let T0 = spanResponse(y, s, l0 / L - 1.0).x;
       let c = y.axialVisc / (L * h);
       for (var k = 0u; k < 4u; k++) {
-        let al = ALPHA;
-        let r = lenChange(ec, de, al[k], l0);
+        let r = lenChange(ec, stepB[k] - stepN[k], l0);
         let Ta = spanResponse(y, s, r.y / L - 1.0).x;
         add1(k, 0.5 * (T0 + Ta) * r.x);
         add1(k, 0.5 * c * r.x * (r.y + l0 - 2.0 * ln));
@@ -131,7 +163,8 @@ fn nodeDelta(n: u32) {
       let kd = ke * y.bendVisc / h;
       let rn = geo.x * x[a].xyz - 2.0 * x[n].xyz + geo.y * x[c].xyz;
       let r0 = rn + geo.x * dx[a].xyz - 2.0 * d0 + geo.y * dx[c].xyz;
-      let dr = geo.x * dir(a) - 2.0 * dn + geo.y * dir(c);
+      let stepA = steps(a);
+      let stepC = steps(c);
       // elastic: exact change of the fold-stiffening energy; viscous: exact change of 1/2 kd (|r| - |rn|)^2
       // (assemble.wgsl triple), (|r| - |r0|) (|r| + |r0| - 2 |rn|) without cancellation
       let q0 = dot(r0, r0);
@@ -139,11 +172,10 @@ fn nodeDelta(n: u32) {
       let lrn = length(rn);
       let ab = geo.w;
       for (var k = 0u; k < 4u; k++) {
-        let alv = ALPHA;
-        let al = alv[k];
-        let dq = 2.0 * al * dot(r0, dr) + al * al * dot(dr, dr);
+        let dr = geo.x * stepA[k] - 2.0 * stepN[k] + geo.y * stepC[k];
+        let dq = 2.0 * dot(r0, dr) + dot(dr, dr);
         add1(k, 0.5 * ke * bendPsiDelta(q0, q0 + dq, dq, ab));
-        let rl = lenChange(r0, dr, al, l0);
+        let rl = lenChange(r0, dr, l0);
         add1(k, 0.5 * kd * rl.x * (rl.y + l0 - 2.0 * lrn));
       }
     }
@@ -172,12 +204,12 @@ fn nodeDelta(n: u32) {
       let p = pa[q];
       let o = pb[q];
       let ec = (x[o].xyz + dx[o].xyz) - (x[p].xyz + dx[p].xyz);
-      let de = dir(o) - dir(p);
+      let stepO = steps(o);
+      let stepP = steps(p);
       let l0 = length(ec);
       let f0 = shearLaw(ks, jam, Ld, l0).x;
       for (var k = 0u; k < 4u; k++) {
-        let al = ALPHA;
-        let rr = lenChange(ec, de, al[k], l0);
+        let rr = lenChange(ec, stepO[k] - stepP[k], l0);
         // trapezoid of the shear force law (exact on its linear branch)
         add1(k, 0.5 * (f0 + shearLaw(ks, jam, Ld, rr.y).x) * rr.x);
       }
@@ -255,4 +287,16 @@ fn lineChoose(@builtin(local_invocation_index) lid: u32) {
     }
     counters[3] = bitcast<u32>(a);
   }
+}
+
+// Once lineChoose set alpha (only while detached pieces exist): delta += rotationCurve(alpha w, r) / alpha
+// on their nodes, so that newtonApply (alpha delta) moves them along the path evaluated above.
+@compute @workgroup_size(128)
+fn curveApply(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x || pinned(n)) { return; }
+  let cw = curveRef[2u * n];
+  let alpha = bitcast<f32>(counters[3]);
+  if (cw.w < 0.5 || !(alpha > 0.0)) { return; }
+  delta[n] = vec4<f32>(delta[n].xyz + rotationCurve(alpha * cw.xyz, curveRef[2u * n + 1u].xyz) / alpha, delta[n].w);
 }

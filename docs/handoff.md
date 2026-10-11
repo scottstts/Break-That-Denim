@@ -1,5 +1,15 @@
 # Handoff (rolling)
 
+Latest (2026-10-11, floor contact): `docs/decisions/2026-10-11-floor-contact.md` (uncommitted). Free play
+collides with the floor 12 cm below (FLOOR_Z, src/simulation/floor.ts): self-contact cubic + friction in
+assemble, quadratic model in the line search, hard/trust bound in step.wgsl; off during "Beneath". Loose
+tails rest on it. Found and fixed: spinning detached pieces barely felt friction (chord-velocity start
+iterate rigid_spin.wgsl, rotation-exact update path energy.wgsl steps/curveApply). Verified headless:
+`npm run check` 67 unit, `npm run test:gpu` 26/26 + 19/19 + 7/7 + 5/5 (new tests/gpu/floor.ts); substep
+cost unchanged; sessions fall/trail added. Not seen in a browser.
+- **For the user:** "Beneath" tears less with the rotation fixes (936 vs 1042 ruptures by 12 s; face
+  still fully shown). Re-staging is theirs.
+
 Two-hand hypothesis verified (2026-10-11): nonblocking staged audit reproduces the floating 208-node
 centre piece. It separates from mounts/both claw cores at 2.1667 s and all 208 nodes are correctly
 detached with one valid GPU component ID by 2.1833 s; this stays true through 6.1 s while it floats.
@@ -35,7 +45,6 @@ rigid_frame.wgsl builds E = Z^T A Z per piece; PCG starts from each piece's rigi
 (rigid_apply.wgsl). Verified headless: `npm run check` 67 unit, `npm run test:gpu` 26/26 + 19/19 + 7/7
 (new comb / serpentine cut-outs). Beneath: no hovering scraps; sheet artifacts/captures/beneath-falling-pieces.png.
 Not seen in a browser.
-- Remind the user: floor collision for free play (falling pieces pass through the render-only floor).
 - Still waiting on the user: re-fitting the creature's colliders (1-5 cm off the skin,
   tools/stage/colliderfit.ts); pieces resting on them still float.
 

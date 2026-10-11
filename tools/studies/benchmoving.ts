@@ -6,10 +6,13 @@
 import { readBuffer } from '../../src/gpu/util';
 import { settledSolver } from '../gpu/scripts/render';
 import { drain, gpuDevice } from '../gpu/env';
+import { FLOOR_Z } from '../../src/simulation/floor';
 
 export default async function main(): Promise<void> {
   const device = await gpuDevice();
   const { solver } = await settledSolver(device);
+  // FLOOR=1: with the floor collision free play has
+  if (process.env.FLOOR) solver.setFloor(FLOOR_Z);
   const x0 = new Float32Array(await readBuffer(device, solver.x));
   const v = new Float32Array(x0.length);
   for (let n = 0; n < solver.N; n++) v[4 * n + 2] = 0.3 * Math.sin((2 * Math.PI * x0[4 * n]) / 0.04);

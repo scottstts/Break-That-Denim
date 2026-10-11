@@ -1,5 +1,8 @@
 # Floor, mount and overhead room light (render-only environment)
 
+Follow-up (2026-10-11): the floor now collides in free play (user request); see
+`2026-10-11-floor-contact.md`. The "no collision" bullet below is history.
+
 ## Decisions
 
 - **Floor 12 cm below the mount, no collision (user decision).** Pulled flaps hang 3.5–6.4 cm

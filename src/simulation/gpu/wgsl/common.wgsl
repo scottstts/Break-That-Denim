@@ -18,7 +18,7 @@ struct LayerMat {
   yarn: array<Yarn, 2>,
   // shearStiffness, crossingFriction, crossingWrap, pitchU
   a: vec4<f32>,
-  // pitchV, normal air drag (N s / m^3), crossing normal force of intact weave (N), unused
+  // pitchV, normal air drag (N s / m^3), crossing normal force of intact weave (N), thickness (m)
   b: vec4<f32>,
 };
 
@@ -29,6 +29,11 @@ struct SimParams {
   // history tolerance (f32 bits): largest last Newton update at which a node may advance history
   counts: vec4<u32>,
   layers: array<LayerMat, 3>,
+  // floor contact (floorLowest): height (m), contact distance beyond the half thickness (m), penalty
+  // stiffness (N/m), friction coefficient
+  floor: vec4<f32>,
+  // friction regularization speed (m/s), 1 if the floor collides, unused...
+  floorAux: vec4<f32>,
 };
 
 struct NodeStatic {
@@ -239,6 +244,42 @@ fn shearLaw(ks: f32, jam: f32, Ld: f32, l: f32) -> vec2<f32> {
 
 fn segActive(s: Seg) -> bool {
   return (s.flags & (SEG_EXISTS | SEG_BROKEN)) == SEG_EXISTS;
+}
+
+// ---------------------------------------------------------------- floor contact
+
+// The cloth on the floor (SimParams.floor): a node at height z within its contact distance delta (half its
+// layer's thickness plus the rendered surface's bulge) of the plane at fz takes the cubic penalty of
+// self-contact, E = k s^3 / (3 delta) at depth s = delta - (z - fz), and regularized Coulomb friction on
+// its step (the floor is at rest). Assembled with the node's own terms (assemble.wgsl), its quadratic
+// model in the line search (energy.wgsl), and bounded in every update (step.wgsl floorBound).
+
+// Lowest height a node's iterate may reach from its height zLin in one update: never closer to the
+// plane than half its thickness (the cloth's underside stays above the floor), and no deeper into the
+// contact distance than twice its depth now or the depth sWeight that carries its weight (the trust
+// region of the linearized cubic penalty, as selfcontact.wgsl terms). Never above zLin (the bound only
+// limits approach). A node falling onto the floor stops there within one substep (inelastic).
+fn floorLowest(zLin: f32, fz: f32, delta: f32, halfThickness: f32, sWeight: f32) -> f32 {
+  let s = max(delta - (zLin - fz), 0.0);
+  return min(max(fz + delta - max(sWeight, 2.0 * s), fz + halfThickness), zLin);
+}
+
+// Depth into the contact distance at which the penalty k s^2 / delta carries a node of mass m.
+fn floorWeightDepth(m: f32, g: f32, delta: f32, k: f32) -> f32 {
+  return sqrt(m * g * delta / k);
+}
+
+// ---------------------------------------------------------------- rigid rotation
+
+// R(th) r - r - th x r: what rotating r by the rotation vector th adds to its tangent step th x r
+// (Rodrigues, without forming R r). A detached piece's rigid part of a step moves along it (rigid_spin.wgsl,
+// energy.wgsl, rigid_apply.wgsl rigidCurve): along the tangent alone its spans stretch by |th|^2 / 2.
+fn rotationCurve(th: vec3<f32>, r: vec3<f32>) -> vec3<f32> {
+  let phi = length(th);
+  if (phi < 1e-9) { return vec3<f32>(0.0); }
+  let k = th / phi;
+  let kr = cross(k, r);
+  return (sin(phi) - phi) * kr + (1.0 - cos(phi)) * cross(k, kr);
 }
 
 // ---------------------------------------------------------------- symmetric 3x3 blocks

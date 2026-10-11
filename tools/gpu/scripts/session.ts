@@ -20,6 +20,7 @@ import { AcousticLog } from '../../../src/engine/acousticLog';
 import { ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../../../src/audio/record';
 import { CAPTURES, drain, encodePng, floorImages, gpuDevice } from '../env';
 import { settledSolver } from './render';
+import { FLOOR_Z } from '../../../src/simulation/floor';
 
 /** Gesture steps in world metres relative to the grab point; times in seconds. */
 type Step =
@@ -78,6 +79,10 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
   // not fall through
   // debris against the cloth: a piece cut free is laid above intact cloth and falls onto it
   scrap: [{ scrap: [-0.035, 0.03], half: 4, lift: 0.01, shift: 0.03 }, { wait: 1.2 }],
+  // floor contact: a piece cut free in the middle drops through its own opening and lies on the floor
+  fall: [{ scrap: [0.0, 0.0], half: 8, lift: 0, shift: 0 }, { wait: 1.5 }],
+  // floor contact: a flap longer than the drop to the floor (13.6 cm) hangs and trails along it
+  trail: [{ cut: [0.0, -0.02], half: 20 }, { wait: 2.5 }],
   // self-contact, deterministic: the cut flap is laid folded over the sheet 4 mm above it and drops
   drop: [{ cut: [-0.035, 0.03], half: 8 }, { foldover: 0.0025 }, { wait: 1.5 }],
   // the folded flap grabbed where it lies on the sheet and lifted: the flap is what is picked (not the
@@ -305,6 +310,8 @@ export default async function main(args: string[]): Promise<void> {
   const interaction = new Interaction(device, solver, scene);
   solver.preSubstep = (pass) => interaction.encodeSubstep(pass);
   solver.preAssemble = (dispatch) => interaction.encode(dispatch);
+  // as free play: the cloth collides with the floor (NOFLOORCONTACT=1: falls through it, as before)
+  if (!process.env.NOFLOORCONTACT) solver.setFloor(FLOOR_Z);
   const topology = process.env.NO_TOPOLOGY ? null : new Topology(device, solver, scene, () => interaction.coreNodes);
   let events = 0;
   // AUDIO=file.json: the acoustic record of every substep (audio/record.ts; pan = world x of the fracture)
@@ -1274,7 +1281,7 @@ fn perNode(@builtin(global_invocation_id) gid: vec3<u32>) {
 }`;
     const mod = new ComputeModule(device, 'energyDbg', code);
     const buf = createBuffer(device, 'dbg', 32 * solver.N);
-    const group = mod.bindGroup('dbg', { 0: solver.simParams, 1: solver.nodes, 2: solver.x, 3: solver.dx, 4: solver.pred, 5: solver.segs, 6: solver.delta, 7: solver.ext, 8: solver.partial4, 9: solver.counters, 10: buf });
+    const group = mod.bindGroup('dbg', { 0: solver.simParams, 1: solver.nodes, 2: solver.x, 3: solver.dx, 4: solver.pred, 5: solver.segs, 6: solver.delta, 7: solver.ext, 8: solver.partial4, 9: solver.counters, 10: buf, 11: solver.curveRef });
     dbgMod = { pipe: mod.pipeline('perNode'), group, buf };
   }
   const enc = device.createCommandEncoder();

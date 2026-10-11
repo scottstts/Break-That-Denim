@@ -64,6 +64,8 @@ struct RenderU {
   // node count, layer count, cell count, refined vertex count
   counts: vec4<u32>,
   layers: array<LayerR, 3>,
+  // the floor the solver's cloth collides with (GpuSolver.floorZ): height (m), 1 if there is one, unused...
+  floor: vec4<f32>,
 };
 
 struct NodeStaticR {

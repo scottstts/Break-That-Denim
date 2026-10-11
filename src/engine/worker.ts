@@ -189,6 +189,8 @@ class Engine {
     this.topology = new Topology(this.device, this.solver, this.scene, () => this.interaction.coreNodes);
     this.renderer = new Renderer(this.device, format, this.solver, this.scene);
     this.renderer.resize(width, height);
+    // free play: torn pieces and long flaps land on the floor drawn beneath the cloth
+    this.solver.setFloor(this.renderer.floorZ);
     this.speedProbe = this.device.createBuffer({ label: 'speedProbe', size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     progress(0.7);
 

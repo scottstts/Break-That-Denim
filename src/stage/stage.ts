@@ -98,7 +98,9 @@ export class Stage {
       ambient: [...r.ambient],
       torchIntensity: r.torchIntensity,
     };
+    // the experience plays over the void: nothing to land on
     r.showFloor = false;
+    host.solver.setFloor(null);
     // the room's lights stay put while the camera moves; the bulb is placed relative to this anchor
     r.lightAnchor = [...DEFAULT_CAMERA.target];
     if (!r.extras.includes(host.creature)) r.extras.push(host.creature);
@@ -184,6 +186,7 @@ export class Stage {
     const r = this.host.renderer;
     Object.assign(r, this.base);
     r.showFloor = true;
+    this.host.solver.setFloor(r.floorZ);
     r.lightAnchor = null;
     r.post = { ...NO_POST_EFFECTS };
     r.freeze = false;
