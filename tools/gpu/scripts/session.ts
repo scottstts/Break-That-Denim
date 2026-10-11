@@ -438,6 +438,23 @@ export default async function main(args: string[]): Promise<void> {
         console.log(`  freed since release: ${fresh.length} nodes, speed max ${Math.max(...sp).toFixed(3)} mean ${(sp.reduce((a, b) => a + b, 0) / sp.length).toFixed(3)} m/s, travel max ${(Math.max(...travel) * 1e3).toFixed(1)} mm, spread ${(spread * 1e3).toFixed(1)} mm (t=${(t - releaseT).toFixed(3)} after release)`);
       }
     }
+    if (process.env.DEBRIS) {
+      // DEBRIS=1: detached material still in the scene (state 1): count, mean height and vertical speed,
+      // and how many nodes are retired (left the scene)
+      let cnt = 0;
+      let zs = 0;
+      let vz = 0;
+      let retired = 0;
+      for (let n = 0; n < N; n++) {
+        if (xs[4 * n + 3] > 1.5) retired++;
+        else if (xs[4 * n + 3] > 0.5) {
+          cnt++;
+          zs += xs[4 * n + 2];
+          vz += v[4 * n + 2];
+        }
+      }
+      if (cnt + retired > 0) console.log(`  debris t=${t.toFixed(2)}: ${cnt} nodes, mean z ${((zs / Math.max(cnt, 1)) * 1e3).toFixed(1)} mm, mean vz ${(vz / Math.max(cnt, 1)).toFixed(3)} m/s, retired ${retired}`);
+    }
     if (process.env.FREED && prevX) {
       // nodes that became debris this frame: their speed then (a piece flung by the solve before it left it)
       let count = 0;

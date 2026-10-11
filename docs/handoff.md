@@ -1,5 +1,44 @@
 # Handoff (rolling)
 
+Two-hand hypothesis verified (2026-10-11): nonblocking staged audit reproduces the floating 208-node
+centre piece. It separates from mounts/both claw cores at 2.1667 s and all 208 nodes are correctly
+detached with one valid GPU component ID by 2.1833 s; this stays true through 6.1 s while it floats.
+No lingering anchor or missed classification found. New standalone
+`tests/gpu/twohand-topology.ts`: 18/18 checks, including overlapping analysis/cuts/releases and zero
+grip force/stiffness from lingering claw rim entries on detached material. Lint/typecheck and 67 unit
+tests pass. Details/repro in the two-hand verification section of
+`docs/decisions/2026-10-11-folded-fragment-contact.md`. No production fix or commit.
+
+Follow-up investigation (2026-10-11, still unresolved): mapped the visible staged island near pixel
+(437, 357) in `investigation-async2-6` to the same 208 detached mechanical nodes, then compared the
+identical state with no body, a frozen body, and the animated body. With animated body/current
+contacts it ends 10.15 mm above its start after 2 s, barely descending after body contact has ended.
+With only its internal contacts ablated it clears the animated body and exits by 1 s. Thus staged
+collisions contribute the lifting, while internal-contact resistance sustains the apparent hover.
+Actual blend-skinned triangle distances also confirm capsule support off the visible skin, but
+body-only support is transient in this replay. See the follow-up section in
+`docs/decisions/2026-10-11-folded-fragment-contact.md`. Production code was not changed or committed.
+
+Latest investigation (2026-10-11, floating scraps still unresolved):
+`docs/decisions/2026-10-11-folded-fragment-contact.md`. A folded 208-node staged fragment with the
+current rigid-mode change still floats after the creature, grips and all other material are removed.
+Internal contact's diagonal stiffness and absolute displacement bounds suppress common motion:
+1.44 mm fall in 0.1 s versus 51.36 mm when only that component's internal contacts are ablated.
+`tools/studies/foldedfall.ts` reproduces and isolates both defects. No production fix applied in this
+investigation. The earlier "no hovering scraps" conclusion below was too broad; collider refitting
+alone does not resolve this failure.
+
+Latest (2026-10-11, floating torn pieces): `docs/decisions/2026-10-11-detached-rigid-modes.md`
+(uncommitted). Detached pieces hovered because PCG resolved ~4 % of their rigid motion (lace-like
+pieces lose coarse support). Topology now labels pieces; assembly writes their rigid blocks (rigidK);
+rigid_frame.wgsl builds E = Z^T A Z per piece; PCG starts from each piece's rigid response
+(rigid_apply.wgsl). Verified headless: `npm run check` 67 unit, `npm run test:gpu` 26/26 + 19/19 + 7/7
+(new comb / serpentine cut-outs). Beneath: no hovering scraps; sheet artifacts/captures/beneath-falling-pieces.png.
+Not seen in a browser.
+- Remind the user: floor collision for free play (falling pieces pass through the render-only floor).
+- Still waiting on the user: re-fitting the creature's colliders (1-5 cm off the skin,
+  tools/stage/colliderfit.ts); pieces resting on them still float.
+
 Latest (2026-10-11, line-search stalls): `docs/decisions/2026-10-11-pinch-slip.md` (uncommitted).
 The stalls were a grip defect, not a solver one: rim entries torn away from the pinch stayed sprung to
 the hand from any distance. Pinch entries now slip out beyond a pad radius of the patch's own motion;

@@ -12,6 +12,18 @@
 @group(0) @binding(8) var<storage, read> ext: array<vec4<f32>>; // 3 per node: grad, H(xx xy xz yy), H(yz zz)
 // contact bounds per node (selfcontact.wgsl / contact.wgsl; step.wgsl feasible): own and reciprocal
 @group(0) @binding(9) var<storage, read> cmeta: array<vec4<f32>>;
+// per detached node (rigid_frame.wgsl): its external block (inertia, drag, external Hessian, active
+// bounds) and the stiffness its own internal terms (span to next, triple centred on it, two shear
+// diagonals) put on a rigid rotation, as two Sym packed in 3 vec4
+@group(0) @binding(10) var<storage, read_write> rigidK: array<vec4<f32>>;
+
+// A rigid rotation w moves the ends of a term's vector d by w x d: a spring block
+// kPar e e^T + kPerp (I - e e^T) along d resists it with d^2 kPerp (I - e e^T); a scalar stencil k on
+// a vector r with k (|r|^2 I - r r^T).
+fn rotationOfSpring(kPerp: f32, d: vec3<f32>) -> Sym {
+  let l2 = dot(d, d);
+  return Sym(kPerp * (vec3<f32>(l2) - d * d), -kPerp * vec3<f32>(d.x * d.y, d.x * d.z, d.y * d.z));
+}
 
 fn fineLevel() -> LevelInfo {
   var lv: LevelInfo;
@@ -159,6 +171,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let h = P.hg.x;
   let w = st.mass / (h * h);
   var D = symId(w);
+  let detached = x[n].w > 0.5;
+  // external block and the internal rotation stiffness of the terms this node owns (rigidK)
+  var Kx = symId(w);
+  var Kr = symZero();
   var g = w * (dx[n].xyz - pred[n].xyz);
   // implicit air drag (drag.wgsl): 1/2 dx^T Dd dx from the accepted state
   let Dd = airDragBlock(n);
@@ -169,7 +185,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let e1 = ext[3u * n + 1u];
   let e2 = ext[3u * n + 2u];
   g += e0.xyz;
-  D = symAdd(D, Sym(vec3<f32>(e1.x, e1.w, e2.y), vec3<f32>(e1.y, e1.z, e2.x)));
+  let He = Sym(vec3<f32>(e1.x, e1.w, e2.y), vec3<f32>(e1.y, e1.z, e2.x));
+  D = symAdd(D, He);
+  Kx = symAdd(symAdd(Kx, Dd), He);
 
   // couplings: [+u, -u, +v, -v] axial/bending, scalars [+2u, -2u, +2v, -2v]
   var C1: array<Sym, 4>;
@@ -205,6 +223,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let H = axialBlock(s.kPar, s.kPerp, s.e);
       D = symAdd(D, H);
       if (freeNext) { C1[kp] = symAdd(C1[kp], symScale(H, -1.0)); }
+      if (detached) { Kr = symAdd(Kr, rotationOfSpring(s.kPerp, (x[next].xyz + dx[next].xyz) - (x[n].xyz + dx[n].xyz))); }
     }
     // triple centered at n: (prev, n, next), weight of n -2
     if (actPrev && actNext) {
@@ -214,6 +233,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       D = symAdd(D, symId(4.0 * k));
       if (freeNext) { C1[kp] = symAdd(C1[kp], symId(-2.0 * t.wc * k)); }
       if (freePrev) { C1[km] = symAdd(C1[km], symId(-2.0 * t.wa * k)); }
+      if (detached) { Kr = symAdd(Kr, rotationOfSpring(k, t.r)); }
     }
     // triple centered at next: (n, next, next2), weight of n wa
     if (actNext && activeSeg(next, f) && next2 >= 0) {
@@ -258,6 +278,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let H = axialBlock(sl.y, max(fs, 0.0) / len, e);
     D = symAdd(D, H);
     if (!isPinned(p)) { CD[c] = symScale(H, -1.0); }
+    // diagonals of cell (i, j) and, across it, of cell (i, j - 1): each counted at one of its ends
+    if (detached && (c == 0 || c == 3)) { Kr = symAdd(Kr, rotationOfSpring(max(fs, 0.0) / len, d)); }
   }
 
   // Active contact bounds (step.wgsl feasible): a node whose iterate already approaches a face by all
@@ -269,7 +291,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var b = 0u; b < 2u; b++) {
     let m = cmeta[2u * n + b];
     if (m.w >= 1e8 || all(m.xyz == vec3<f32>(0.0))) { continue; }
-    if (-dot(dx[n].xyz, m.xyz) >= m.w - 1e-3 * abs(m.w) && dot(g, m.xyz) > 0.0) { D = symAdd(D, axialBlock(kAct, 0.0, m.xyz)); }
+    if (-dot(dx[n].xyz, m.xyz) >= m.w - 1e-3 * abs(m.w) && dot(g, m.xyz) > 0.0) {
+      D = symAdd(D, axialBlock(kAct, 0.0, m.xyz));
+      Kx = symAdd(Kx, axialBlock(kAct, 0.0, m.xyz));
+    }
+  }
+  if (detached) {
+    rigidK[3u * n] = vec4<f32>(Kx.d.x, Kx.o.x, Kx.o.y, Kx.d.y);
+    rigidK[3u * n + 1u] = vec4<f32>(Kx.o.z, Kx.d.z, Kr.d.x, Kr.o.x);
+    rigidK[3u * n + 2u] = vec4<f32>(Kr.o.y, Kr.d.y, Kr.o.z, Kr.d.z);
   }
 
   storeSym(row, D, vec2<f32>(C2[0], C2[1]));

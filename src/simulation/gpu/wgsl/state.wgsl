@@ -11,7 +11,8 @@
 @group(0) @binding(4) var<storage, read_write> packed: array<u32>;
 @group(0) @binding(5) var<storage, read> freed: array<u32>;
 
-// Per node: bit0 / bit1 = active span of family u / v owned by the node, bit2 = not cloth (x.w > 0).
+// Per node: bit0 / bit1 = active span of family u / v owned by the node, bit2 = not cloth (x.w > 0),
+// bit3 = retired (x.w > 1.5).
 @compute @workgroup_size(128)
 fn pack(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
@@ -20,6 +21,7 @@ fn pack(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (segActive(segs[2u * n])) { b |= 1u; }
   if (segActive(segs[2u * n + 1u])) { b |= 2u; }
   if (x[n].w > 0.5) { b |= 4u; }
+  if (x[n].w > 1.5) { b |= 8u; }
   packed[n] = b;
 }
 

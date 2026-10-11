@@ -18,6 +18,8 @@ import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS } from '../../audio/record';
 import gateWgsl from './wgsl/gate.wgsl?raw';
 import energyWgsl from './wgsl/energy.wgsl?raw';
 import dragWgsl from './wgsl/drag.wgsl?raw';
+import rigidFrameWgsl from './wgsl/rigid_frame.wgsl?raw';
+import rigidApplyWgsl from './wgsl/rigid_apply.wgsl?raw';
 
 export interface GpuSolverParams {
   h: number;
@@ -78,6 +80,12 @@ export const RELEASE_REFINEMENT = { newtonIterations: 4, duration: 0.1 };
 
 /** Upper bound on Newton iterations (size of the per-iteration convergence slots). */
 const MAX_NEWTON = 8;
+/** Detached pieces whose rigid modes the preconditioner carries (rigid_frame.wgsl); more go without. */
+export const MAX_PIECES = 4096;
+/** Workgroups of the per-piece rigid kernels (each loops over pieces). */
+const PIECE_GROUPS = 64;
+/** pieceOf entry of a node outside every detached piece (rigid_apply.wgsl NO_PIECE). */
+export const NO_PIECE = 0xffffffff;
 
 const MAX_LINE = 384;
 /** Line colors per family (3: lines smoothed together never share a stencil coupling). */
@@ -214,6 +222,17 @@ export class GpuSolver {
   /** Cross-layer contact for multi-layer scenes, self-contact for a single layer. */
   readonly contact: Contact | SelfContact;
   readonly contactEnabled: boolean;
+  /** Detached pieces (Topology.setPieces): [0] count, [1 + p] first entry of piece p in pieceNodes. */
+  private readonly pieceStart: GPUBuffer;
+  private readonly pieceNodes: GPUBuffer;
+  private readonly pieceOf: GPUBuffer;
+  private readonly pieceFrame: GPUBuffer;
+  private readonly pieceStep: GPUBuffer;
+  /** Per node (detached only): the blocks the rigid-mode correction sums (assemble.wgsl rigidK). */
+  private readonly rigidK: GPUBuffer;
+  private pieceCount = 0;
+  /** Encoding the dry Newton iteration that records dispatch sizes (every optional pass included). */
+  private recordingSizes = false;
   readonly gateArgs: GPUBuffer;
   private readonly gateSizes: GPUBuffer;
   /** Distinct workgroup counts dispatched by one Newton iteration (index into gate arguments). */
@@ -291,6 +310,12 @@ export class GpuSolver {
     this.counters = createBuffer(device, 'counters', 4 * (ACOUSTIC_SLOT + ACOUSTIC_SLOTS));
     this.acousticSources = createBuffer(device, 'acousticSources', 64, UNIFORM);
     this.contactEnabled = scene.layers.length > 1 || this.params.selfContact;
+    this.pieceStart = createBuffer(device, 'pieces.start', 4 * (MAX_PIECES + 2));
+    this.pieceNodes = createBuffer(device, 'pieces.nodes', 4 * N);
+    this.pieceOf = createBufferWith(device, 'pieces.of', new Uint32Array(N).fill(NO_PIECE));
+    this.pieceFrame = createBuffer(device, 'pieces.frame', 160 * MAX_PIECES);
+    this.pieceStep = createBuffer(device, 'pieces.step', 32 * MAX_PIECES);
+    this.rigidK = createBuffer(device, 'pieces.rigidK', 48 * N);
 
     // ---- levels
     const fineLayers: LatticeLayer[] = scene.layers.map((L) => ({ nx: L.nx, ny: L.ny, offset: L.nodeOffset }));
@@ -337,7 +362,9 @@ export class GpuSolver {
     const rec = { setPipeline() {}, setBindGroup() {}, dispatchWorkgroups(x: number) { if (!sizes.includes(x)) sizes.push(x); }, end() {} };
     this.createPipelines();
     this.createBindGroups();
+    this.recordingSizes = true;
     this.encodeNewtonIteration(rec as unknown as GPUComputePassEncoder, 0, true);
+    this.recordingSizes = false;
     if (!sizes.includes(GRIP_GROUPS)) sizes.push(GRIP_GROUPS);
     sizes.forEach((x, k) => this.sizeIndex.set(x, k));
     this.gateSizes = createBufferWith(device, 'newton.gateSizes', new Uint32Array([sizes.length, new Uint32Array(new Float32Array([params.newtonTolerance]).buffer)[0], ...sizes]));
@@ -406,6 +433,12 @@ export class GpuSolver {
     this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + dragWgsl + energyWgsl));
     this.pl.energyDelta = this.mod.energy.pipeline('energyDelta');
     this.pl.lineChoose = this.mod.energy.pipeline('lineChoose');
+    this.mod.rigidFrame = new ComputeModule(d, 'rigidFrame', patch('rigid', commonWgsl + rigidFrameWgsl));
+    this.pl.rigidFrame = this.mod.rigidFrame.pipeline('rigidFrame');
+    this.mod.rigidApply = new ComputeModule(d, 'rigidApply', patch('rigid', commonWgsl + rigidApplyWgsl));
+    this.pl.rigidReduce = this.mod.rigidApply.pipeline('rigidReduce');
+    this.pl.rigidApply = this.mod.rigidApply.pipeline('rigidApply');
+    this.pl.rigidResidual = this.mod.rigidApply.pipeline('rigidResidual');
   }
 
   private createBindGroups(): void {
@@ -413,7 +446,7 @@ export class GpuSolver {
     const group = (m: string, key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod[m].bindGroup(key, entries);
     };
-    group('assemble', 'assemble', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.pred, 5: this.segs, 6: L0.op, 7: L0.B, 8: this.ext, 9: this.contact.meta });
+    group('assemble', 'assemble', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.pred, 5: this.segs, 6: L0.op, 7: L0.B, 8: this.ext, 9: this.contact.meta, 10: this.rigidK });
     this.levels.forEach((L, k) => {
       const v = k === 0 ? 'Fine' : 'Coarse';
       group(`mg${v}`, `residual${k}`, { 0: L.info, 2: L.op, 3: L.fixed, 6: L.X, 7: L.B, 8: L.R });
@@ -440,6 +473,9 @@ export class GpuSolver {
       group('pcg', `updateP${k}`, { 0: Fi, 1: this.slot(k), 4: this.p, 5: L0.X, 10: this.scal });
     }
     group('pcg', 'initP', { 0: Fi, 1: this.slot(0xffffffff), 4: this.p, 5: L0.X, 10: this.scal });
+    group('rigidFrame', 'rigidFrame', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.rigidK, 5: this.pieceStart, 6: this.pieceNodes, 7: this.pieceFrame });
+    group('rigidApply', 'rigidApply', { 0: this.simParams, 1: this.x, 2: this.dx, 3: this.pieceStart, 4: this.pieceNodes, 5: this.pieceOf, 6: this.pieceFrame, 7: this.pieceStep, 8: L0.B, 9: this.delta, 10: this.Ap });
+    group('pcg', 'matvecDelta', { 0: Fi, 2: L0.op, 3: L0.fixed, 4: this.delta, 5: this.Ap, 9: this.partial });
   }
 
   private createStepBindGroups(): void {
@@ -558,6 +594,8 @@ export class GpuSolver {
    */
   encodeAssemble(pass: GPUComputePassEncoder, coarse = true): void {
     this.dispatch(pass, 'assemble', 'assemble', this.nodeGroups(this.N));
+    // detached pieces' rigid modes at this iterate (rigid_frame.wgsl)
+    if (this.hasPieces) this.dispatch(pass, 'rigidFrame', 'rigidFrame', PIECE_GROUPS);
     if (!coarse) return;
     for (let k = 0; k + 1 < this.levels.length; k++) {
       this.dispatch(pass, k === 0 ? 'pwFine' : 'pwCoarse', `pw${k}`, this.nodeGroups(this.levels[k].N));
@@ -570,6 +608,7 @@ export class GpuSolver {
     const K = this.params.pcgIterations;
     const g = this.nodeGroups(this.N, 256);
     this.dispatch(pass, 'clear2', 'clear', g);
+    this.encodeRigidStart(pass);
     this.encodeVCycle(pass, 0);
     this.dispatch(pass, 'updateP', 'initP', g);
     this.dispatch(pass, 'dotPartial', 'dotRZ', DOT_GROUPS);
@@ -584,6 +623,36 @@ export class GpuSolver {
       this.dispatch(pass, 'reduceFinal', `reduce${2 * k + 2}`, 1);
       this.dispatch(pass, 'updateP', `updateP${k}`, g);
     }
+  }
+
+  private get hasPieces(): boolean {
+    return this.pieceCount > 0 || this.recordingSizes;
+  }
+
+  /** PCG's start: each detached piece's rigid response to the rhs, and its residual (rigid_apply.wgsl). */
+  private encodeRigidStart(pass: GPUComputePassEncoder): void {
+    if (!this.hasPieces) return;
+    this.dispatch(pass, 'rigidReduce', 'rigidApply', PIECE_GROUPS);
+    this.dispatch(pass, 'rigidApply', 'rigidApply', this.nodeGroups(this.N));
+    this.dispatch(pass, 'matvecDot', 'matvecDelta', DOT_GROUPS);
+    this.dispatch(pass, 'rigidResidual', 'rigidApply', this.nodeGroups(this.N));
+  }
+
+  /**
+   * The detached pieces (Topology): per node its piece or NO_PIECE, and each piece's nodes contiguous
+   * in `nodes` from `start[p]` (`start` has count + 1 entries). Pieces beyond MAX_PIECES are left
+   * without the rigid correction. An empty set removes it.
+   */
+  setPieces(pieceOf: Uint32Array, start: Uint32Array, nodes: Uint32Array): void {
+    const count = Math.min(MAX_PIECES, Math.max(0, start.length - 1));
+    const of = count < start.length - 1 ? pieceOf.map((p) => (p < count ? p : NO_PIECE)) : pieceOf;
+    const header = new Uint32Array(count + 2);
+    header[0] = count;
+    header.set(start.subarray(0, count + 1), 1);
+    this.device.queue.writeBuffer(this.pieceStart, 0, header);
+    if (nodes.length > 0) this.device.queue.writeBuffer(this.pieceNodes, 0, nodes);
+    this.device.queue.writeBuffer(this.pieceOf, 0, of);
+    this.pieceCount = count;
   }
 
   /** Line search after a PCG solve: energy changes along delta and the chosen step length. */

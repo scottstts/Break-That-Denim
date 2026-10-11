@@ -2,7 +2,8 @@
  * Detached-material contracts on the production kernels (headless: Node + Dawn). A piece the
  * connectivity analysis detached keeps its mechanics: its intact spans resist extension under
  * differential motion and under partial support, and a free piece translates, rotates and falls as one
- * body. Bending viscosity is internal: it does not resist a rigid rotation.
+ * body, also when it is cut out of the mounted sheet (the solve resolves its rigid modes). Bending
+ * viscosity is internal: it does not resist a rigid rotation.
  *   npm run test:gpu
  * Exits non-zero on failure.
  */
@@ -304,6 +305,53 @@ fn probeBend() {
   solver.device.queue.writeBuffer(solver.dx, 0, new Float32Array(4 * solver.N));
 }
 
+/**
+ * A lace-like piece cut out of the mounted sheet (every span across its outline broken, and inner cuts
+ * as tearing leaves them; the rest of the cloth stays in the solve) falls as freely as drag lets it.
+ * Its rigid motion is resisted only by its inertia against yarn couplings ~1e5 times stiffer, and the
+ * coarse levels miss such a piece: without the rigid-mode start of the Newton direction two PCG
+ * iterations resolved a few percent of its fall (0.24 m/s after 0.25 s) and torn pieces hovered.
+ */
+async function cutOut(fx: Fixture, shape: 'comb' | 'serpentine'): Promise<void> {
+  const { solver, nx, topology, initial, segs0 } = fx;
+  // 8 x 7 nodes below the middle of the sheet: a comb (one row along u, teeth along v) or a
+  // serpentine (rows joined at alternate ends)
+  const i0 = 70;
+  const j0 = 40;
+  const inside = (i: number, j: number) => i >= i0 && i < i0 + 8 && j >= j0 && j < j0 + 7;
+  const piece: number[] = [];
+  const segs = segs0.slice();
+  for (let j = j0 - 1; j < j0 + 8; j++) {
+    for (let i = i0 - 1; i < i0 + 9; i++) {
+      const n = j * nx + i;
+      // spans joining the piece to the rest: (n, u) to (i + 1, j), (n, v) to (i, j + 1)
+      if (inside(i, j) !== inside(i + 1, j)) segs[8 * (2 * n) + 5] |= SEG_BROKEN;
+      if (inside(i, j) !== inside(i, j + 1)) segs[8 * (2 * n + 1) + 5] |= SEG_BROKEN;
+      if (!inside(i, j)) continue;
+      piece.push(n);
+      if (shape === 'comb' && j > j0 && inside(i + 1, j)) segs[8 * (2 * n) + 5] |= SEG_BROKEN;
+      if (shape === 'serpentine' && inside(i, j + 1) && i !== (((j - j0) & 1) === 0 ? i0 + 7 : i0)) segs[8 * (2 * n + 1) + 5] |= SEG_BROKEN;
+    }
+  }
+  topology.reset();
+  solver.setState(initial);
+  solver.device.queue.writeBuffer(solver.segs, 0, segs);
+  await topology.request();
+  const steps = Math.round(0.25 / solver.params.h);
+  substeps(solver, steps);
+  await drain(solver.device);
+  const x = new Float32Array(await readBuffer(solver.device, solver.x));
+  const v = new Float32Array(await readBuffer(solver.device, solver.v));
+  const live = piece.filter((n) => x[4 * n + 3] < 1.5);
+  const vz = live.reduce((t, n) => t + v[4 * n + 2], 0) / Math.max(live.length, 1);
+  const t = steps * solver.params.h;
+  const detached = piece.every((n) => x[4 * n + 3] >= 1);
+  check(`detached: a ${shape} cut out of the sheet falls as freely as drag lets it`, detached && -vz > 0.5 * 9.81 * t, `${piece.length} nodes, fall ${(-vz).toFixed(3)} m/s after ${t.toFixed(2)} s (free fall ${(9.81 * t).toFixed(3)}, half of it required)`);
+  topology.reset();
+  solver.setState(initial);
+  solver.device.queue.writeBuffer(solver.segs, 0, segs0);
+}
+
 export default async function main(): Promise<void> {
   const device = await gpuDevice();
   const { solver, scene } = await settledSolver(device, JSON.parse(process.env.SOLVER ?? '{}') as object);
@@ -321,6 +369,8 @@ export default async function main(): Promise<void> {
   await differential(fx);
   await edge(fx);
   await tumble(fx);
+  await cutOut(fx, 'comb');
+  await cutOut(fx, 'serpentine');
   await strandAtRest(fx);
   await bendViscosity(fx);
   device.destroy();

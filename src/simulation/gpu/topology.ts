@@ -1,6 +1,6 @@
 import { ComputeModule, createBuffer } from '../../gpu/util';
 import type { CompiledScene } from '../scene';
-import type { GpuSolver } from './solver';
+import { NO_PIECE, type GpuSolver } from './solver';
 import commonWgsl from './wgsl/common.wgsl?raw';
 import stateWgsl from './wgsl/state.wgsl?raw';
 
@@ -15,6 +15,10 @@ import stateWgsl from './wgsl/state.wgsl?raw';
  * The anchors are taken when an analysis applies its result, not when it was requested: a grip that
  * attached while the connectivity readback was pending keeps what it holds. (The read connectivity
  * may be older than that; cuts only remove spans, so a stale graph frees less, never more.)
+ *
+ * Every analysis also labels the detached pieces (connected through active spans) for the solver's
+ * rigid-mode correction (GpuSolver.setPieces): pieces split by later ruptures are relabelled by the
+ * analysis those ruptures request.
  */
 export class Topology {
   private readonly device: GPUDevice;
@@ -45,6 +49,10 @@ export class Topology {
   private readonly anchorSource: (() => readonly number[]) | null;
   /** Nodes detached so far (development statistics). */
   freedCount = 0;
+  /** Per node its detached piece (NO_PIECE outside), each piece's nodes contiguous from pieceStart. */
+  private readonly pieceOf: Uint32Array;
+  private readonly pieceNodes: Uint32Array;
+  private pieceSignature = 0;
 
   constructor(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, anchors: (() => readonly number[]) | null = null) {
     this.device = device;
@@ -60,6 +68,8 @@ export class Topology {
     this.staging = device.createBuffer({ label: 'state.staging', size: Math.max(16, 4 * N), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     this.group = this.mod.bindGroup('state', { 0: solver.simParams, 1: solver.segs, 2: solver.x, 4: this.packed, 5: this.freedBuf });
     this.freed = new Uint32Array(N);
+    this.pieceOf = new Uint32Array(N).fill(NO_PIECE);
+    this.pieceNodes = new Uint32Array(N);
     this.visited = new Uint8Array(N);
     this.queue = new Int32Array(N);
     this.stride = new Int32Array(N);
@@ -100,6 +110,9 @@ export class Topology {
     const enc = this.device.createCommandEncoder({ label: 'state.reset' });
     enc.clearBuffer(this.freedBuf);
     this.device.queue.submit([enc.finish()]);
+    this.pieceOf.fill(NO_PIECE);
+    this.pieceSignature = 0;
+    this.solver.setPieces(this.pieceOf, new Uint32Array(1), new Uint32Array(0));
     const fixed = new Uint32Array(this.scene.nodeCount);
     for (let n = 0; n < fixed.length; n++) fixed[n] = this.scene.pinned[n];
     this.device.queue.writeBuffer(this.solver.levels[0].fixed, 0, fixed);
@@ -132,6 +145,7 @@ export class Topology {
         p2.end();
         this.device.queue.submit([e2.finish()]);
       }
+      this.labelPieces(bits);
     } while (this.again);
   }
 
@@ -160,6 +174,47 @@ export class Topology {
     }
     this.freedCount += count;
     return count;
+  }
+
+  /**
+   * Label the detached pieces (detached before, or freed by this analysis; not retired) through active
+   * spans, and hand them to the solver when they changed.
+   */
+  private labelPieces(bits: Uint32Array): void {
+    const N = this.scene.nodeCount;
+    const detached = (n: number) => ((bits[n] & 4) !== 0 && (bits[n] & 8) === 0) || this.freed[n] === 1;
+    const of = this.pieceOf;
+    of.fill(NO_PIECE);
+    const start: number[] = [0];
+    let tail = 0;
+    let hash = 2166136261;
+    for (let seed = 0; seed < N; seed++) {
+      if (of[seed] !== NO_PIECE || !detached(seed)) continue;
+      const p = start.length - 1;
+      let head = tail;
+      of[seed] = p;
+      this.pieceNodes[tail++] = seed;
+      while (head < tail) {
+        const n = this.pieceNodes[head++];
+        const nx = this.stride[n];
+        const nbr: number[] = [];
+        if (bits[n] & 1) nbr.push(n + 1);
+        if (bits[n] & 2) nbr.push(n + nx);
+        if (this.column[n] > 0 && bits[n - 1] & 1) nbr.push(n - 1);
+        if (this.row[n] > 0 && bits[n - nx] & 2) nbr.push(n - nx);
+        for (const m of nbr) {
+          if (of[m] !== NO_PIECE || !detached(m)) continue;
+          of[m] = p;
+          this.pieceNodes[tail++] = m;
+        }
+      }
+      start.push(tail);
+      hash = Math.imul(hash ^ (seed + 1), 16777619) ^ tail;
+    }
+    hash = (hash ^ start.length) >>> 0;
+    if (hash === this.pieceSignature) return;
+    this.pieceSignature = hash;
+    this.solver.setPieces(of, Uint32Array.from(start), this.pieceNodes.subarray(0, tail));
   }
 
   private push(bits: Uint32Array, n: number): void {
