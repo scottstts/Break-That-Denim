@@ -3,7 +3,8 @@ import { COTTON_FIBRE_DENSITY } from '../simulation/material';
 import type { GpuSolver } from '../simulation/gpu/solver';
 import { SELF_CONTACT, SelfContact } from '../simulation/gpu/selfcontact';
 import { ComputeModule, createBuffer, createBufferWith, shaderModule, STORAGE, UNIFORM } from '../gpu/util';
-import { invert, lookAt, multiply, normalize, orthographic, perspective, sub, type Mat4, type Vec3 } from './math';
+import { cameraMatrices, type CameraState } from './camera';
+import { lookAt, multiply, normalize, orthographic, sub, type Mat4, type Vec3 } from './math';
 import commonWgsl from './wgsl/render_common.wgsl?raw';
 import lightWgsl from './wgsl/render_light.wgsl?raw';
 import refineWgsl from './wgsl/refine.wgsl?raw';
@@ -25,24 +26,7 @@ import coverageWgsl from './wgsl/coverage.wgsl?raw';
 import mipgenWgsl from './wgsl/mipgen.wgsl?raw';
 import mountWgsl from './wgsl/mount.wgsl?raw';
 
-export interface CameraState {
-  target: Vec3;
-  distance: number;
-  /** Tilt from the cloth normal toward -y (rad). */
-  pitch: number;
-  /** Rotation about the cloth normal (rad). */
-  yaw: number;
-  fovY: number;
-}
-
-/** About 35 cm of cloth across the view height: the projected weave density of the reference. */
-export const DEFAULT_CAMERA: CameraState = {
-  target: [0.0, 0.0, -0.01],
-  distance: 0.98,
-  pitch: 0.16,
-  yaw: 0,
-  fovY: (20 * Math.PI) / 180,
-};
+export { DEFAULT_CAMERA, cameraMatrices, type CameraState, type ViewMatrices } from './camera';
 
 const SAMPLES = 4;
 /** Bytes per layer in the RenderU uniform (render_common.wgsl LayerR). */
@@ -71,6 +55,45 @@ const COV_BLOCK = 4;
  */
 const KEY_ANGULAR_RADIUS = (3 * (2 * SHADOW_HALF)) / SHADOW_SIZE / 2e-3;
 const FRAME_BYTES = 512;
+
+/**
+ * Opaque geometry staged into the scene beside the cloth (Renderer.extras): drawn into both lights'
+ * shadow maps (the bound frame uniform carries that light's projection) and into the main pass.
+ */
+export interface SceneExtra {
+  drawShadow(pass: GPURenderPassEncoder, light: 'key' | 'over'): void;
+  drawMain(pass: GPURenderPassEncoder): void;
+}
+
+/** What staged geometry needs to shade in the scene's lighting (Renderer.shared). */
+export interface SharedResources {
+  /** Render prelude and common definitions, then the lighting functions (render_light.wgsl). */
+  common: string;
+  light: string;
+  frameU: GPUBuffer;
+  frameOverU: GPUBuffer;
+  shadowView: GPUTextureView;
+  overView: GPUTextureView;
+  dummyDepthView: GPUTextureView;
+  shadowSampler: GPUSampler;
+  hdrFormat: GPUTextureFormat;
+  samples: number;
+}
+
+/**
+ * Camera-film treatment applied in the post pass (all zero: the product's plain tone map).
+ * grade: amount of the staged grade, film grain, vignette; glitch: amount of signal corruption and its
+ * seed (held for a few frames).
+ */
+export interface PostEffects {
+  grade: number;
+  grain: number;
+  vignette: number;
+  glitch: number;
+  glitchSeed: number;
+}
+
+export const NO_POST_EFFECTS: PostEffects = { grade: 0, grain: 0, vignette: 0, glitch: 0, glitchSeed: 0 };
 
 /** An image for the floor material: decoded RGBA8 bytes (headless) or a browser image bitmap. */
 export type FloorImage = ImageBitmap | { width: number; height: number; data: Uint8Array };
@@ -113,23 +136,6 @@ const EDGE_FORMAT: GPUTextureFormat = 'rgba16float';
 /** Jump-flooding steps (crossings) of the edge field: enough to reach EDGE_RMAX across warps and picks. */
 const JFA_STEPS = [16, 8, 4, 2, 1, 1];
 
-export interface ViewMatrices {
-  eye: Vec3;
-  view: Mat4;
-  proj: Mat4;
-  viewProj: Mat4;
-  invViewProj: Mat4;
-}
-
-export function cameraMatrices(c: CameraState, aspect: number): ViewMatrices {
-  const dir: Vec3 = [Math.sin(c.yaw) * Math.sin(c.pitch), -Math.cos(c.yaw) * Math.sin(c.pitch), Math.cos(c.pitch)];
-  const eye: Vec3 = [c.target[0] + dir[0] * c.distance, c.target[1] + dir[1] * c.distance, c.target[2] + dir[2] * c.distance];
-  const up: Vec3 = [-Math.sin(c.yaw), Math.cos(c.yaw), 0];
-  const view = lookAt(eye, c.target, up);
-  const proj = perspective(c.fovY, aspect, 0.05, 3.0);
-  const viewProj = multiply(proj, view);
-  return { eye, view, proj, viewProj, invViewProj: invert(viewProj) };
-}
 
 /** Layout constants of the yarn-resolution passes, prepended to every render module. */
 function prelude(scene: CompiledScene, faceHash: boolean): string {
@@ -186,9 +192,16 @@ export class Renderer {
   exposure = 1.0;
   /** Sky/bounce fill (hemisphere top): shadowed cloth stays a dark blue, as in the reference. */
   ambient: Vec3 = [0.03, 0.035, 0.05];
-  /** Where the key's cone is aimed, relative to the camera target, and the cosine where its soft edge starts. */
+  /**
+   * Where the key's cone is aimed, relative to the camera target; the cosines where its soft edge
+   * starts and where it reaches full strength; the share of light outside the cone (the fixture's
+   * spill); its colour.
+   */
   keyAim: Vec3 = [0.0, 0.12, 0];
   keyCone = 0.9;
+  keyInner = 1.0;
+  keyLeak = 0.05;
+  keyColor: Vec3 = [1, 1, 1];
   /** Radiance behind the cloth (the void seen through openings). */
   background: Vec3 = [0.002, 0.002, 0.003];
   /**
@@ -209,6 +222,19 @@ export class Renderer {
   floorTile = 2.5;
   /** Texels per tile of the floor's base colour and normal maps (public/texture holds their centre crop). */
   floorDetailTexels = 8192;
+  /** Draw the floor (a staged experience plays over the void). */
+  showFloor = true;
+  /**
+   * Where the lights are placed and their shadow maps centred: null follows the camera's target (the
+   * product's framing); a staged camera that moves pins them to the room instead.
+   */
+  lightAnchor: Vec3 | null = null;
+  /** Opaque staged geometry (SceneExtra). */
+  readonly extras: SceneExtra[] = [];
+  /** Post-pass treatment (PostEffects). */
+  post: PostEffects = { ...NO_POST_EFFECTS };
+  /** Present the last rendered frame again through the post pass only (a frozen picture). */
+  freeze = false;
 
   private readonly frameU: GPUBuffer;
   /** The frame uniform as the overhead light's shadow pass sees it (its projection in place of the key's). */
@@ -268,6 +294,9 @@ export class Renderer {
   private readonly tileSampler: GPUSampler;
   private readonly shadowSampler: GPUSampler;
   private readonly dummyDepth: GPUTexture;
+  /** Render prelude and common definitions of every render module. */
+  private readonly common: string;
+  private readonly postU: GPUBuffer;
   private postGroup: GPUBindGroup | null = null;
   private msaaColor: GPUTexture | null = null;
   private msaaDepth: GPUTexture | null = null;
@@ -288,6 +317,7 @@ export class Renderer {
     // the free tails collide with the cloth through the solver's self-contact face hash
     const faceHash = solver.contactEnabled && solver.contact instanceof SelfContact ? solver.contact : null;
     const common = prelude(scene, faceHash !== null) + commonWgsl;
+    this.common = common;
 
     let cells = 0;
     let refined = 0;
@@ -675,8 +705,10 @@ export class Renderer {
       entries: [
         { binding: 0, visibility: F, buffer: { type: 'uniform' } },
         { binding: 1, visibility: F, texture: { sampleType: 'unfilterable-float' } },
+        { binding: 2, visibility: F, buffer: { type: 'uniform' } },
       ],
     });
+    this.postU = createBuffer(device, 'postU', 32, UNIFORM);
     this.pipes.post = device.createRenderPipeline({
       label: 'post',
       layout: device.createPipelineLayout({ bindGroupLayouts: [this.postLayout] }),
@@ -684,6 +716,22 @@ export class Renderer {
       fragment: { module: postModule, entryPoint: 'fsTonemap', targets: [{ format }] },
       primitive: { topology: 'triangle-list' },
     });
+  }
+
+  /** Shader prelude, frame uniforms and shadow maps for staged geometry (SceneExtra). */
+  shared(): SharedResources {
+    return {
+      common: this.common,
+      light: lightWgsl,
+      frameU: this.frameU,
+      frameOverU: this.frameOverU,
+      shadowView: this.shadowTex.createView(),
+      overView: this.overTex.createView(),
+      dummyDepthView: this.dummyDepth.createView(),
+      shadowSampler: this.shadowSampler,
+      hdrFormat: HDR_FORMAT,
+      samples: SAMPLES,
+    };
   }
 
   /** Prefiltered weave tile per layer: every mip level averaged analytically (weave_tile.wgsl). */
@@ -929,7 +977,14 @@ export class Renderer {
     this.msaaColor = this.device.createTexture({ label: 'msaaColor', size, format: HDR_FORMAT, sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT });
     this.msaaDepth = this.device.createTexture({ label: 'msaaDepth', size, format: 'depth32float', sampleCount: SAMPLES, usage: GPUTextureUsage.RENDER_ATTACHMENT });
     this.hdr = this.device.createTexture({ label: 'hdr', size, format: HDR_FORMAT, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
-    this.postGroup = this.device.createBindGroup({ layout: this.postLayout, entries: [{ binding: 0, resource: { buffer: this.frameU } }, { binding: 1, resource: this.hdr.createView() }] });
+    this.postGroup = this.device.createBindGroup({
+      layout: this.postLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.frameU } },
+        { binding: 1, resource: this.hdr.createView() },
+        { binding: 2, resource: { buffer: this.postU } },
+      ],
+    });
   }
 
   private lightMatrix(target: Vec3): Mat4 {
@@ -957,35 +1012,45 @@ export class Renderer {
   encode(encoder: GPUCommandEncoder, camera: CameraState, time: number, target: GPUTextureView, profile?: GPUQuerySet): void {
     const tw = (k: number) => (profile ? { querySet: profile, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 } : undefined);
     if (!this.hdr || !this.msaaColor || !this.msaaDepth || !this.postGroup) return;
+    const pe = this.post;
+    this.device.queue.writeBuffer(this.postU, 0, new Float32Array([pe.grade, pe.grain, pe.vignette, time, pe.glitch, pe.glitchSeed, 0, 0]));
+    if (this.freeze) {
+      this.encodePost(encoder, target, tw(3));
+      return;
+    }
     const m = cameraMatrices(camera, this.width / this.height);
-    const key: Vec3 = [camera.target[0] + this.keyOffset[0], camera.target[1] + this.keyOffset[1], camera.target[2] + this.keyOffset[2]];
+    const anchor = this.lightAnchor ?? camera.target;
+    const key: Vec3 = [anchor[0] + this.keyOffset[0], anchor[1] + this.keyOffset[1], anchor[2] + this.keyOffset[2]];
     // aim the key slightly above the frame centre so illumination falls off toward the bottom
-    const aim: Vec3 = [camera.target[0] + this.keyAim[0], camera.target[1] + this.keyAim[1], camera.target[2] + this.keyAim[2]];
+    const aim: Vec3 = [anchor[0] + this.keyAim[0], anchor[1] + this.keyAim[1], anchor[2] + this.keyAim[2]];
+    const floor = this.floorGroup !== null && this.showFloor;
     const axis = normalize(sub(aim, key));
     const fu = new Float32Array(FRAME_BYTES / 4);
     fu.set(m.viewProj, 0);
-    fu.set(this.lightMatrix(camera.target), 16);
+    fu.set(this.lightMatrix(anchor), 16);
     fu.set([...m.eye, camera.fovY / this.height], 32);
     // keyPos relative intensity normalisation uses |keyPos| (see keyLight); positions are in world space
     fu.set([...key, this.keyIntensity], 36);
     fu.set([...axis, this.keyCone], 40);
     fu.set([...this.ambient, (2 * SHADOW_HALF) / SHADOW_SIZE], 44);
     fu.set([this.width, this.height, 1 / this.width, 1 / this.height], 48);
-    const kd = Math.hypot(key[0] - camera.target[0], key[1] - camera.target[1], key[2] - camera.target[2]);
+    const kd = Math.hypot(key[0] - anchor[0], key[1] - anchor[1], key[2] - anchor[2]);
     fu.set([this.exposure, time, kd, this.frameIndex++], 52);
-    const over = this.overMatrix(camera.target);
+    const over = this.overMatrix(anchor);
     const od = normalize(this.overDir);
     fu.set(over, 56);
     fu.set([...od, (2 * OVER_HALF) / OVER_SIZE], 72);
     fu.set([...this.overColor.map((c) => c * this.overIntensity), this.overAngle], 76);
-    fu.set([this.floorZ, 1 / this.floorTile, this.floorGroup ? 1 : 0, this.floorDetailTexels], 80);
+    fu.set([this.floorZ, 1 / this.floorTile, floor ? 1 : 0, this.floorDetailTexels], 80);
     fu.set([KEY_ANGULAR_RADIUS, SHADOW_FAR - SHADOW_NEAR, 2 * SHADOW_HALF, SHADOW_SIZE / COV_BLOCK], 84);
     fu.set([this.overAngle, OVER_FAR - OVER_NEAR, 2 * OVER_HALF, OVER_SIZE / COV_BLOCK], 88);
+    fu.set([this.keyInner, this.keyLeak, 0, 0], 92);
+    fu.set([...this.keyColor, 0], 96);
     this.device.queue.writeBuffer(this.frameU, 0, fu);
     // the overhead light's shadow pass: its projection in place of the key's, and the loose threads'
     // ribbons turned toward it (they face keyPos when drawn from the light)
     fu.set(over, 16);
-    fu.set([camera.target[0] + 10 * od[0], camera.target[1] + 10 * od[1], camera.target[2] + 10 * od[2]], 36);
+    fu.set([anchor[0] + 10 * od[0], anchor[1] + 10 * od[1], anchor[2] + 10 * od[2]], 36);
     this.device.queue.writeBuffer(this.frameOverU, 0, fu);
 
     const N = this.scene.nodeCount;
@@ -1058,6 +1123,7 @@ export class Renderer {
     sp.setBindGroup(0, this.groups.mountShadow);
     sp.setPipeline(this.pipes.mountShadow);
     sp.draw(24);
+    for (const e of this.extras) e.drawShadow(sp, 'key');
     sp.end();
 
     const op = encoder.beginRenderPass({
@@ -1076,9 +1142,10 @@ export class Renderer {
     op.setBindGroup(0, this.groups.mountOver);
     op.setPipeline(this.pipes.mountShadow);
     op.draw(24);
+    for (const e of this.extras) e.drawShadow(op, 'over');
     op.end();
 
-    if (this.floorGroup) {
+    if (floor) {
       // the floor's view of the cloth from each light
       const cc = encoder.beginComputePass({ label: 'floorCoverage' });
       for (const c of this.covGroups) {
@@ -1106,7 +1173,8 @@ export class Renderer {
     mp.setBindGroup(0, this.groups.mount);
     mp.setPipeline(this.pipes.mount);
     mp.draw(24);
-    if (this.floorGroup) {
+    for (const e of this.extras) e.drawMain(mp);
+    if (floor && this.floorGroup) {
       // after the opaque cloth (only what shows through it is shaded), before the blended fibre over it
       mp.setBindGroup(0, this.floorGroup);
       mp.setPipeline(this.pipes.floor);
@@ -1120,13 +1188,17 @@ export class Renderer {
     mp.drawIndirect(this.piecesArgs, 16);
     mp.end();
 
+    this.encodePost(encoder, target, tw(3));
+  }
+
+  private encodePost(encoder: GPUCommandEncoder, target: GPUTextureView, timestampWrites?: GPURenderPassTimestampWrites): void {
     const pp = encoder.beginRenderPass({
       label: 'post',
-      timestampWrites: tw(3),
+      timestampWrites,
       colorAttachments: [{ view: target, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
     });
     pp.setPipeline(this.pipes.post);
-    pp.setBindGroup(0, this.postGroup);
+    pp.setBindGroup(0, this.postGroup!);
     pp.draw(3);
     pp.end();
   }

@@ -51,13 +51,24 @@
       <span class="loader-rows loader-fill"></span>
       <span class="loader-needle"></span>
     </div>
-    <button class="reset" type="button" aria-label="Reset the denim" title="Reset the denim">
-      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-        <path d="M19.4 13.1a7.5 7.5 0 1 1-2.1-6.4" />
-        <path d="M18.3 3.4v3.9h-3.9" />
-      </svg>
-      <span>Reset</span>
-    </button>
+    <div class="dock">
+      <ul class="experiences" id="experiences" role="menu" aria-label="Experiences" hidden>
+        <li role="none"><button class="experience" type="button" role="menuitem" data-experience="beneath">Smilie</button></li>
+      </ul>
+      <button class="menu" type="button" aria-label="Experiences" title="Experiences" aria-haspopup="menu" aria-expanded="false" aria-controls="experiences">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path d="M2.8 12s3.4-6 9.2-6 9.2 6 9.2 6-3.4 6-9.2 6-9.2-6-9.2-6z" />
+          <circle cx="12" cy="12" r="2.6" />
+        </svg>
+      </button>
+      <button class="reset" type="button" aria-label="Reset the denim" title="Reset the denim">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path d="M19.4 13.1a7.5 7.5 0 1 1-2.1-6.4" />
+          <path d="M18.3 3.4v3.9h-3.9" />
+        </svg>
+        <span>Reset</span>
+      </button>
+    </div>
     <div class="status" role="status" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

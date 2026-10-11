@@ -238,8 +238,10 @@ export class GpuSolver {
   private readonly mod: Record<string, ComputeModule> = {};
   /** Encodes per-substep external work (grip lead clamp) after the predictor. */
   preSubstep: ((pass: GPUComputePassEncoder) => void) | null = null;
-  /** Encodes external terms (grip) into ext before each assembly, using the solver's dispatcher. */
+  /** Encodes external terms (grip, body) into ext before each assembly, using the solver's dispatcher. */
   preAssemble: ((dispatch: (pipe: GPUComputePipeline, group: GPUBindGroup, maxGroups: number) => void) => void) | null = null;
+  /** Encodes external work on the committed state before the damage update (a staged body's claws piercing). */
+  postCommit: ((pass: GPUComputePassEncoder) => void) | null = null;
 
   constructor(device: GPUDevice, scene: CompiledScene, params: GpuSolverParams = GPU_DEFAULTS) {
     this.device = device;
@@ -593,7 +595,8 @@ export class GpuSolver {
   /** One Newton iteration (index `it` selects its convergence slot). `dry` records sizes only. */
   encodeNewtonIteration(pass: GPUComputePassEncoder, it: number, dry = false): void {
     if (this.contactEnabled) this.contact.encodeTerms(pass);
-    if (!dry) this.preAssemble?.((pipe, group) => this.dispatchRaw(pass, pipe, group, GRIP_GROUPS));
+    // external terms (grips, a staged body) dispatch at sizes the gate table holds (grip or node groups)
+    if (!dry) this.preAssemble?.((pipe, group, groups) => this.dispatchRaw(pass, pipe, group, groups));
     this.encodeAssemble(pass, it === 0);
     this.encodePCG(pass);
     this.encodeLineSearch(pass);
@@ -621,6 +624,7 @@ export class GpuSolver {
 
   encodeFinalize(pass: GPUComputePassEncoder): void {
     this.dispatch(pass, 'commit', 'commit', this.nodeGroups(this.N));
+    this.postCommit?.(pass);
     this.encodeDamage(pass);
     for (let f = 0; f < 2; f++) for (let par = 0; par < 2; par++) this.dispatch(pass, 'slip', `slip${f}${par}`, this.nodeGroups(this.N));
   }

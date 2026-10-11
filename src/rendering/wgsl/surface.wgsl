@@ -384,7 +384,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let over = F.overColor.rgb * shO;
   let amb = F.ambient.rgb * (0.55 + 0.45 * Nf.z);
   // direct irradiance on the cloth's plane, for the haze of fibres bridging the grooves
-  let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) + over * max(dot(Nf, F.overDir.xyz), 0.0);
+  let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) * F.keyColor.rgb + over * max(dot(Nf, F.overDir.xyz), 0.0);
   // the rim's loose fibres: pale albedo, more sheen, weave washed out toward the edge
   var fib = vec4<f32>(0.0);
   if (rim.rim > 0.0) { fib = rimFibres(rest, rim.dir, in.layer, pix); }
@@ -490,7 +490,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let inv = 1.0 / cnt;
     let Nl = normalize(nSum);
     let Tl = normalize(tSum - dot(tSum, Nl) * Nl + 1e-6 * Tu);
-    acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) + fiberShade(Nl, Tl, Vv, F.overDir.xyz, albDirect * inv, fuzz * inv) * over + amb * albAmb * inv;
+    acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) * F.keyColor.rgb + fiberShade(Nl, Tl, Vv, F.overDir.xyz, albDirect * inv, fuzz * inv) * over + amb * albAmb * inv;
     // loose fibres bridging the grooves: a faint haze lifts the deepest points
     acc = mix(acc, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * groove * inv * fuzz * inv);
     acc *= cnt;
@@ -521,7 +521,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let Tf = normalize(cos(tw) * Ta + sin(tw) * cross(Ny, Ta));
     let fz = mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak;
     let albD = albedo * mix(0.55, 1.0, ao);
-    var ct = fiberShade(Ny, Tf, Vv, key.xyz, albD, fz) * (key.w * sh) + fiberShade(Ny, Tf, Vv, F.overDir.xyz, albD, fz) * over + amb * albedo * ao;
+    var ct = fiberShade(Ny, Tf, Vv, key.xyz, albD, fz) * (key.w * sh) * F.keyColor.rgb + fiberShade(Ny, Tf, Vv, F.overDir.xyz, albD, fz) * over + amb * albedo * ao;
     ct = mix(ct, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
     color = select(mix(color, ct, lodTile), ct, cnt == 0.0);
     if (lodTile >= 1.0) {

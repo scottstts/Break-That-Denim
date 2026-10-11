@@ -146,7 +146,7 @@ fn fibreDirect(Ld: vec3<f32>, E: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3
 
 // The key (through tau), the overhead light (through tauO) and the fill.
 fn fibreLight(key: vec4<f32>, over: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32, tauO: f32) -> FibreLit {
-  let k = fibreDirect(key.xyz, vec3<f32>(key.w), T, V, Nc, a, tau);
+  let k = fibreDirect(key.xyz, key.w * F.keyColor.rgb, T, V, Nc, a, tau);
   let o2 = fibreDirect(over.xyz, F.overColor.rgb * over.w, T, V, Nc, a, tauO);
   var o: FibreLit;
   o.single = k.single + o2.single;

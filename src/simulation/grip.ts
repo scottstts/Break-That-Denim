@@ -119,13 +119,39 @@ function splitPads(s: CompiledScene, node: number, disc: GripPatch, axis: number
   return out;
 }
 
+/** A hold other than a fingertip pinch: claws hooked into the weave (a staged creature's hand). */
+export interface HookProfile {
+  /** Material radius each claw holds (m): the yarns caught on its curve. */
+  radius: number;
+  /** Total force bound (N) and the handle's largest lead (m), as GRIP.maxForce / maxLead. */
+  maxForce: number;
+  maxLead: number;
+}
+
+/**
+ * Claws hooked into the cloth at several crossings: the union of a smoothly weighted disc of
+ * `profile.radius` around each (a node in two discs takes the larger weight). Claws hold rigidly (no
+ * pinch). Null when nothing free is left.
+ */
+export function hookPatch(s: CompiledScene, claws: readonly number[], profile: HookProfile, available: (n: number) => boolean = () => true, window?: PatchWindow): GripPatch | null {
+  const weight = new Map<number, number>();
+  for (const c of claws) {
+    const disc = patchDisc(s, c, available, window, profile.radius);
+    disc?.nodes.forEach((n, k) => weight.set(n, Math.max(weight.get(n) ?? 0, disc.weights[k])));
+  }
+  if (weight.size === 0) return null;
+  const nodes = [...weight.keys()];
+  const weights = nodes.map((n) => weight.get(n)!);
+  const W = weights.reduce((a, b) => a + b, 0);
+  return { nodes, weights, sides: nodes.map(() => 0), padPitch: 0, between: [], stiffness: profile.maxForce / (profile.maxLead * W) };
+}
+
 /** The smoothly weighted disc around `node` (see gripPatch), with a radial pinch. */
-function patchDisc(s: CompiledScene, node: number, available: (n: number) => boolean, window?: PatchWindow): GripPatch | null {
+function patchDisc(s: CompiledScene, node: number, available: (n: number) => boolean, window?: PatchWindow, R = GRIP.radius): GripPatch | null {
   const layer = s.layers.find((L) => node >= L.nodeOffset && node < L.nodeOffset + L.nodeCount);
   if (!layer) return null;
   const u0 = s.restUV[2 * node];
   const v0 = s.restUV[2 * node + 1];
-  const R = GRIP.radius;
   const m = layer.material;
   const reach = window ? reachable(window, m.pitchU, m.pitchV, PATCH_PATH * R) : null;
   const ri = window ? window.radius : Math.ceil(R / m.pitchU);

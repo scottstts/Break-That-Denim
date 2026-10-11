@@ -1,7 +1,7 @@
 import './style.css';
 import { TearAudio } from './audio/audio';
 import { computeDrawingBufferSize } from './shared/drawingBuffer';
-import { ALL_POINTERS, type FromEngine, type ToEngine } from './shared/messages';
+import { ALL_POINTERS, type ExperienceName, type FromEngine, type ToEngine } from './shared/messages';
 
 const canvas = document.createElement('canvas');
 canvas.className = 'stage';
@@ -10,6 +10,9 @@ document.body.prepend(canvas);
 const status = document.querySelector<HTMLElement>('.status')!;
 const reset = document.querySelector<HTMLButtonElement>('.reset')!;
 const loader = document.querySelector<HTMLElement>('.loader')!;
+const menu = document.querySelector<HTMLButtonElement>('.menu')!;
+const list = document.querySelector<HTMLElement>('.experiences')!;
+const items = [...list.querySelectorAll<HTMLButtonElement>('.experience')];
 
 // the wordmark appears once its typefaces are in (no fallback flash), or with the fallback after a wait
 void Promise.race([
@@ -97,7 +100,12 @@ canvas.addEventListener(
   { passive: false },
 );
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') cancelAll(e.timeStamp);
+  if (e.key !== 'Escape') return;
+  if (menuOpen()) {
+    openMenu(false);
+    menu.focus();
+  }
+  cancelAll(e.timeStamp);
 });
 window.addEventListener('blur', () => cancelAll(performance.now()));
 document.addEventListener('visibilitychange', () => {
@@ -105,8 +113,34 @@ document.addEventListener('visibilitychange', () => {
   post({ type: 'visibility', visible });
   audio.setVisible(visible);
 });
+// staged experiences: the menu lists them; choosing one plays it on intact cloth (the reset button
+// ends it); assets are fetched as soon as the menu opens
+const menuOpen = () => !list.hasAttribute('hidden');
+function openMenu(open: boolean) {
+  list.hidden = !open;
+  menu.setAttribute('aria-expanded', String(open));
+  if (!open) return;
+  audio.prefetchStaged();
+  for (const item of items) post({ type: 'prefetch', name: item.dataset.experience as ExperienceName });
+}
+menu.addEventListener('click', () => {
+  audio.unlock();
+  openMenu(!menuOpen());
+});
+for (const item of items) {
+  item.addEventListener('click', () => {
+    audio.unlock();
+    audio.prefetchStaged();
+    post({ type: 'experience', name: item.dataset.experience as ExperienceName });
+    openMenu(false);
+  });
+}
+document.addEventListener('pointerdown', (e) => {
+  if (menuOpen() && !(e.target instanceof Node && (list.contains(e.target) || menu.contains(e.target)))) openMenu(false);
+});
 reset.addEventListener('click', () => {
   audio.unlock();
+  openMenu(false);
   post({ type: 'reset' });
   reset.classList.remove('spin');
   void reset.offsetWidth;
@@ -148,6 +182,18 @@ worker.onmessage = (ev: MessageEvent<FromEngine>) => {
     }
     document.body.classList.toggle('loading', m.state === 'loading');
     if (m.state === 'running') markReady();
+  } else if (m.type === 'experience') {
+    const item = items.find((i) => i.dataset.experience === m.name);
+    if (m.state === 'loading') item?.setAttribute('aria-busy', 'true');
+    else item?.removeAttribute('aria-busy');
+    document.body.classList.toggle('staged', m.state === 'loading' || m.state === 'playing');
+    if (m.state === 'failed') {
+      status.textContent = 'That experience could not be loaded.';
+      status.classList.add('visible');
+      setTimeout(() => status.classList.remove('visible'), 2600);
+    }
+  } else if (m.type === 'cue') {
+    audio.cue(m.cue);
   } else if (m.type === 'cursor') {
     canvas.style.cursor = m.cursor;
   } else if (m.type === 'stats') {

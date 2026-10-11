@@ -1,7 +1,12 @@
 import workletUrl from './worklet.ts?worker&url';
+import type { SoundCue } from '../shared/messages';
+import { glitchNoise } from './glitch';
 import { prepareSource } from './tearVoice';
 
 const recordingUrl = `${import.meta.env.BASE_URL}fabric_tear_sound_sample.mp3`;
+const laughUrl = `${import.meta.env.BASE_URL}exprerience_sounds/creepy_laugh.mp3`;
+/** Fades at the edges of a signal-noise burst (s). */
+const EDGE = 0.015;
 
 /**
  * Main-thread setup of the tear sound. Browsers start audio only from a user gesture, so the context
@@ -16,6 +21,10 @@ export class TearAudio {
   private starting: Promise<void> | null = null;
   private readonly connect: (port: MessagePort) => void;
   private readonly recording: Promise<ArrayBuffer | null>;
+  /** Staged sounds: the laugh (fetched when an experience is in view, decoded once audio runs) and what plays. */
+  private laughBytes: Promise<ArrayBuffer | null> | null = null;
+  private laugh: Promise<AudioBuffer | null> | null = null;
+  private readonly playing = new Set<AudioScheduledSourceNode>();
 
   constructor(connect: (port: MessagePort) => void) {
     this.connect = connect;
@@ -58,6 +67,75 @@ export class TearAudio {
       .catch((e: unknown) => console.warn('Tear sound unavailable:', e));
   }
 
+  /** Fetch the staged sounds ahead of use (an experience is about to be chosen); decoded once audio runs. */
+  prefetchStaged(): void {
+    this.laughBytes ??= fetch(laughUrl)
+      .then((r) => (r.ok ? r.arrayBuffer() : null))
+      .catch(() => null);
+    if (this.context) void this.laughBuffer(this.context);
+  }
+
+  private laughBuffer(context: AudioContext): Promise<AudioBuffer | null> {
+    this.laughBytes ??= fetch(laughUrl)
+      .then((r) => (r.ok ? r.arrayBuffer() : null))
+      .catch(() => null);
+    this.laugh ??= this.laughBytes.then((b) => (b ? context.decodeAudioData(b) : null)).catch(() => null);
+    return this.laugh;
+  }
+
+  /** Play (or stop) a staged experience's sound now. */
+  cue(c: SoundCue): void {
+    const context = this.context;
+    if (!context) return;
+    if (c.kind === 'stop') {
+      const t = context.currentTime;
+      for (const s of this.playing) {
+        try {
+          s.stop(t + 0.05);
+        } catch {
+          // already stopped
+        }
+      }
+      this.playing.clear();
+      return;
+    }
+    if (c.kind === 'laugh') {
+      // the recording as it is: whole, at its own level
+      void this.laughBuffer(context).then((buffer) => {
+        if (!buffer) return;
+        const src = context.createBufferSource();
+        src.buffer = buffer;
+        src.connect(context.destination);
+        src.start();
+        this.track(src);
+      });
+      return;
+    }
+    const n = Math.max(1, Math.round(c.duration * context.sampleRate));
+    const buffer = context.createBuffer(2, n, context.sampleRate);
+    glitchNoise(context.sampleRate, c.level, buffer.getChannelData(0), buffer.getChannelData(1));
+    this.play(context, buffer, 0, c.duration, 1);
+  }
+
+  private play(context: AudioContext, buffer: AudioBuffer, offset: number, duration: number, level: number): void {
+    const t = context.currentTime;
+    const src = context.createBufferSource();
+    src.buffer = buffer;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(level, t + EDGE);
+    gain.gain.setValueAtTime(level, t + duration - EDGE);
+    gain.gain.linearRampToValueAtTime(0, t + duration);
+    src.connect(gain).connect(context.destination);
+    src.start(t, offset, duration);
+    this.track(src);
+  }
+
+  private track(src: AudioScheduledSourceNode): void {
+    this.playing.add(src);
+    src.onended = () => this.playing.delete(src);
+  }
+
   /** Pause output while the page is hidden (the engine stops simulating then too). */
   setVisible(visible: boolean): void {
     if (!this.context) return;
@@ -65,3 +143,4 @@ export class TearAudio {
     else void this.context.suspend().catch(() => {});
   }
 }
+

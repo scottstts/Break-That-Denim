@@ -187,12 +187,41 @@ body:not(.loading) .loader {
   }
 }
 
-/* ------------------------------------------------------------------ reset */
+/* ------------------------------------------------------------------ dock: experiences menu and reset */
 
-.reset {
+.dock {
   position: fixed;
   right: var(--right);
   bottom: var(--bottom);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: opacity 600ms ease;
+}
+
+body.loading .dock {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* while an experience plays the controls step back; they come forward under the pointer */
+body.staged .dock {
+  opacity: 0.28;
+}
+
+body.staged .dock:hover,
+body.staged .dock:focus-within {
+  opacity: 1;
+}
+
+body.staged .brand {
+  opacity: 0;
+}
+
+.reset,
+.menu,
+.experience {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 10px;
@@ -220,8 +249,60 @@ body:not(.loading) .loader {
     opacity 600ms ease;
 }
 
+.menu {
+  justify-content: center;
+  width: 44px;
+  padding: 0;
+}
+
+/* the menu: the experiences stacked above the eye button */
+.experiences {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.experiences[hidden] {
+  display: none;
+}
+
+.experience {
+  padding: 0 calc(20px - 0.24em) 0 20px;
+  animation: rise 260ms cubic-bezier(0.3, 0.7, 0.2, 1) both;
+}
+
+.experience[aria-busy='true'] {
+  color: var(--paper);
+}
+
+.experience[aria-busy='true']::before {
+  animation: seam 900ms ease-in-out infinite;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@keyframes seam {
+  50% {
+    border-color: var(--thread);
+  }
+}
+
 /* stitched inner seam, like a patch */
-.reset::before {
+.reset::before,
+.menu::before,
+.experience::before {
   content: '';
   position: absolute;
   inset: 4px;
@@ -249,8 +330,43 @@ body:not(.loading) .loader {
 }
 
 .reset:hover::before,
-.reset:focus-visible::before {
+.reset:focus-visible::before,
+.menu:hover::before,
+.menu:focus-visible::before,
+.menu[aria-expanded='true']::before,
+.experience:hover::before,
+.experience:focus-visible::before {
   border-color: var(--thread);
+}
+
+.menu svg {
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.menu:hover,
+.menu:focus-visible,
+.menu[aria-expanded='true'],
+.experience:hover,
+.experience:focus-visible {
+  color: var(--paper);
+  background: rgba(22, 27, 40, 0.72);
+  border-color: rgba(233, 235, 241, 0.22);
+}
+
+.menu:active,
+.experience:active {
+  transform: scale(0.97);
+}
+
+.menu:focus-visible,
+.experience:focus-visible {
+  outline: 2px solid var(--thread);
+  outline-offset: 3px;
 }
 
 .reset:hover svg {
@@ -279,10 +395,6 @@ body:not(.loading) .loader {
   }
 }
 
-body.loading .reset {
-  opacity: 0;
-  pointer-events: none;
-}
 
 /* ------------------------------------------------------------------ status */
 
@@ -327,7 +439,9 @@ body.failed .status {
 
 @media (prefers-reduced-motion: reduce) {
   .loader-needle,
-  .reset.spin svg {
+  .reset.spin svg,
+  .experience,
+  .experience[aria-busy='true']::before {
     animation: none;
   }
   .reset:hover svg {

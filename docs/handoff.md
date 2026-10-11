@@ -1,5 +1,31 @@
 # Handoff (rolling)
 
+Latest (2026-10-11): "Beneath" now plays the Blender-approved clip (user approved the poses; the old
+source model `smily_horror_monster.glb` was removed at their request; `public/models/smilie.glb` is the
+model, gitignored). Decision record: `docs/decisions/2026-10-11-staged-beneath.md`.
+- Bake: `blender/smilie/export.py` (inside Blender, or `Blender -b smilie.blend --python` a runpy wrapper;
+  the file needs no save) -> `public/stage/smilie.clip`. `animate.py` no longer keys `ambient` (export
+  derives the fill from the World and the bulb). The user's Blender MCP socket was closed after the bake.
+- Runtime: `src/stage/clip.ts` (sampler), `beneath.ts` (events from markers), `stage.ts` (per substep:
+  play + aim corrections + body pose + hold targets; per frame: camera, bulb as key, fill, pit, film),
+  `puppet.ts` (bind/play/reach), body piercing `src/simulation/gpu/body.ts` + `body.wgsl` (solver
+  `postCommit`), key light inner cone/spill/colour in the renderer, post without snow/blackout.
+- Verified headless: `npm run check` (64 unit), `npm run test:gpu` 26/26 + 13/13 (new: pierce cuts
+  exactly the crossings under the point; blunt and held nodes none), full runs 13.8 s, build ships clip
+  and model. Pose 17 us/substep. Not watched in a browser yet (rule: headless only during build).
+- Top open item: the lunge shreds the coupon (kinematic body through intact cloth; see the record's
+  Open). Tools: `tools/stage/beneath.ts` (LIT=1 flat debug light, CAM debug camera), `clawprobe.ts`,
+  `sweepprobe.ts`, `coverprobe.ts`, `posebench.ts`.
+
+Latest: `docs/decisions/2026-10-11-staged-beneath.md`: staged horror experience "Beneath" (menu button
+beside Reset; src/stage/*, body collider src/simulation/gpu/body.ts, claw puncture src/simulation/puncture.ts,
+post grade/glitch in post.wgsl; uncommitted). Verified headless only: `npm run check` 66 unit,
+`npm run test:gpu` 26/26 + 12/12, full runs with 0-5 line-search rejections. Not yet seen in a browser.
+Reproduce: `node tools/gpu/run.mjs tools/stage/beneath.ts <name>` (FRAMES, VIDEO=1, AUDIO=f.json, CAM,
+NOCREATURE, UNTIL), `tools/stage/audio.ts f.json out.wav`, `tools/stage/coverprobe.ts <t>`,
+`tools/stage/posebench.ts`, `tools/stage/creaturestill.ts` (POSE, PLACE, SCALE). Model + laugh live in
+public/models (gitignored) and public/exprerience_sounds.
+
 Latest round: `docs/decisions/2026-10-10-stability-round.md` (acting on artifacts/assessment: neutral grab,
 visible picking, connected patch, shared hand on the simulation clock, release refinement against the
 numerical bounce, relative/swept contact bounds, contact across tears, deterministic contact; uncommitted).

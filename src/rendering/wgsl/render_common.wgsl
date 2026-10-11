@@ -29,6 +29,9 @@ struct FrameU {
   // depth range of its shadow projection (m), extent of the projection (m), coverage-map texels per side
   keyCov: vec4<f32>,
   overCov: vec4<f32>,
+  // key cone: cos where it reaches full strength, share of light outside the cone, unused; key colour
+  keyShape: vec4<f32>,
+  keyColor: vec4<f32>,
 };
 
 struct LayerR {

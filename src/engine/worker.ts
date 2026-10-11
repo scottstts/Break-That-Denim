@@ -1,6 +1,6 @@
 import { acquireGpu, GpuUnavailableError } from '../gpu/device';
 import { readBuffer } from '../gpu/util';
-import { DEFAULT_CAMERA, Renderer, cameraMatrices, type CameraState, type FloorImages } from '../rendering/renderer';
+import { DEFAULT_CAMERA, NO_POST_EFFECTS, Renderer, cameraMatrices, type CameraState, type FloorImages } from '../rendering/renderer';
 import { add, dot, normalize, scale, sub, transformPoint, type Vec3 } from '../rendering/math';
 import { Interaction, MAX_GRIPS } from '../simulation/gpu/interaction';
 import { Hand, PointerTrack } from '../simulation/hand';
@@ -8,7 +8,14 @@ import { GPU_DEFAULTS, GpuSolver, RELEASE_REFINEMENT } from '../simulation/gpu/s
 import { loadDrape, settleDrape } from '../simulation/gpu/settle';
 import { Topology } from '../simulation/gpu/topology';
 import { compileScene, defaultSceneSpecs, type CompiledScene } from '../simulation/scene';
-import { ALL_POINTERS, type DevCommand, type FromEngine, type PointerCommand, type ToEngine } from '../shared/messages';
+import { ALL_POINTERS, type DevCommand, type ExperienceName, type FromEngine, type PointerCommand, type ToEngine } from '../shared/messages';
+import { BodyContact } from '../simulation/gpu/body';
+import { fetchBeneathClip, fetchCreature } from '../stage/assets';
+import type { Clip } from '../stage/clip';
+import { CreatureRenderer } from '../stage/creatureRenderer';
+import { Puppet } from '../stage/puppet';
+import { Rig } from '../stage/rig';
+import { Stage } from '../stage/stage';
 import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../audio/record';
 import { AcousticLog } from './acousticLog';
 
@@ -44,6 +51,15 @@ const SIM_FRAME_INTERVAL = 1 / 30 - 0.002;
 /** The cloth is at rest (simulation sleeps) below this nodal speed for REST_TIME seconds. */
 const REST_SPEED = 0.003;
 const REST_TIME = 0.4;
+/** A staged experience's assets: the creature (GPU side and rig) and its authored clip. */
+interface StagedAssets {
+  renderer: CreatureRenderer;
+  puppet: Puppet;
+  clip: Clip;
+}
+
+/** Time over which the picture settles after an experience ends on its broken signal (ms). */
+const REACQUIRE_MS = 600;
 /** Wheel depth per unit deltaY while gripping (m). */
 const WHEEL_DEPTH = 0.00006;
 
@@ -71,6 +87,15 @@ class Engine {
   private renderer!: Renderer;
   private interaction!: Interaction;
   private topology!: Topology;
+  /** A staged creature's body the cloth collides with (empty outside an experience). */
+  private body!: BodyContact;
+  /** The staged experience playing (free play when null), its creature once loaded, and its load. */
+  private stage: Stage | null = null;
+  private creatureLoad: Promise<StagedAssets> | null = null;
+  /** Bumped whenever an experience is asked for or ended: a slower load does not start a stale one. */
+  private experienceToken = 0;
+  /** When an experience ran to its end (ms, frame clock): the picture comes back through a reacquiring signal. */
+  private reacquire = -Infinity;
   /** Ruptures + pull-outs at the last connectivity analysis. */
   private topologyEvents = 0;
   private camera: CameraState = { ...DEFAULT_CAMERA };
@@ -147,7 +172,13 @@ class Engine {
     progress(0.5);
     this.interaction = new Interaction(this.device, this.solver, this.scene);
     this.solver.preSubstep = (pass) => this.interaction.encodeSubstep(pass);
-    this.solver.preAssemble = (dispatch) => this.interaction.encode(dispatch);
+    this.body = new BodyContact(this.device, this.solver, this.scene);
+    this.solver.postCommit = (pass) => this.body.encodePierce(pass);
+    // per Newton iteration, after the contact terms: a staged body's, then the grips'
+    this.solver.preAssemble = (dispatch) => {
+      this.body.encode(dispatch);
+      this.interaction.encode(dispatch);
+    };
     // pieces the fingers hold stay cloth: the anchors are whatever is held when an analysis applies
     this.topology = new Topology(this.device, this.solver, this.scene, () => this.interaction.coreNodes);
     this.renderer = new Renderer(this.device, format, this.solver, this.scene);
@@ -188,6 +219,18 @@ class Engine {
 
   reset(): void {
     if (!this.ready || !this.snapshot) return;
+    if (this.stage) {
+      this.endExperience();
+      return;
+    }
+    // a finished experience's sound may still be playing out
+    send({ type: 'cue', cue: { kind: 'stop' } });
+    this.restoreCloth();
+  }
+
+  /** The cloth back to its settled, intact state. */
+  private restoreCloth(): void {
+    if (!this.snapshot) return;
     this.releaseAll();
     this.releaseEpoch++;
     this.interaction.releaseAll();
@@ -208,6 +251,111 @@ class Engine {
     this.simBacklog = 0;
     this.refineSteps = 0;
     this.asleep = true;
+    this.dirty = true;
+  }
+
+  // ------------------------------------------------------------------ staged experiences
+
+  /** The creature and its clip, loaded once (model, textures, performance) and kept for later runs. */
+  private loadCreature(): Promise<StagedAssets> {
+    this.creatureLoad ??= Promise.all([fetchCreature(self.location.href), fetchBeneathClip(self.location.href)]).then(([{ model, images }, clip]) => {
+      const renderer = new CreatureRenderer(this.renderer, model, images);
+      // the decoded images are released once their copies to the GPU have run
+      void this.device.queue.onSubmittedWorkDone().then(() => {
+        for (const img of Object.values(images)) if ('close' in img) img.close();
+      });
+      return { renderer, puppet: new Puppet(new Rig(model)), clip };
+    });
+    this.creatureLoad.catch(() => (this.creatureLoad = null));
+    return this.creatureLoad;
+  }
+
+  prefetch(name: ExperienceName): void {
+    if (this.ready && name === 'beneath') void this.loadCreature().catch(() => {});
+  }
+
+  /** Start (or restart) a staged experience on the intact cloth; null ends the one playing. */
+  async experience(name: ExperienceName | null): Promise<void> {
+    if (!this.ready) return;
+    const token = ++this.experienceToken;
+    if (name === null) {
+      if (this.stage) this.endExperience();
+      return;
+    }
+    if (this.stage) this.endExperience(false);
+    send({ type: 'experience', name, state: 'loading' });
+    let creature: StagedAssets;
+    try {
+      creature = await this.loadCreature();
+    } catch (e) {
+      console.error(e);
+      if (token === this.experienceToken) send({ type: 'experience', name, state: 'failed' });
+      return;
+    }
+    if (token !== this.experienceToken || !this.ready) return;
+    this.releaseAll();
+    this.restoreCloth();
+    send({ type: 'cue', cue: { kind: 'stop' } });
+    this.stage = new Stage({
+      device: this.device,
+      scene: this.scene,
+      solver: this.solver,
+      interaction: this.interaction,
+      renderer: this.renderer,
+      body: this.body,
+      creature: creature.renderer,
+      puppet: creature.puppet,
+      clip: creature.clip,
+      analyse: () => this.topology.request(),
+      letGo: (slot) => {
+        this.interaction.letGo(slot);
+        const epoch = this.releaseEpoch;
+        void this.topology.request().then(() => {
+          if (epoch !== this.releaseEpoch) return;
+          this.interaction.release(slot);
+          this.refineSteps = Math.round(RELEASE_REFINEMENT.duration / H);
+        });
+      },
+      cue: (e) => {
+        if (e.kind === 'laugh') send({ type: 'cue', cue: { kind: 'laugh' } });
+        else if (e.kind === 'glitch') send({ type: 'cue', cue: { kind: 'glitch', duration: e.duration, level: e.level } });
+      },
+      held: (slot, held) => this.audioPort?.postMessage({ grip: slot, held }),
+    });
+    this.wake();
+    this.dirty = true;
+    send({ type: 'experience', name, state: 'playing' });
+    send({ type: 'cursor', cursor: 'default' });
+  }
+
+  /**
+   * Back to free play: the creature leaves, the cloth is intact again, the camera the product's. An
+   * experience that ran to its end (`now` given) leaves its sounds to finish; an interrupted one stops them.
+   */
+  private endExperience(announce = true, now = -Infinity): void {
+    const stage = this.stage;
+    if (!stage) return;
+    this.reacquire = now;
+    this.stage = null;
+    stage.stop();
+    if (now === -Infinity) send({ type: 'cue', cue: { kind: 'stop' } });
+    for (let slot = 0; slot < MAX_GRIPS; slot++) this.audioPort?.postMessage({ grip: slot, held: false });
+    this.restoreCloth();
+    if (announce) {
+      send({ type: 'experience', name: 'beneath', state: 'ended' });
+      send({ type: 'cursor', cursor: 'grab' });
+    }
+  }
+
+  /** After an experience's signal loss, free play comes back through a decoder settling (REACQUIRE_MS). */
+  private reacquireSignal(now: number): void {
+    const u = (now - this.reacquire) / REACQUIRE_MS;
+    if (u < 0 || u >= 1) {
+      if (this.renderer.post.glitch !== 0) this.renderer.post = { ...NO_POST_EFFECTS };
+      return;
+    }
+    const g = (1 - u) * (1 - u);
+    this.renderer.post = { ...NO_POST_EFFECTS, glitch: 0.7 * g, glitchSeed: Math.floor(now / 70) % 97 };
     this.dirty = true;
   }
 
@@ -243,7 +391,7 @@ class Engine {
   }
 
   pointer(c: PointerCommand): void {
-    if (!this.ready) return;
+    if (!this.ready || this.stage) return;
     const sample = { time: c.time, x: c.x, y: c.y };
     if (c.phase === 'cancel' && c.id === ALL_POINTERS) {
       this.releaseAll();
@@ -330,6 +478,7 @@ class Engine {
   }
 
   wheel(deltaY: number): void {
+    if (this.stage) return;
     if (this.grips.size > 0) {
       for (const g of this.grips.values()) g.hand.wheel(-deltaY * WHEEL_DEPTH);
     } else {
@@ -370,6 +519,14 @@ class Engine {
    * anchors stay, and a tear running on after the release keeps its source.
    */
   private updateAnchors(): void {
+    if (this.stage) {
+      const sources = this.stage.sources();
+      if (sources.every((s) => !s)) return;
+      this.anchors.fill(0);
+      sources.forEach((s, slot) => s && this.anchors.set([...s, 1], 4 * slot));
+      this.device.queue.writeBuffer(this.solver.acousticSources, 0, this.anchors);
+      return;
+    }
     if (this.grips.size === 0) return;
     this.anchors.fill(0);
     for (const g of this.grips.values()) this.anchors.set([...g.hand.target, 1], 4 * g.slot);
@@ -434,7 +591,7 @@ class Engine {
           void this.topology.request();
         }
         this.probeBusy = false;
-        if (this.grips.size > 0 || this.asleep) {
+        if (this.grips.size > 0 || this.asleep || this.stage) {
           this.restFor = 0;
           return;
         }
@@ -472,7 +629,8 @@ class Engine {
     const end = clock(now);
     for (let k = 0; k < steps; k++) {
       // grip targets are queue writes; one submission per substep keeps each ordered with its work
-      this.stepHandles(H, end - 1000 * dt * (1 - (k + 1) / steps));
+      if (this.stage) this.stage.substep(H);
+      else this.stepHandles(H, end - 1000 * dt * (1 - (k + 1) / steps));
       const se = this.device.createCommandEncoder({ label: 'substep' });
       this.solver.encodeSubstep(se, this.substepIterations());
       acoustic?.record(se);
@@ -482,14 +640,17 @@ class Engine {
       // read back as soon as the substeps finish (before the frame renders): the substeps are heard
       // over the wall time this frame presents them in
       const duration = dt / steps;
-      const viewProj = cameraMatrices(this.camera, this.width / this.height).viewProj;
+      const viewProj = cameraMatrices(this.stage ? this.stage.camera : this.camera, this.width / this.height).viewProj;
       void acoustic.end().then((r) => r && this.sendAcoustics(r.raw, r.count, duration, viewProj));
     }
     if (steps > 0) this.probeRest(steps);
     this.substepsDone += steps;
     const enc = this.device.createCommandEncoder({ label: 'frame' });
-    this.renderer.encode(enc, this.camera, now / 1000, this.context.getCurrentTexture().createView());
+    const camera = this.stage ? this.stage.frame() : this.camera;
+    if (!this.stage) this.reacquireSignal(now);
+    this.renderer.encode(enc, camera, now / 1000, this.context.getCurrentTexture().createView());
     this.device.queue.submit([enc.finish()]);
+    if (this.stage?.done) this.endExperience(true, now);
     this.inFlight = true;
     this.device.queue.onSubmittedWorkDone().then(() => (this.inFlight = false));
     this.frameCount++;
@@ -575,6 +736,12 @@ scope.onmessage = (ev: MessageEvent<ToEngine>) => {
       break;
     case 'reset':
       engine.reset();
+      break;
+    case 'experience':
+      void engine.experience(m.name);
+      break;
+    case 'prefetch':
+      engine.prefetch(m.name);
       break;
     case 'visibility':
       engine.setVisible(m.visible);

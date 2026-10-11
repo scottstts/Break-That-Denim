@@ -1,7 +1,7 @@
 import { ComputeModule, createBuffer, UNIFORM } from '../../gpu/util';
 import { invert, normalize, sub, transformPoint, type Vec3 } from '../../rendering/math';
 import type { CompiledScene } from '../scene';
-import { GRIP, gripPatch, patchWindowRadius, type PatchWindow } from '../grip';
+import { GRIP, gripPatch, patchWindowRadius, type GripPatch, type PatchWindow } from '../grip';
 import type { GpuSolver } from './solver';
 import commonWgsl from './wgsl/common.wgsl?raw';
 import interactWgsl from './wgsl/interact.wgsl?raw';
@@ -70,7 +70,7 @@ export class Interaction {
     // without contact nothing else writes ext, so grip terms overwrite instead of accumulating
     const code = interactWgsl.replace('const GRIP_ADDS: bool = true;', `const GRIP_ADDS: bool = ${solver.contactEnabled};`);
     this.mod = new ComputeModule(device, 'interact', commonWgsl + code);
-    for (const e of ['gripTerms', 'gripLead', 'gripInit', 'pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude', 'pickVisible', 'pickWrite', 'pickWindow']) {
+    for (const e of ['gripTerms', 'gripLead', 'gripInit', 'pickNear', 'pickRay', 'pickRayNode', 'pickCandidates', 'pickOcclude', 'pickVisible', 'pickWrite', 'pickWindow']) {
       this.pipes[e] = this.mod.pipeline(e);
     }
     this.gripGoal = createBuffer(device, 'gripGoal', 48 * MAX_GRIPS);
@@ -139,6 +139,32 @@ export class Interaction {
     this.run(pass, 'pickWrite', 1);
     this.run(pass, 'pickWindow', 1);
     pass.end();
+    return this.readPick(enc);
+  }
+
+  /**
+   * The crossing with material nearest to world point `p` within `radius` (m), with its position and
+   * the connectivity around it (a staged hand closing on whatever cloth is under it).
+   */
+  async nearest(p: [number, number, number], radius: number): Promise<PickResult | null> {
+    const u = new Float32Array(32);
+    u.set([0, 0, 0, 0], 16);
+    u.set([1, 1, radius, this.windowRadius], 20);
+    u.set([...p, 0], 24);
+    this.device.queue.writeBuffer(this.pickU, 0, u);
+    const init = new Uint32Array(4 + 2 * MAX_CAND);
+    init.set([0xffffffff, 0xffffffff, 0, 0xffffffff]);
+    this.device.queue.writeBuffer(this.pick, 0, init);
+    const enc = this.device.createCommandEncoder({ label: 'nearest' });
+    const pass = enc.beginComputePass();
+    this.run(pass, 'pickNear', Math.ceil(this.solver.N / 128));
+    this.run(pass, 'pickWrite', 1);
+    this.run(pass, 'pickWindow', 1);
+    pass.end();
+    return this.readPick(enc);
+  }
+
+  private async readPick(enc: GPUCommandEncoder): Promise<PickResult | null> {
     const staging = this.staging.pop() ?? this.device.createBuffer({ size: 4 * PICK_OUT_WORDS, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyBufferToBuffer(this.pickOut, 0, staging, 0, 4 * PICK_OUT_WORDS);
     this.device.queue.submit([enc.finish()]);
@@ -181,6 +207,20 @@ export class Interaction {
     this.release(slot);
     const patch = gripPatch(this.scene, node, (n) => !this.owner.has(n), window);
     if (!patch) return false;
+    this.attachPatch(slot, node, patch, anchor, GRIP.maxLead);
+    return true;
+  }
+
+  /** Material another grip does not already hold (for building a patch, grip.ts). */
+  readonly isFree = (n: number): boolean => !this.owner.has(n);
+
+  /**
+   * Attach grip `slot` to an explicit patch (grip.ts gripPatch / hookPatch) with the handle's lead bound
+   * `maxLead`; offsets and the handle's origin are taken from node `picked` on the GPU (see attach).
+   */
+  attachPatch(slot: number, picked: number, patch: GripPatch, anchor: [number, number, number], maxLead: number): void {
+    this.release(slot);
+    const node = picked;
     const count = Math.min(patch.nodes.length, SLOT_ENTRIES);
     const data = new ArrayBuffer(32 * count);
     const du = new Uint32Array(data);
@@ -205,7 +245,7 @@ export class Interaction {
     this.device.queue.writeBuffer(this.grip, 32 * SLOT_ENTRIES * slot, data);
     const u = new Float32Array(12);
     u.set([anchor[0], anchor[1], anchor[2], count], 0);
-    u.set([patch.stiffness, GRIP.maxLead, 0, 1], 4);
+    u.set([patch.stiffness, maxLead, 0, 1], 4);
     new Uint32Array(u.buffer)[6] = node;
     u.set([anchor[0], anchor[1], anchor[2], patch.padPitch], 8);
     this.device.queue.writeBuffer(this.gripU, SLOT_BYTES * slot, u);
@@ -215,7 +255,6 @@ export class Interaction {
     this.run(pass, 'gripInit', Math.ceil(count / 64));
     pass.end();
     this.device.queue.submit([enc.finish()]);
-    return true;
   }
 
   /** Spread of grip `slot`'s patch relative to grab time (grip.ts pinchScale), from the next substep. */

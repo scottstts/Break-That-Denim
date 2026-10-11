@@ -426,3 +426,17 @@ fn pickWindow(@builtin(local_invocation_index) k: u32) {
   if (!live(m)) { b |= 4u; }
   pickOut[8u + k] = b;
 }
+
+// ---------------------------------------------------------------- nearest material (staged grabs)
+
+// The crossing with material nearest to a point (PK.eye) within PK.viewport.z (m), as the proximity
+// candidate key pickWrite reads (pick[3]: quantised distance << 20 | node).
+@compute @workgroup_size(128)
+fn pickNear(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n = gid.x;
+  if (n >= P.counts.x || !hasMaterial(n)) { return; }
+  let d = distance(x[n].xyz, PK.eye.xyz);
+  if (d > PK.viewport.z) { return; }
+  let dk = min(4095u, u32(d / PK.viewport.z * 4095.0));
+  atomicMin(&pick[3], (dk << 20u) | (n & 0xFFFFFu));
+}

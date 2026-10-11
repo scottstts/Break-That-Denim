@@ -149,7 +149,7 @@ fn fsFloor(in: VOut) -> @location(0) vec4<f32> {
   let key = keyLight(P);
   let visK = lightVis(keyCovTex, F.lightViewProj, F.keyCov, P, -F.floor.x / max(key.z, 0.05));
   let aK = sqrt(alpha * alpha + 0.25 * F.keyCov.x * F.keyCov.x);
-  var c = (diff * max(dot(N, key.xyz), 0.0) + vec3<f32>(ggx(N, V, key.xyz, aK))) * (key.w * visK);
+  var c = (diff * max(dot(N, key.xyz), 0.0) + vec3<f32>(ggx(N, V, key.xyz, aK))) * (key.w * visK) * F.keyColor.rgb;
 
   // overhead lamp: a distant disc; its size widens the highlight (half-vector spread of half its radius)
   let Lo = F.overDir.xyz;

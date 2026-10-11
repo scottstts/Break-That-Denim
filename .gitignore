@@ -28,3 +28,7 @@ refs
 
 # Generated reference captures, numerical traces, and benchmark output
 artifacts/
+
+public/models
+blender/
+__pycache__/

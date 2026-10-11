@@ -32,6 +32,8 @@ export default defineConfig({
   },
   plugins: [captureEndpoint()],
   worker: { format: 'es' },
+  // baked staged-experience clips (public/stage) are binary assets (the unit tests import one inline)
+  assetsInclude: ['**/*.clip'],
   build: { target: 'es2023' },
   test: {
     include: ['tests/**/*.test.ts'],

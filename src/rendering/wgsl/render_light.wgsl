@@ -3,16 +3,17 @@
 
 // ---------------------------------------------------------------- lighting
 
-// Key light: a broad soft source above the top-left of the frame; returns (direction to light, irradiance scale).
+// Key light: a broad soft source above the top-left of the frame; returns (direction to light,
+// irradiance scale). Its colour (F.keyColor) multiplies the irradiance where it is used.
 fn keyLight(P: vec3<f32>) -> vec4<f32> {
   let d = F.keyPos.xyz - P;
   let dist = length(d);
   let Ld = d / dist;
   let c = dot(-Ld, F.keyAxis.xyz);
-  let cone = smoothstep(F.keyAxis.w, 1.0, c);
+  let cone = smoothstep(F.keyAxis.w, F.keyShape.x, c);
   let r0 = F.params.z;
   let fall = (r0 * r0) / (dist * dist);
-  return vec4<f32>(Ld, F.keyPos.w * fall * mix(0.05, 1.0, cone));
+  return vec4<f32>(Ld, F.keyPos.w * fall * mix(F.keyShape.y, 1.0, cone));
 }
 
 // Fibre BRDF times cos for one light: diffuse from a fibrous yarn surface, a longitudinal specular

@@ -1,17 +1,20 @@
 /**
  * Interaction and contact contracts on the production kernels (headless: Node + Dawn), on the settled
  * drape. Picking sees only visible material, a grab imposes no displacement, held material survives a
- * pending connectivity analysis, and contact bounds are relative and swept.
+ * pending connectivity analysis, contact bounds are relative and swept, and a claw's point parts the
+ * yarns under it.
  *   npm run test:gpu
  * Exits non-zero on failure.
  */
 import { ComputeModule, createBufferWith, readBuffer, UNIFORM } from '../../src/gpu/util';
 import { cameraMatrices, DEFAULT_CAMERA } from '../../src/rendering/renderer';
 import { normalize, scale, sub, transformPoint, type Vec3 } from '../../src/rendering/math';
+import { BodyContact, BODY_CONTACT, CLAW_PIERCE } from '../../src/simulation/gpu/body';
 import { Interaction } from '../../src/simulation/gpu/interaction';
 import { Topology } from '../../src/simulation/gpu/topology';
 import { Hand } from '../../src/simulation/hand';
 import type { GpuSolver } from '../../src/simulation/gpu/solver';
+import type { CompiledScene } from '../../src/simulation/scene';
 import common from '../../src/simulation/gpu/wgsl/common.wgsl?raw';
 import step from '../../src/simulation/gpu/wgsl/step.wgsl?raw';
 import { drain, gpuDevice } from '../../tools/gpu/env';
@@ -233,6 +236,59 @@ async function contact(device: GPUDevice, solver: GpuSolver, initial: Float32Arr
   solver.setState(initial);
 }
 
+/**
+ * A sharp capsule's point loading a node past the piercing force cuts both yarns of exactly the crossings
+ * within its half-width of the node's place in the weave; a blunt capsule, or a node a claw holds, is not cut.
+ */
+async function piercing(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, initial: Float32Array, nx: number): Promise<void> {
+  const body = new BodyContact(device, solver, scene);
+  const before = new Uint32Array(await readBuffer(device, solver.field));
+  const L = scene.layers[0];
+  const F = scene.field[0];
+  const w = L.weave;
+  const n = L.nodeOffset + 60 * nx + 90;
+  const held = n + 12;
+  const p = vec(initial, n);
+  const r = 0.004;
+  // the point presses 0.5 mm into the node from below: a penalty above the piercing force
+  const press = (k: number, sharp: boolean) => {
+    const q = vec(initial, k);
+    const b = [q[0], q[1], q[2] - r + 0.0005];
+    return { a: [b[0], b[1], b[2] - 0.02], b, radius: r, active: true, sharp };
+  };
+  if (BODY_CONTACT.stiffness * (BODY_CONTACT.distance + 0.0005) <= CLAW_PIERCE.force) throw new Error('test press below the piercing force');
+  const run = async (caps: ReturnType<typeof press>[]) => {
+    body.setPose(caps, 1 / 120);
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    body.encodePierce(pass);
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    return new Uint32Array(await readBuffer(device, solver.field));
+  };
+  // which crossings lie within the point's half-width of a node's place in the weave
+  const within = (k: number, c: number) => {
+    const [i, j] = [(k - L.nodeOffset) % nx, Math.floor((k - L.nodeOffset) / nx)];
+    const kk = (c - F.offset) % F.K;
+    const m = Math.floor((c - F.offset) / F.K);
+    return Math.hypot((kk - (i * F.bu + (F.bu - 1) / 2)) * w.pitchU, (m - (j * F.bv + (F.bv - 1) / 2)) * w.pitchV) <= CLAW_PIERCE.radius + 1e-9;
+  };
+  body.setExempt([held], true);
+  const blunt = await run([press(n, false)]);
+  const after = await run([press(n, true), press(held, true)]);
+  let cut = 0;
+  let wrong = 0;
+  for (let c = 0; c < before.length; c++) {
+    const expect = c >= F.offset && c < F.offset + F.K * F.M && within(n, c);
+    if (expect) cut++;
+    const want = expect ? (before[c] | 0xffff) >>> 0 : before[c];
+    if (after[c] !== want || blunt[c] !== before[c]) wrong++;
+  }
+  check('pierce: a claw point cuts the crossings within its half-width, a blunt one and a held node none', cut > 0 && wrong === 0, `${cut} crossings to cut, ${wrong} differ (node at ${p.map((x) => (x * 1e3).toFixed(1)).join(', ')} mm)`);
+  body.clear();
+  device.queue.writeBuffer(solver.field, 0, before);
+}
+
 export default async function main(): Promise<void> {
   const device = await gpuDevice();
   const { solver, scene } = await settledSolver(device);
@@ -245,6 +301,7 @@ export default async function main(): Promise<void> {
   await acquisition(device, solver, interaction, initial);
   await topologyRace(device, solver, interaction, initial, nx);
   await contact(device, solver, initial, nx);
+  await piercing(device, solver, scene, initial, nx);
   device.destroy();
   const failed = results.filter((r) => !r.ok).length;
   console.log(`=== ${results.length - failed}/${results.length} passed`);
