@@ -9,10 +9,12 @@ import type { Side } from './puppet';
  * claws pierce it and hold it through the mechanics (stage.ts). Times are seconds of simulated time
  * (the cloth and the creature share that clock).
  *
- * The laugh (public/exprerience_sounds/creepy_laugh.mp3) is one recording, already cut to the
- * experience as it plays in the browser: started once at LAUGH_AT and played whole (the clip's laugh
- * markers cue the bursts of an earlier recording and are not used). The ambience (ambiant.mp3) plays
- * from the start and fades out over the final breakup, as its glitch sound plays.
+ * Sound and picture run on different clocks: the picture on simulated time (slower than real time
+ * where the device cannot keep up), the recordings in real time. Each recording is therefore cued by
+ * the picture: the laugh (public/exprerience_sounds/creepy_laugh.mp3, cut by the user to the run as
+ * it plays on a desktop) in its four phrases (LAUGH_PIECES, split at its silences), each at the moment
+ * of the picture it accompanies there; the ambience (ambiant.mp3) loops from the start and fades out
+ * over the final breakup. The clip's laugh markers (an earlier recording's bursts) are not used.
  */
 
 /** Something the stage does at a time (Stage applies them in order). */
@@ -27,16 +29,33 @@ export type StageEvent =
   | { t: number; kind: 'grab'; side: Side }
   /** A hand lets go. */
   | { t: number; kind: 'release'; side: Side }
-  /** A sound: the laugh recording (whole), the ambience (start, fade out), or a burst of signal noise. */
-  | { t: number; kind: 'laugh' }
+  /** A sound: a phrase [from, to] (s) of the laugh, the ambience (start, fade out), or signal noise. */
+  | { t: number; kind: 'laugh'; from: number; to: number }
   | { t: number; kind: 'ambient' }
   | { t: number; kind: 'ambientFade'; duration: number }
   | { t: number; kind: 'glitch'; duration: number; level: number };
 
 export const BENEATH_CLIP_URL = '/stage/smilie.clip';
 
+/**
+ * The picture's pace on the desktop the sound was laid out on: 13.8 s of simulated time in ~21.4 s of
+ * wall time (the user's measured run, less the 0.6 s the picture takes to settle after it). Sound
+ * lengths given in simulated time (glitch bursts, the ambience's fade) are played over
+ * duration * DESKTOP_PACE / pace, the pace measured as it runs: as authored on that desktop, longer
+ * where the picture runs slower.
+ */
+export const DESKTOP_PACE = 13.8 / 21.4;
+
 /** When the laugh starts (s from the start). */
 export const LAUGH_AT = 0.5;
+
+/** The laugh's phrases in the recording (s), split at its silences below -40 dB. */
+export const LAUGH_PIECES: readonly (readonly [number, number])[] = [
+  [0, 4.71],
+  [5.54, 9.83],
+  [10.76, 16.01],
+  [16.72, 20.11],
+];
 
 function side(e: ClipEvent): Side {
   const s = e.name.split('.')[1];
@@ -69,7 +88,9 @@ export function stageEvents(clip: Clip): StageEvent[] {
         throw new Error(`unknown clip event ${e.name}`);
     }
   });
-  events.push({ t: LAUGH_AT, kind: 'laugh' }, { t: 0, kind: 'ambient' });
+  // each phrase where the picture is when it is heard on the desktop the laugh was cut on
+  for (const [from, to] of LAUGH_PIECES) events.push({ t: LAUGH_AT + from * DESKTOP_PACE, kind: 'laugh', from, to });
+  events.push({ t: 0, kind: 'ambient' });
   // the ambience fades out over the final breakup (the last glitch, which runs to the end)
   const breakup = events.reduce<StageEvent | null>((last, e) => (e.kind === 'glitch' && (!last || e.t >= last.t) ? e : last), null);
   if (breakup?.kind === 'glitch') events.push({ t: breakup.t, kind: 'ambientFade', duration: breakup.duration });

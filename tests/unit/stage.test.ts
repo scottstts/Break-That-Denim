@@ -3,7 +3,7 @@ import { hookPatch } from '../../src/simulation/grip';
 import { DENIM } from '../../src/simulation/material';
 import { materialAt, nodeAt } from '../../src/simulation/materialPoint';
 import { compileScene, defaultSceneSpecs } from '../../src/simulation/scene';
-import { LAUGH_AT, stageEvents } from '../../src/stage/beneath';
+import { DESKTOP_PACE, LAUGH_AT, LAUGH_PIECES, stageEvents } from '../../src/stage/beneath';
 import { Clip } from '../../src/stage/clip';
 import { quat, v3, type V } from '../../src/stage/rig';
 import { CLAW_HOOK } from '../../src/stage/claws';
@@ -104,9 +104,18 @@ describe('Beneath clip', () => {
     }
   });
 
-  it('plays the laugh once, whole, from its start time', () => {
+  it('cues the laugh phrase by phrase where they fall on the desktop the laugh was cut on', () => {
     const laughs = events.filter((e) => e.kind === 'laugh');
-    expect(laughs.map((e) => e.t)).toEqual([LAUGH_AT]);
+    expect(laughs.map((e) => (e.kind === 'laugh' ? [e.from, e.to] : []))).toEqual(LAUGH_PIECES.map((p) => [...p]));
+    expect(laughs[0].t).toBe(LAUGH_AT);
+    // at that pace each phrase starts where the whole recording, started at LAUGH_AT, had it, and after
+    // the one before it has ended
+    laughs.forEach((e, k) => {
+      if (e.kind !== 'laugh') return;
+      expect((e.t - LAUGH_AT) / DESKTOP_PACE).toBeCloseTo(e.from, 9);
+      const prev = laughs[k - 1];
+      if (prev?.kind === 'laugh') expect(e.t).toBeGreaterThanOrEqual(prev.t + (prev.to - prev.from) * DESKTOP_PACE);
+    });
   });
 
   it('starts the ambience with the scene and fades it out over the final breakup', () => {

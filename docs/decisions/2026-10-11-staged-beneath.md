@@ -57,13 +57,15 @@ frozen and glitched (still the picture: no snow, no black); free play resumes on
   jaw from that clock, so lip sync holds however far the simulation lags real time.
 - **Glitches switch, not ease.** The film's glitch curve is constant-interpolated: a Bezier between the
   last burst and the breakup crept from 0 to 0.14 over the stare (the black macroblocks in the browser).
-- **The laugh is one recording on the wall clock.** The user cut `creepy_laugh.mp3` (20.7 s) to the
-  experience as it plays in the browser (~22 s wall time: the simulation runs below real time). It starts
-  at `LAUGH_AT` (0.5 s) and plays whole at its own level; the natural end does not stop it (Reset or a
-  restart does). The clip's laugh markers (bursts of the earlier recording) are not used.
-- **The ambience runs under everything.** `ambiant.mp3` (25 s) starts with the stage's first substep at
-  its own level and fades out linearly over the final breakup (the clip's last glitch, whose sound
-  plays meanwhile), then stops; Reset or a restart stops it at once.
+- **Sound is cued by the picture, which runs at the device's pace.** The picture runs on simulated
+  time (on a phone well below real time); the recordings in real time. So the laugh (cut by the user to
+  the run on their desktop, ~21.4 s wall for 13.8 s simulated: `DESKTOP_PACE`) plays in its four phrases
+  (split at its -40 dB silences), each cued at the simulated time the desktop picture reaches when the
+  phrase was heard there, and never over the phrase before it; the ambience loops until it fades over the
+  final breakup; durations given in simulated time (glitch bursts, the fade) are played over
+  `duration * DESKTOP_PACE / pace`, the pace measured as the run plays. On that desktop everything is as
+  before; slower, phrases wait for their moment and the noise stretches with the picture. Reset or a
+  restart stops it all; the natural end lets what plays finish.
 - **Free play is untouched** when no experience runs: product key/fill values reproduce the previous
   shading exactly; the pierce pass and body terms dispatch nothing without a body.
 

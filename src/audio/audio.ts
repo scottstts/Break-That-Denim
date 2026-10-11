@@ -29,11 +29,13 @@ export class TearAudio {
   /** The ambience playing, and the gain that fades it. */
   private ambient: { src: AudioBufferSourceNode; gain: GainNode } | null = null;
   private laughEnvelope: Float32Array | null = null;
+  /** When the laugh phrase playing ends (context time): the next one never starts over it. */
+  private laughEnd = 0;
   /**
-   * The laugh started: its loudness envelope (envelope.ts) and when it is heard from (ms since the
-   * epoch: performance.timeOrigin + now, comparable across threads).
+   * A laugh phrase [from, to] started: the recording's loudness envelope (envelope.ts) and when `from`
+   * is heard (ms since the epoch: performance.timeOrigin + now, comparable across threads).
    */
-  onLaugh: ((envelope: Float32Array, start: number) => void) | null = null;
+  onLaugh: ((envelope: Float32Array, start: number, from: number, to: number) => void) | null = null;
 
   constructor(connect: (port: MessagePort) => void) {
     this.connect = connect;
@@ -117,6 +119,7 @@ export class TearAudio {
       }
       this.playing.clear();
       this.ambient = null;
+      this.laughEnd = 0;
       return;
     }
     if (c.kind === 'ambient') {
@@ -126,10 +129,12 @@ export class TearAudio {
         if (!buffer) return;
         const src = context.createBufferSource();
         src.buffer = buffer;
+        // it loops for as long as the picture takes
+        src.loop = true;
         const gain = context.createGain();
         src.connect(gain).connect(context.destination);
         // a late decode starts it where it would be by now
-        src.start(context.currentTime, Math.min(buffer.duration, context.currentTime - at));
+        src.start(context.currentTime, (context.currentTime - at) % buffer.duration);
         this.track(src);
         this.ambient = { src, gain };
       });
@@ -146,17 +151,22 @@ export class TearAudio {
       return;
     }
     if (c.kind === 'laugh') {
-      // the recording as it is: whole, at its own level
+      // a phrase of the recording as it is, at its own level (the cuts fall in its silences); never
+      // over the one before it (the picture can run faster than the pace the cues were set for)
       void this.stagedBuffer(context, laughUrl).then((buffer) => {
         if (!buffer) return;
         const src = context.createBufferSource();
         src.buffer = buffer;
         src.connect(context.destination);
-        src.start();
+        const now = context.currentTime;
+        const at = Math.max(now, this.laughEnd);
+        const length = Math.min(c.to, buffer.duration) - c.from;
+        src.start(at, c.from, length);
+        this.laughEnd = at + length;
         this.track(src);
-        this.laughEnvelope ??= loudness(Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c)), buffer.sampleRate);
+        this.laughEnvelope ??= loudness(Array.from({ length: buffer.numberOfChannels }, (_, ch) => buffer.getChannelData(ch)), buffer.sampleRate);
         const latency = context.outputLatency || context.baseLatency || 0;
-        this.onLaugh?.(this.laughEnvelope, performance.timeOrigin + performance.now() + 1000 * latency);
+        this.onLaugh?.(this.laughEnvelope, performance.timeOrigin + performance.now() + 1000 * (at - now + latency), c.from, c.to);
       });
       return;
     }

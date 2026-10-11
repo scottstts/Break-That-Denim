@@ -11,6 +11,7 @@ import { compileScene, defaultSceneSpecs, type CompiledScene } from '../simulati
 import { ALL_POINTERS, type DevCommand, type ExperienceName, type FromEngine, type PointerCommand, type ToEngine } from '../shared/messages';
 import { BodyContact } from '../simulation/gpu/body';
 import { fetchBeneathClip, fetchCreature } from '../stage/assets';
+import { DESKTOP_PACE } from '../stage/beneath';
 import type { Clip } from '../stage/clip';
 import { CreatureRenderer } from '../stage/creatureRenderer';
 import { Puppet } from '../stage/puppet';
@@ -95,8 +96,10 @@ class Engine {
   private creatureLoad: Promise<StagedAssets> | null = null;
   /** Bumped whenever an experience is asked for or ended: a slower load does not start a stale one. */
   private experienceToken = 0;
-  /** The staged laugh as heard: its loudness envelope and when it started (ms since the epoch). */
-  private laugh: { envelope: Float32Array; start: number } | null = null;
+  /** The staged laugh phrase as heard: the recording's loudness envelope, when `from` plays (ms since the epoch), the phrase. */
+  private laugh: { envelope: Float32Array; start: number; from: number; to: number } | null = null;
+  /** Simulated seconds per wall second while an experience plays (smoothed over about a second). */
+  private pace = DESKTOP_PACE;
   /** When an experience ran to its end (ms, frame clock): the picture comes back through a reacquiring signal. */
   private reacquire = -Infinity;
   /** Ruptures + pull-outs at the last connectivity analysis. */
@@ -273,8 +276,21 @@ class Engine {
     return this.creatureLoad;
   }
 
-  heardLaugh(envelope: Float32Array, start: number): void {
-    this.laugh = { envelope, start };
+  heardLaugh(envelope: Float32Array, start: number, from: number, to: number): void {
+    this.laugh = { envelope, start, from, to };
+  }
+
+  /** Loudness of the laugh as heard now (0 between phrases). */
+  private laughLevel(): number {
+    const l = this.laugh;
+    if (!l) return 0;
+    const t = l.from + (performance.timeOrigin + performance.now() - l.start) / 1000;
+    return t >= l.from && t <= l.to ? loudnessAt(l.envelope, t) : 0;
+  }
+
+  /** A duration of the picture (simulated s) as heard at the pace it runs now (see DESKTOP_PACE). */
+  private heard(duration: number): number {
+    return (duration * DESKTOP_PACE) / Math.min(1.25, Math.max(0.1, this.pace));
   }
 
   prefetch(name: ExperienceName): void {
@@ -304,6 +320,7 @@ class Engine {
     this.restoreCloth();
     send({ type: 'cue', cue: { kind: 'stop' } });
     this.laugh = null;
+    this.pace = DESKTOP_PACE;
     this.stage = new Stage({
       device: this.device,
       scene: this.scene,
@@ -325,13 +342,13 @@ class Engine {
         });
       },
       cue: (e) => {
-        if (e.kind === 'laugh') send({ type: 'cue', cue: { kind: 'laugh' } });
+        if (e.kind === 'laugh') send({ type: 'cue', cue: { kind: 'laugh', from: e.from, to: e.to } });
         else if (e.kind === 'ambient') send({ type: 'cue', cue: { kind: 'ambient' } });
-        else if (e.kind === 'ambientFade') send({ type: 'cue', cue: { kind: 'ambientFade', duration: e.duration } });
-        else if (e.kind === 'glitch') send({ type: 'cue', cue: { kind: 'glitch', duration: e.duration, level: e.level } });
+        else if (e.kind === 'ambientFade') send({ type: 'cue', cue: { kind: 'ambientFade', duration: this.heard(e.duration) } });
+        else if (e.kind === 'glitch') send({ type: 'cue', cue: { kind: 'glitch', duration: this.heard(e.duration), level: e.level } });
       },
       held: (slot, held) => this.audioPort?.postMessage({ grip: slot, held }),
-      laugh: () => (this.laugh ? loudnessAt(this.laugh.envelope, (performance.timeOrigin + performance.now() - this.laugh.start) / 1000) : 0),
+      laugh: () => this.laughLevel(),
     });
     this.wake();
     this.dirty = true;
@@ -619,7 +636,8 @@ class Engine {
   private frame(now: number): void {
     if (!this.ready) return;
     scope.requestAnimationFrame((t) => this.frame(t));
-    const dt = Math.min(0.1, Math.max(0, (now - this.lastFrame) / 1000));
+    const wall = Math.max(0, (now - this.lastFrame) / 1000);
+    const dt = Math.min(0.1, wall);
     // present at most every SIM_FRAME_INTERVAL while simulating, and never with a frame in flight
     if (this.inFlight || (!this.asleep && (now - this.lastPresent) / 1000 < SIM_FRAME_INTERVAL)) return;
     this.lastFrame = now;
@@ -634,6 +652,8 @@ class Engine {
         this.simBacklog -= steps * H;
       }
     }
+    // how fast the picture runs: simulated seconds per wall second, over about a second
+    if (this.stage && wall > 0 && wall < 1) this.pace += (1 - Math.exp(-wall)) * ((steps * H) / wall - this.pace);
     if (steps === 0 && !this.dirty) return;
     this.dirty = false;
     this.lastPresent = now;
@@ -758,7 +778,7 @@ scope.onmessage = (ev: MessageEvent<ToEngine>) => {
       engine.prefetch(m.name);
       break;
     case 'laugh':
-      engine.heardLaugh(m.envelope, m.start);
+      engine.heardLaugh(m.envelope, m.start, m.from, m.to);
       break;
     case 'visibility':
       engine.setVisible(m.visible);

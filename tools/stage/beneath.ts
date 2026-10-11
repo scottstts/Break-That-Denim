@@ -8,8 +8,8 @@
  * it flat (the product's key, a bright fill, no film) to see the mechanics;
  * AUDIO=file.json records the acoustic records, holds and sound cues (tools/stage/audio.ts renders them).
  * TRACE=1 prints the rupture count every 0.1 s.
- * The laugh moves the jaw as heard in the browser, where the run takes PACE (default 22/13.8) times its
- * simulated time.
+ * The laugh moves the jaw as heard in the browser on the desktop it was laid out on (PACE, default
+ * DESKTOP_PACE: simulated seconds per wall second).
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { AcousticLog } from '../../src/engine/acousticLog';
@@ -29,7 +29,7 @@ import { Stage } from '../../src/stage/stage';
 import { CAPTURES, drain, gpuDevice, saveTexture } from '../gpu/env';
 import { settledSolver } from '../gpu/scripts/render';
 import { loudness, loudnessAt } from '../../src/audio/envelope';
-import { LAUGH_AT } from '../../src/stage/beneath';
+import { DESKTOP_PACE, LAUGH_AT } from '../../src/stage/beneath';
 import { decodeAudio, loadClip, loadCreature } from './env';
 
 export default async function main(args: string[]): Promise<void> {
@@ -62,7 +62,7 @@ export default async function main(args: string[]): Promise<void> {
   const holds: [number, number, boolean][] = [];
   const cues: StageEvent[] = [];
   const laugh = loudness(decodeAudio('public/exprerience_sounds/creepy_laugh.mp3', 48000), 48000);
-  const pace = Number(process.env.PACE ?? 22 / 13.8);
+  const pace = Number(process.env.PACE ?? DESKTOP_PACE);
   let simTime = 0;
   const stage = new Stage({
     device,
@@ -90,7 +90,7 @@ export default async function main(args: string[]): Promise<void> {
       holds.push([audioRecords.length, slot, held]);
       if (process.env.STATS) console.log(`  slot ${slot} ${held ? 'held' : 'released'}`);
     },
-    laugh: () => loudnessAt(laugh, (simTime - LAUGH_AT) * pace),
+    laugh: () => loudnessAt(laugh, (simTime - LAUGH_AT) / pace),
   });
   const until = Number(process.env.UNTIL ?? stage.duration);
   const video = !!process.env.VIDEO;

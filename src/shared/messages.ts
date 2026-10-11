@@ -9,8 +9,11 @@ export type ToEngine =
   | { type: 'experience'; name: ExperienceName | null }
   /** Fetch an experience's assets ahead of a likely start (the menu opened). */
   | { type: 'prefetch'; name: ExperienceName }
-  /** The staged laugh is heard from `start` (ms since the epoch); its loudness envelope (audio/envelope.ts) moves the jaw. */
-  | { type: 'laugh'; envelope: Float32Array; start: number }
+  /**
+   * A phrase [from, to] (s) of the staged laugh is heard from `start` (ms since the epoch, when `from`
+   * plays); the recording's loudness envelope (audio/envelope.ts) moves the jaw.
+   */
+  | { type: 'laugh'; envelope: Float32Array; start: number; from: number; to: number }
   | { type: 'visibility'; visible: boolean }
   /** Port to the audio thread's tear voice (audio/worklet.ts): acoustic records go there. */
   | { type: 'audio'; port: MessagePort }
@@ -51,9 +54,9 @@ export type FromEngine =
 export type ExperienceName = 'beneath';
 
 export type SoundCue =
-  /** The laugh recording, whole. */
-  | { kind: 'laugh' }
-  /** The ambience: start it, or fade it out over `duration` (s). */
+  /** A phrase [from, to] (s) of the laugh recording (after the one playing, if it has not ended). */
+  | { kind: 'laugh'; from: number; to: number }
+  /** The ambience: start it (looping), or fade it out over `duration` (s). */
   | { kind: 'ambient' }
   | { kind: 'ambientFade'; duration: number }
   /** Signal-noise burst of the camera breaking up, `duration` s at `level` (0..1). */

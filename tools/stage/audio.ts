@@ -84,9 +84,11 @@ export default async function main(args: string[]): Promise<void> {
         R[start + i] += g * ambient[2 * i + 1];
       }
     } else if (c.kind === 'laugh') {
-      for (let i = 0; i < laugh.length / 2 && start + i < N; i++) {
-        L[start + i] += laugh[2 * i];
-        R[start + i] += laugh[2 * i + 1];
+      const from = Math.round(c.from * fs);
+      const n = Math.round((c.to - c.from) * fs);
+      for (let i = 0; i < n && from + i < laugh.length / 2 && start + i < N; i++) {
+        L[start + i] += laugh[2 * (from + i)];
+        R[start + i] += laugh[2 * (from + i) + 1];
       }
     } else if (c.kind === 'glitch') {
       const n = Math.round(c.duration * fs);
