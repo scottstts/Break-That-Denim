@@ -10,6 +10,8 @@
 @group(0) @binding(6) var<storage, read_write> op: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read_write> rhs: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> ext: array<vec4<f32>>; // 3 per node: grad, H(xx xy xz yy), H(yz zz)
+// contact bounds per node (selfcontact.wgsl / contact.wgsl; step.wgsl feasible): own and reciprocal
+@group(0) @binding(9) var<storage, read> cmeta: array<vec4<f32>>;
 
 fn fineLevel() -> LevelInfo {
   var lv: LevelInfo;
@@ -18,7 +20,8 @@ fn fineLevel() -> LevelInfo {
   return lv;
 }
 
-fn isPinned(m: i32) -> bool { return (nodes[u32(m)].flags & NODE_PINNED) != 0u || x[u32(m)].w > 0.5; }
+// mounted or retired (detached pieces stay in the solve, state.wgsl)
+fn isPinned(m: i32) -> bool { return (nodes[u32(m)].flags & NODE_PINNED) != 0u || x[u32(m)].w > 1.5; }
 
 fn segAt(owner: i32, f: u32) -> Seg { return segs[2u * u32(owner) + f]; }
 
@@ -52,7 +55,10 @@ fn segForce(a: u32, b: u32, f: u32, mat: LayerMat) -> SegForce {
 // Bending of the triple (a, b, c) centered at b (fold-stiffening energy, see bendPsi, with the
 // rest-length weights r = wa x_a - 2 x_b + wc x_c of bendGeometry): the gradient coefficient ke Psi'
 // and a scalar stiffness k = ke (Psi' + 2 Psi'' q) + kd that majorizes the exact Hessian
-// ke (Psi' I + 2 Psi'' r r^T) + kd I (the operator stores this stencil as scalars, times w w^T).
+// ke (Psi' I + 2 Psi'' r r^T) + kd H_v (the operator stores this stencil as scalars, times w w^T).
+// Viscosity acts on the rate of the bending measure |r| (viscous potential 1/2 kd (|r| - |rn|)^2 over
+// the substep): a rigid rotation of the triple changes r but not |r|, and is not resisted. Its Hessian
+// H_v = r^ r^T + (1 - |rn| / |r|) (I - r^ r^T) is at most I.
 struct Triple {
   ke: f32,
   kd: f32,
@@ -78,7 +84,10 @@ fn triple(a: u32, b: u32, c: u32, f: u32, mat: LayerMat) -> Triple {
   return Triple(kb * ps.y, kd, kb * (ps.y + 2.0 * ps.z * q) + kd, geo.x, geo.y, r, rn);
 }
 
-fn tripleGrad(t: Triple) -> vec3<f32> { return t.ke * t.r + t.kd * (t.r - t.rn); }
+fn tripleGrad(t: Triple) -> vec3<f32> {
+  let lr = length(t.r);
+  return (t.ke + t.kd * (lr - length(t.rn)) / max(lr, 1e-12)) * t.r;
+}
 
 // Shear diagonal d of the cell with lower-left corner (ci, cj): d = 0 joins c and rt, d = 1 joins r
 // and t. A diagonal acts while one of its two triangles is intact (the crossings there still lock
@@ -115,6 +124,10 @@ fn shearRest(lv: LevelInfo, l: u32, ci: i32, cj: i32) -> f32 {
   let s1 = segAt(c, 1u).rest;
   return sqrt(s0 * s0 + s1 * s1);
 }
+
+// Normal stiffness of an active contact bound in the Newton operator, relative to the node's own
+// diagonal: the held node keeps ~1 % of the normal correction it would otherwise take.
+const ACTIVE_BOUND: f32 = 100.0;
 
 // Fine row layout (see rowfine.wgsl): 18 vec4, block b at 2b / 2b+1, scalars in spare lanes.
 const ROW_VEC4: u32 = 18u;
@@ -245,6 +258,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let H = axialBlock(sl.y, max(fs, 0.0) / len, e);
     D = symAdd(D, H);
     if (!isPinned(p)) { CD[c] = symScale(H, -1.0); }
+  }
+
+  // Active contact bounds (step.wgsl feasible): a node whose iterate already approaches a face by all
+  // its bound allows, and whose net force still drives it on, is held along the bound's normal in the
+  // Newton direction (stiffness ACTIVE_BOUND times its own), so the rest of the system takes up what the
+  // clip would otherwise leave as a stretched span. Only the direction changes (the line search uses
+  // the true potential); a node the forces pull away from the face is free.
+  let kAct = ACTIVE_BOUND * (D.d.x + D.d.y + D.d.z);
+  for (var b = 0u; b < 2u; b++) {
+    let m = cmeta[2u * n + b];
+    if (m.w >= 1e8 || all(m.xyz == vec3<f32>(0.0))) { continue; }
+    if (-dot(dx[n].xyz, m.xyz) >= m.w - 1e-3 * abs(m.w) && dot(g, m.xyz) > 0.0) { D = symAdd(D, axialBlock(kAct, 0.0, m.xyz)); }
   }
 
   storeSym(row, D, vec2<f32>(C2[0], C2[1]));

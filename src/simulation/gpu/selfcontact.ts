@@ -18,7 +18,12 @@ export const SELF_CONTACT = {
    * the rendered bicubic surface over the flat collision triangles in tight folds.
    */
   distance: 1.0e-3,
-  /** Penalty stiffness (N/m): stops a 1 m/s impact of a lattice node within 0.1 mm. */
+  /**
+   * Penalty stiffness k (N/m) of the cubic law (selfcontact.wgsl): the tangent stiffness at half the
+   * contact distance. At 0.3 mm of compression it presses ~4 kPa over a lattice node's area, the load of
+   * a fabric compression test (5 kPa) over a few tenths of a millimetre; a 1 m/s impact of a node stops
+   * 0.23 mm in.
+   */
   stiffness: 500,
   friction: 0.45,
   /** Regularization speed below which friction is viscous (m/s). */
@@ -39,6 +44,8 @@ interface SolverBuffers {
   segs: GPUBuffer;
   ext: GPUBuffer;
   N: number;
+  /** Development hook (GpuSolverParams.patch): rewrites the module's WGSL before compilation. */
+  params?: { patch?: (module: string, code: string) => string };
 }
 
 /**
@@ -78,7 +85,8 @@ export class SelfContact {
     const pairs = createBuffer(d, 'selfContact.pairs', 4 * (K + 2) * s.N);
     const acc = createBuffer(d, 'selfContact.acc', 4 * 9 * s.N);
     this.meta = createBuffer(d, 'selfContact.meta', 32 * s.N);
-    this.mod = new ComputeModule(d, 'selfContact', commonWgsl + selfContactWgsl);
+    const patch = s.params?.patch ?? ((_: string, c: string) => c);
+    this.mod = new ComputeModule(d, 'selfContact', patch('selfcontact', commonWgsl + selfContactWgsl));
     for (const e of ['faceCount', 'faceFill', 'damageRow', 'detect', 'resolveBounds', 'terms', 'gather']) this.pipes[e] = this.mod.pipeline(e);
     this.group = this.mod.bindGroup('selfContact', {
       0: s.simParams,

@@ -50,7 +50,7 @@ struct Seg {
   // bit q: bundled yarn q has separated within the span
   cutMask: u32,
   spare0: f32,
-  // bits 0..2 SEG_*
+  // SEG_* bits
   flags: u32,
   // where a separated span split into tails (fraction from the owner)
   failSite: f32,
@@ -59,6 +59,8 @@ struct Seg {
 
 const SEG_EXISTS: u32 = 1u;
 const SEG_BROKEN: u32 = 2u;
+// broken by crossing slip, its yarns still to part at the end they slid out of (scene.ts SEG_SLIPPED)
+const SEG_SLIPPED: u32 = 8u;
 const NODE_PINNED: u32 = 1u;
 
 struct LevelInfo {

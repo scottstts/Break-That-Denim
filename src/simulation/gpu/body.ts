@@ -47,7 +47,7 @@ export interface BodyCapsule {
 /**
  * A prescribed (kinematic) body the cloth collides with: capsules whose pose is set once per substep
  * (setPose, at the substep's end time); the step from the previous pose is the body's surface motion
- * that friction acts on. Its terms are added to the solver's ext every Newton iteration (body.wgsl).
+ * that friction acts on and that contact is swept over (a fast limb meets the cloth it passes through). Its terms are added to the solver's ext every Newton iteration (body.wgsl).
  * Sharp capsules pierce the cloth (encodePierce, after each substep's commit). Nodes a claw holds are
  * exempt from both (setExempt).
  */
@@ -125,6 +125,13 @@ export class BodyContact {
       d[o + 5] = c.b[1];
       d[o + 6] = c.b[2];
       d[o + 7] = c.active ? 1 : 0;
+      // contact is swept over the substep: the bounds hold the previous pose too
+      if (c.active && this.hasPrev) {
+        for (let q = 0; q < 3; q++) {
+          lo[q] = Math.min(lo[q], pv[q] - c.radius - reach, pv[3 + q] - c.radius - reach);
+          hi[q] = Math.max(hi[q], pv[q] + c.radius + reach, pv[3 + q] + c.radius + reach);
+        }
+      }
       for (let q = 0; q < 3; q++) {
         d[o + 8 + q] = this.hasPrev ? c.a[q] - pv[q] : 0;
         d[o + 12 + q] = this.hasPrev ? c.b[q] - pv[3 + q] : 0;

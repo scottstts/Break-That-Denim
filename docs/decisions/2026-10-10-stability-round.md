@@ -122,5 +122,6 @@ whole step and the sheet coasts; maul rejections 5-8 -> 42-43.
 - No edge-edge or strand contact; torn cells lose their collision face; tiny scraps are ballistic.
 - Bending viscosity damps rigid rotation of a bent chain (world-space curvature rate).
 - Rare line-search rejections at crack tips (nearly free nodes whose slack spans let the Newton step
-  overshoot into tension; the global line search then rejects every node's step).
+  overshoot into tension; the global line search then rejects every node's step). Cause found: a grip
+  spring on a pinch rim torn off the patch (2026-10-11-pinch-slip.md).
 - `session.ts` "settled" flag resets on any single 2 cm/s frame (debris blips): read the vmax trace.

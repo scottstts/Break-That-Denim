@@ -10,7 +10,7 @@ import interactWgsl from './wgsl/interact.wgsl?raw';
 export const MAX_GRIPS = 4;
 /** Patch entries per grip (interact.wgsl SLOT_ENTRIES); all grips fill the solver's 32 x 64 grip dispatch. */
 const SLOT_ENTRIES = 512;
-const SLOT_BYTES = 48;
+const SLOT_BYTES = 64;
 /** Proximity candidates (interact.wgsl MAX_CAND). */
 const MAX_CAND = 128;
 /** Words of the pick output: point, node, kind, then the connectivity window (interact.wgsl pickOut). */
@@ -30,6 +30,8 @@ export interface PickResult {
 
 interface Held {
   nodes: number[];
+  /** Grip entries (the patch without the strip between the pads). */
+  count: number;
   core: number[];
   /** Letting go (letGo): still holding, but no longer an anchor of what it holds. */
   releasing: boolean;
@@ -241,13 +243,14 @@ export class Interaction {
       nodes.push(n);
       this.owner.set(n, slot);
     }
-    this.held[slot] = { nodes, core, stiffness: patch.stiffness, releasing: false };
+    this.held[slot] = { nodes, count, core, stiffness: patch.stiffness, releasing: false };
     this.device.queue.writeBuffer(this.grip, 32 * SLOT_ENTRIES * slot, data);
-    const u = new Float32Array(12);
+    const u = new Float32Array(16);
     u.set([anchor[0], anchor[1], anchor[2], count], 0);
     u.set([patch.stiffness, maxLead, 0, 1], 4);
     new Uint32Array(u.buffer)[6] = node;
     u.set([anchor[0], anchor[1], anchor[2], patch.padPitch], 8);
+    u.set([patch.slip, 0, 0, 0], 12);
     this.device.queue.writeBuffer(this.gripU, SLOT_BYTES * slot, u);
     this.device.queue.writeBuffer(this.initU, 0, new Uint32Array([slot, 0, 0, 0]));
     const enc = this.device.createCommandEncoder({ label: 'gripInit' });
@@ -277,7 +280,7 @@ export class Interaction {
   setTarget(target: [number, number, number], slot = 0): void {
     const h = this.held[slot];
     if (!h) return;
-    this.device.queue.writeBuffer(this.gripU, SLOT_BYTES * slot, new Float32Array([target[0], target[1], target[2], h.nodes.length]));
+    this.device.queue.writeBuffer(this.gripU, SLOT_BYTES * slot, new Float32Array([target[0], target[1], target[2], h.count]));
   }
 
   /**

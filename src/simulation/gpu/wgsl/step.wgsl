@@ -22,19 +22,12 @@
 
 fn historyTolerance() -> f32 { return bitcast<f32>(P.counts.w); }
 
-// mounted, or no longer part of the cloth solve (ballistic debris / retired, x.w > 0)
-fn pinnedN(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 0.5; }
+// mounted, or retired (out of the scene; detached pieces stay in the solve, state.wgsl)
+fn pinnedN(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 1.5; }
 
-// Debris leaves the scene below this height or beyond this lateral distance (m) and is retired.
+// A detached node leaves the scene below this height or beyond this lateral distance (m) and is retired.
 const RETIRE_Z: f32 = -0.25;
 const RETIRE_R: f32 = 0.6;
-// Quadratic air drag of a cloth scrap per unit speed (1/m): 0.5 rho Cd / (areal density), with
-// Cd ~ 1 and 0.4 kg/m^2 denim; terminal fall speed sqrt(g / k) ~ 2.6 m/s.
-const DEBRIS_DRAG: f32 = 1.5;
-// Debris resting on cloth: within this bound (m, a share of the clearance above the core) it is
-// supported, with cloth/cloth friction
-const DEBRIS_REST: f32 = 0.5e-3;
-const DEBRIS_FRICTION: f32 = 0.5;
 
 fn lattice(l: u32) -> vec4<u32> { return P.layers[l].lattice; }
 
@@ -55,15 +48,6 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   let h = P.hg.x;
-  let w = x[n].w;
-  if (w > 0.5 && w < 1.5) {
-    // ballistic debris: free fall with drag, outside the linear solve
-    let v0 = v[n].xyz;
-    let vb = v0 / (1.0 + DEBRIS_DRAG * h * length(v0)) + h * P.hg.yzw;
-    pred[n] = vec4<f32>(h * vb, 0.0);
-    dx[n] = vec4<f32>(h * vb, 0.0);
-    return;
-  }
   if (pinnedN(n)) {
     pred[n] = vec4<f32>(0.0);
     dx[n] = vec4<f32>(0.0);
@@ -116,6 +100,20 @@ fn newtonApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   atomicMax(&counters[4u + Mode.x], bitcast<u32>(length(nd - old)));
 }
 
+// A detached node that left the scene: frozen, out of the solve and hidden. Its spans are removed (no
+// longer existing, not broken: nothing ruptured), so the rest of its piece neither hangs from the frozen
+// node nor counts a tear; the piece is cut only where it is already out of view. Its operator row is then
+// the identity with nothing coupled to it. Two nodes retiring together write the same flags.
+fn retire(n: u32, p: vec3<f32>) {
+  x[n] = vec4<f32>(p, 2.0);
+  v[n] = vec4<f32>(0.0);
+  for (var f = 0u; f < 2u; f++) {
+    segs[2u * n + f].flags &= ~SEG_EXISTS;
+    let prev = nbr(n, f, -1);
+    if (prev >= 0) { segs[2u * u32(prev) + f].flags &= ~SEG_EXISTS; }
+  }
+}
+
 @compute @workgroup_size(128)
 fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
@@ -125,37 +123,15 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w = x[n].w;
   dx[n] = vec4<f32>(0.0);
   if (w > 1.5) { return; }
-  var d1 = d;
-  if (w > 0.5) {
-    // ballistic debris meeting the cloth: its approach toward the nearest face is clipped to the same
-    // share of the clearance as a cloth node's (selfcontact.wgsl detect), so it lands and rests on the
-    // cloth (the clipped normal velocity is lost, inelastic). Resting on it (within DEBRIS_REST of the
-    // core), Coulomb friction with the supporting component of gravity slows its sliding by up to
-    // mu |g.n| h per step: a scrap stays put on slopes below atan(mu)
-    let m = cmeta[2u * n];
-    if (any(m.xyz != vec3<f32>(0.0))) {
-      let approach = -dot(d1, m.xyz);
-      if (approach > m.w) { d1 += (approach - m.w) * m.xyz; }
-      if (m.w < DEBRIS_REST) {
-        let dn = dot(d1, m.xyz) * m.xyz;
-        let dt = d1 - dn;
-        let lt = length(dt);
-        let slow = DEBRIS_FRICTION * abs(dot(P.hg.yzw, m.xyz)) * P.hg.x * P.hg.x;
-        d1 = dn + select(vec3<f32>(0.0), dt * ((lt - slow) / max(lt, 1e-12)), lt > slow);
-      }
-    }
-  }
-  let p = x[n].xyz + d1;
+  let p = x[n].xyz + d;
   if (w > 0.5 && (p.z < RETIRE_Z || length(p.xy) > RETIRE_R)) {
-    // debris left the scene: freeze and hide it
-    x[n] = vec4<f32>(p, 2.0);
-    v[n] = vec4<f32>(0.0);
+    retire(n, p);
     return;
   }
   // v.w carries the node's last Newton update into the history kernels
-  v[n] = vec4<f32>(d1 / P.hg.x, lastUpdate);
+  v[n] = vec4<f32>(d / P.hg.x, lastUpdate);
   // largest speed since the host last cleared it (rest detection)
-  atomicMax(&counters[2], bitcast<u32>(length(d1) / P.hg.x));
+  atomicMax(&counters[2], bitcast<u32>(length(d) / P.hg.x));
   x[n] = vec4<f32>(p, w);
 }
 
@@ -236,7 +212,10 @@ fn slip(@builtin(global_invocation_id) gid: vec3<u32>) {
       // The yarn leaves this crossing: the high-side span becomes a free tail of its far node.
       let farTail = select(4u * u32(prev) + 2u * f + 1u, 4u * u32(next) + 2u * f, highR);
       tails[farTail] += segs[sHigh].rest;
-      segs[sHigh].flags = segs[sHigh].flags | SEG_BROKEN;
+      // its yarns left the crossings at n (the owner's end when high is on the right); the field parts
+      // them there at the next coupling (yarnfield.wgsl coupleSpan; this module has no field binding)
+      segs[sHigh].flags = segs[sHigh].flags | SEG_BROKEN | SEG_SLIPPED;
+      segs[sHigh].failSite = select(1.0, 0.0, highR);
       atomicAdd(&counters[1], 1u);
     }
   }

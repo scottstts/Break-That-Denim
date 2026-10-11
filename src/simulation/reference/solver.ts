@@ -1,7 +1,7 @@
 import { axialEnergyDensity, spanResponse } from '../axial';
 import { bendGeometry, bendPsi, bendPsiDelta, bendScale, cellArea, shearJam, shearLaw } from '../laws';
 import { FAMILY_U } from '../material';
-import { SEG_BROKEN, SEG_EXISTS, type CompiledScene, type LayerInfo } from '../scene';
+import { SEG_BROKEN, SEG_EXISTS, SEG_SLIPPED, type CompiledScene, type LayerInfo } from '../scene';
 import { coupleSpans, pullOut, updateField } from '../yarnField';
 import { newtonStepPCG, resetLaggedLevels, type MGConfig } from './newtonMultigrid';
 
@@ -296,6 +296,17 @@ export class ReferenceSolver {
     return kb * bendPsi(r[0] * r[0] + r[1] * r[1] + r[2] * r[2], a)[1];
   }
 
+  /**
+   * Viscous gradient coefficient of the triple last loaded into r: the viscous potential
+   * 1/2 kd (|r| - |rn|)^2 acts on the rate of the bending measure |r|, not on r itself, so a rigid
+   * rotation (which turns r but keeps |r|) is not resisted. Gradient kd (|r| - |rn|) r / |r|.
+   */
+  private bendViscCoeff(kd: number): number {
+    const { r, rn } = this;
+    const lr = Math.hypot(r[0], r[1], r[2]);
+    return (kd * (lr - Math.hypot(rn[0], rn[1], rn[2]))) / Math.max(lr, 1e-12);
+  }
+
   /** Load r (current iterate) and rn (start of the substep) of the triple (a, b, c) with weights wa, wc. */
   private triple(a: number, b: number, c: number, wa: number, wc: number): void {
     for (let k = 0; k < 3; k++) {
@@ -310,12 +321,13 @@ export class ReferenceSolver {
     const nxt = this.nbr[4 * n + 2 * f + 1];
     const sPrev = prev >= 0 ? 2 * prev + f : -1;
     const sNext = nxt >= 0 ? 2 * n + f : -1;
-    const { r, rn } = this;
+    const { r } = this;
     if (this.segActive(sPrev) && this.segActive(sNext)) {
       const [kb, kd, ab, wa, wc] = this.bendCoeffs(n, f, sPrev, sNext);
       this.triple(prev, n, nxt, wa, wc);
       const ke = this.bendGradCoeff(kb, ab);
-      for (let k = 0; k < 3; k++) g[k] += -2 * (ke * r[k] + kd * (r[k] - rn[k]));
+      const kv = ke + this.bendViscCoeff(kd);
+      for (let k = 0; k < 3; k++) g[k] += -2 * kv * r[k];
     }
     if (this.segActive(sNext)) {
       const nxt2 = this.nbr[4 * nxt + 2 * f + 1];
@@ -323,8 +335,8 @@ export class ReferenceSolver {
       if (this.segActive(sNext2)) {
         const [kb, kd, ab, wa, wc] = this.bendCoeffs(nxt, f, sNext, sNext2);
         this.triple(n, nxt, nxt2, wa, wc);
-        const ke = this.bendGradCoeff(kb, ab);
-        for (let k = 0; k < 3; k++) g[k] += wa * (ke * r[k] + kd * (r[k] - rn[k]));
+        const kv = this.bendGradCoeff(kb, ab) + this.bendViscCoeff(kd);
+        for (let k = 0; k < 3; k++) g[k] += wa * kv * r[k];
       }
     }
     if (this.segActive(sPrev)) {
@@ -333,8 +345,8 @@ export class ReferenceSolver {
       if (this.segActive(sPrev2)) {
         const [kb, kd, ab, wa, wc] = this.bendCoeffs(prev, f, sPrev2, sPrev);
         this.triple(prev2, prev, n, wa, wc);
-        const ke = this.bendGradCoeff(kb, ab);
-        for (let k = 0; k < 3; k++) g[k] += wc * (ke * r[k] + kd * (r[k] - rn[k]));
+        const kv = this.bendGradCoeff(kb, ab) + this.bendViscCoeff(kd);
+        for (let k = 0; k < 3; k++) g[k] += wc * kv * r[k];
       }
     }
   }
@@ -482,11 +494,15 @@ export class ReferenceSolver {
           const dp = dirOf(prev);
           const dq = dirOf(next);
           const dr = [0, 1, 2].map((q) => wa * dp[q] - 2 * dn[q] + wc * dq[q]);
-          quad(kd * dot([r0[0] - rn[0], r0[1] - rn[1], r0[2] - rn[2]], dr), kd * dot(dr, dr));
           const q0 = dot(r0, r0);
+          const l0 = Math.sqrt(q0);
+          const lrn = Math.hypot(rn[0], rn[1], rn[2]);
           alphas.forEach((a, k) => {
             const dqa = 2 * a * dot(r0, dr) + a * a * dot(dr, dr);
             add(k, 0.5 * kb * bendPsiDelta(q0, q0 + dqa, dqa, ab));
+            // viscous: exact change of 1/2 kd (|r| - |rn|)^2 without cancellation
+            const [dl, la] = lenChange(r0, dr, a, l0);
+            add(k, 0.5 * kd * dl * (la + l0 - 2 * lrn));
           });
         }
       }
@@ -553,10 +569,8 @@ export class ReferenceSolver {
         this.triple(a, b, nb, wa, wc);
         const r = this.r;
         E += 0.5 * kb * bendPsi(r[0] * r[0] + r[1] * r[1] + r[2] * r[2], ab)[0];
-        for (let q = 0; q < 3; q++) {
-          const d = this.r[q] - this.rn[q];
-          E += 0.5 * kd * d * d;
-        }
+        const dv = Math.hypot(r[0], r[1], r[2]) - Math.hypot(this.rn[0], this.rn[1], this.rn[2]);
+        E += 0.5 * kd * dv * dv;
       }
     }
     for (let n = 0; n < this.N; n++) {
@@ -648,7 +662,7 @@ export class ReferenceSolver {
     const spans = { restLength: this.restLength, softening: this.scene.softening, segFlags: this.segFlags, intact: this.intact, cutMask: this.cutMask, failSite: this.failSite, tails: this.tails };
     updateField(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, spans, this.strain, active, this.scene.crossingNormal0);
     pullOut(this.scene.layers, this.scene.field, this.scene.fieldStrength, this.scene.fieldArea, this.fieldDamage, this.strain, this.scene.crossingNormal0);
-    this.brokenCount += coupleSpans(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, spans, active, SEG_BROKEN);
+    this.brokenCount += coupleSpans(this.scene.layers, this.scene.field, this.scene.fieldArea, this.fieldDamage, spans, active, SEG_BROKEN, SEG_SLIPPED);
   }
 
   /** Friction-limited crossing slip in two parity passes per family. */
@@ -718,7 +732,8 @@ export class ReferenceSolver {
         const far = highR ? this.segOther(sHigh) : sHigh >> 1;
         const farTail = highR ? 4 * far + 2 * f : 4 * far + 2 * f + 1;
         this.tails[farTail] += this.restLength[sHigh];
-        this.segFlags[sHigh] |= SEG_BROKEN;
+        this.segFlags[sHigh] |= SEG_BROKEN | SEG_SLIPPED;
+        this.failSite[sHigh] = highR ? 0 : 1;
         this.pulledOutCount++;
       }
     }

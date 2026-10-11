@@ -42,7 +42,8 @@ fn nodeAt(l: u32, i: i32, j: i32) -> i32 {
   return i32(L.x) + j * i32(L.y) + i;
 }
 
-fn pinned(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 0.5; }
+// mounted or retired (detached pieces stay in the solve, state.wgsl)
+fn pinned(n: u32) -> bool { return (nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 1.5; }
 
 fn spanOn(owner: i32, f: u32) -> bool {
   if (owner < 0) { return false; }
@@ -131,15 +132,19 @@ fn nodeDelta(n: u32) {
       let rn = geo.x * x[a].xyz - 2.0 * x[n].xyz + geo.y * x[c].xyz;
       let r0 = rn + geo.x * dx[a].xyz - 2.0 * d0 + geo.y * dx[c].xyz;
       let dr = geo.x * dir(a) - 2.0 * dn + geo.y * dir(c);
-      // elastic: exact change of the fold-stiffening energy; viscous: quadratic
-      quad(kd * dot(r0 - rn, dr), kd * dot(dr, dr));
+      // elastic: exact change of the fold-stiffening energy; viscous: exact change of 1/2 kd (|r| - |rn|)^2
+      // (assemble.wgsl triple), (|r| - |r0|) (|r| + |r0| - 2 |rn|) without cancellation
       let q0 = dot(r0, r0);
+      let l0 = sqrt(q0);
+      let lrn = length(rn);
       let ab = geo.w;
       for (var k = 0u; k < 4u; k++) {
         let alv = ALPHA;
         let al = alv[k];
         let dq = 2.0 * al * dot(r0, dr) + al * al * dot(dr, dr);
         add1(k, 0.5 * ke * bendPsiDelta(q0, q0 + dq, dq, ab));
+        let rl = lenChange(r0, dr, al, l0);
+        add1(k, 0.5 * kd * rl.x * (rl.y + l0 - 2.0 * lrn));
       }
     }
   }

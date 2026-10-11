@@ -50,6 +50,14 @@ export interface GripPatch {
   between: number[];
   /** Stiffness per unit weight (N/m): the summed force reaches GRIP.maxForce at the largest lead. */
   stiffness: number;
+  /**
+   * A pinch holds by friction under its pads: an entry displaced farther than this (m, the pad's
+   * radius) from where the rest of the patch holds it is no longer under a pad and slips out
+   * (interact.wgsl gripLead). 0: the hold does not slip (claws: yarns caught on a claw leave it only by
+   * tearing, and a hand's claws move relative to each other, so displacement from the grab-time
+   * offsets is no sign of leaving).
+   */
+  slip: number;
 }
 
 /**
@@ -100,7 +108,7 @@ function splitPads(s: CompiledScene, node: number, disc: GripPatch, axis: number
   const layer = s.layers.find((L) => node >= L.nodeOffset && node < L.nodeOffset + L.nodeCount)!;
   const pitch = axis === 0 ? layer.material.pitchU : layer.material.pitchV;
   const c = s.restUV[2 * node + axis];
-  const out: GripPatch = { nodes: [], weights: [], sides: [], stiffness: 0, padPitch: pitch, between: [] };
+  const out: GripPatch = { nodes: [], weights: [], sides: [], stiffness: 0, padPitch: pitch, between: [], slip: disc.slip };
   const side = [0, 0];
   disc.nodes.forEach((n, k) => {
     const u = s.restUV[2 * n + axis] - c;
@@ -143,7 +151,7 @@ export function hookPatch(s: CompiledScene, claws: readonly number[], profile: H
   const nodes = [...weight.keys()];
   const weights = nodes.map((n) => weight.get(n)!);
   const W = weights.reduce((a, b) => a + b, 0);
-  return { nodes, weights, sides: nodes.map(() => 0), padPitch: 0, between: [], stiffness: profile.maxForce / (profile.maxLead * W) };
+  return { nodes, weights, sides: nodes.map(() => 0), padPitch: 0, between: [], stiffness: profile.maxForce / (profile.maxLead * W), slip: 0 };
 }
 
 /** The smoothly weighted disc around `node` (see gripPatch), with a radial pinch. */
@@ -180,7 +188,7 @@ function patchDisc(s: CompiledScene, node: number, available: (n: number) => boo
     }
   }
   if (nodes.length === 0) return null;
-  return { nodes, weights, sides: nodes.map(() => 0), padPitch: 0, between: [], stiffness: GRIP.maxForce / (GRIP.maxLead * W) };
+  return { nodes, weights, sides: nodes.map(() => 0), padPitch: 0, between: [], stiffness: GRIP.maxForce / (GRIP.maxLead * W), slip: R };
 }
 
 /**

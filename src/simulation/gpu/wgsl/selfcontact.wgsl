@@ -1,8 +1,10 @@
 // Self-contact of a cloth layer: a node against a face (an intact lattice cell, as the two triangles
-// c00 c10 c11 and c00 c11 c01). Penalty E = 1/2 k (delta - d)^2 on the distance d from the node to the
-// face, with lagged-normal regularized Coulomb friction on their relative step. The node takes the
-// force, the face's corners the reaction by the closest point's barycentric weights (momentum is
-// conserved). Contributions are scattered with fixed-point integer atomics (WGSL has no float
+// c00 c10 c11 and c00 c11 c01). Penalty E = k (delta - d)^3 / (3 delta) on the distance d from the node
+// to the face: force k s^2 / delta and stiffness 2 k s / delta at depth s = delta - d, both zero where
+// contact begins (the surface fibres compress progressively; the Newton step is limited to where that
+// linearization holds, terms). Lagged-normal regularized Coulomb friction acts on their relative step.
+// The node takes the force, the face's corners the reaction by the closest point's barycentric weights
+// (momentum is conserved). Contributions are scattered with fixed-point integer atomics (WGSL has no float
 // atomics) and gathered into ext; the Newton operator sees them as diagonal blocks.
 //
 // Faces are hashed by centroid once per substep at the predicted iterate (and at the start of the
@@ -57,8 +59,8 @@ struct SelfU {
 
 fn tableMask() -> u32 { return bitcast<u32>(SU.grid.y); }
 fn cur(n: u32) -> vec3<f32> { return x[n].xyz + dx[n].xyz; }
-// a node of the cloth solve (not debris or retired)
-fn cloth(n: u32) -> bool { return x[n].w < 0.5; }
+// a node of the solve: cloth or a detached piece (not retired)
+fn cloth(n: u32) -> bool { return x[n].w < 1.5; }
 
 fn hashCell(c: vec3<i32>) -> u32 {
   let h = (u32(c.x) * 73856093u) ^ (u32(c.y) * 19349663u) ^ (u32(c.z) * 83492791u);
@@ -303,7 +305,7 @@ fn damageRow(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = latticeNode(L, a, j);
     let fu = segs[2u * m].flags;
     let fv = segs[2u * m + 1u].flags;
-    if (!cloth(m) || (fu & SEG_BROKEN) != 0u || (fv & SEG_BROKEN) != 0u) { mark = 1u; }
+    if (x[m].w > 0.5 || (fu & SEG_BROKEN) != 0u || (fv & SEG_BROKEN) != 0u) { mark = 1u; }
   }
   atomicStore(&pairs[(K + 1u) * P.counts.x + n], mark);
 }
@@ -317,8 +319,7 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x) { return; }
   for (var k = 0u; k < K; k++) { atomicStore(&pairs[K * n + k], NONE); }
-  // ballistic debris is bounded against the cloth too (it lands on it instead of falling through), but
-  // takes no penalty terms (step.wgsl commit clips its fall); retired nodes are out of the scene
+  // retired nodes are out of the scene
   if ((nodes[n].flags & NODE_PINNED) != 0u || x[n].w > 1.5) {
     cmeta[2u * n] = vec4<f32>(0.0, 0.0, 0.0, 1e9);
     return;
@@ -418,9 +419,7 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
       }
     }
   }
-  if (cloth(n)) {
-    for (var k = 0u; k < K; k++) { atomicStore(&pairs[K * n + k], best[k]); }
-  }
+  for (var k = 0u; k < K; k++) { atomicStore(&pairs[K * n + k], best[k]); }
   // the bound: against the first face the predicted path crosses (its plane, on the side the node
   // starts on), else against the nearest face at the start
   var nb = n0;
@@ -448,7 +447,6 @@ fn detect(@builtin(global_invocation_id) gid: vec3<u32>) {
   // never close the clearance
   let share = SU.law.w * max(db - HARD_CORE, 0.0);
   cmeta[2u * n] = vec4<f32>(nb, share);
-  if (!cloth(n)) { return; }
   let key = ((4095u - min(4095u, u32(share / RECIP_UNIT))) << 20u) | (n + 1u);
   let c = corners(fb);
   let base = K * P.counts.x;
@@ -497,21 +495,30 @@ fn terms(@builtin(global_invocation_id) gid: vec3<u32>) {
   let mu = SU.law.y;
   let epsU = SU.law.z * P.hg.x;
   let I3 = mat3x3<f32>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0));
+  let own = cmeta[2u * n];
+  // how far this iteration's step may still approach along the node's bound normal (trust region below)
+  var reach = 1e9;
+  // depth at which the penalty carries the node's weight
+  let sWeight = sqrt(nodes[n].mass * length(P.hg.yzw) * delta / kc);
   for (var k = 0u; k < K; k++) {
     let f = atomicLoad(&pairs[K * n + k]);
     if (f == NONE) { continue; }
     let c = corners(f);
     let hit = faceHit(p, c);
-    if (hit.d >= delta || hit.d <= 1e-9) { continue; }
+    if (hit.d <= 1e-9) { continue; }
     let nn = (p - hit.q) / hit.d;
-    let lam = kc * (delta - hit.d);
+    let a = dot(nn, own.xyz);
+    if (a > 0.1) { reach = min(reach, (hit.d - delta + max(sWeight, 2.0 * max(delta - hit.d, 0.0))) / a); }
+    if (hit.d >= delta) { continue; }
+    let s = delta - hit.d;
+    let lam = kc * s * s / delta;
     let nnT = mat3x3<f32>(nn * nn.x, nn * nn.y, nn * nn.z);
     // friction on the step relative to the face's material point
     let rel = dx[n].xyz - (hit.w.x * dx[c.x].xyz + hit.w.y * dx[c.y].xyz + hit.w.z * dx[c.z].xyz + hit.w.w * dx[c.w].xyz);
     let ut = rel - dot(rel, nn) * nn;
     let kf = mu * lam / max(length(ut), epsU);
     let g = -lam * nn + kf * ut;
-    let H = kc * nnT + kf * (I3 - nnT);
+    let H = (2.0 * kc * s / delta) * nnT + kf * (I3 - nnT);
     // The operator takes contact as diagonal blocks only (the node-face coupling is non-local), so
     // node and face each answer the contact force on their own. With the exact blocks (H on the node,
     // w^2 H on a corner of weight w) a corner would correct by gap / w and the pair would overshoot
@@ -525,6 +532,18 @@ fn terms(@builtin(global_invocation_id) gid: vec3<u32>) {
       if (ws[q] <= 0.0) { continue; }
       addTerm(cs[q], -ws[q] * g, (2.0 * ws[q]) * H);
     }
+  }
+  // Trust region of the linearized penalty: a step may take the node no deeper into a contact distance
+  // than twice its depth now, or the depth that carries its weight (its bound tightened to there for the
+  // rest of the substep; step.wgsl newtonApply). Its curvature grows with depth (zero at the onset), so
+  // beyond that the Newton model understates it without bound: one iteration took a free node outside
+  // contact as deep as gravity carried it (h^2 g = 0.68 mm per substep), and a light strand lying on
+  // cloth sank 0.4 mm, was kicked back by 0.25 N and bounced in a cycle two iterations never converged
+  // (8 were needed). Within the region the model's curvature is at least half the true one; a node the
+  // forces press deeper gets there over successive iterations and substeps.
+  if (reach < 1e9 && any(own.xyz != vec3<f32>(0.0))) {
+    let approach = -dot(dx[n].xyz, own.xyz);
+    cmeta[2u * n] = vec4<f32>(own.xyz, min(own.w, approach + reach));
   }
 }
 

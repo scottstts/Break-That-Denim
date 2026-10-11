@@ -7,7 +7,8 @@ import stateWgsl from './wgsl/state.wgsl?raw';
 /**
  * Detached-piece detection. After ruptures (or a grip release) the active span graph is read back
  * (one u32 per node) and searched from its anchors: mounted nodes and, while gripping, the grip
- * patch core. Cloth nodes that no longer reach an anchor become ballistic debris (see state.wgsl).
+ * patch core. Cloth nodes that no longer reach an anchor become detached (see state.wgsl): they stay in
+ * the solve, but nothing holds them.
  * A piece torn out inside the pinch stays in the fingers, whatever its size, until the grip ends.
  * At most one analysis is in flight; requests made meanwhile are coalesced into one rerun.
  *
@@ -42,7 +43,7 @@ export class Topology {
   private anchors: readonly number[] = [];
   /** Current grip anchors, when the owner supplies them (read at apply time). */
   private readonly anchorSource: (() => readonly number[]) | null;
-  /** Nodes made ballistic so far (development statistics). */
+  /** Nodes detached so far (development statistics). */
   freedCount = 0;
 
   constructor(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, anchors: (() => readonly number[]) | null = null) {
@@ -57,7 +58,7 @@ export class Topology {
     this.packed = createBuffer(device, 'state.packed', 4 * N);
     this.freedBuf = createBuffer(device, 'state.freed', 4 * N);
     this.staging = device.createBuffer({ label: 'state.staging', size: Math.max(16, 4 * N), usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    this.group = this.mod.bindGroup('state', { 0: solver.simParams, 1: solver.segs, 2: solver.x, 3: solver.levels[0].fixed, 4: this.packed, 5: this.freedBuf });
+    this.group = this.mod.bindGroup('state', { 0: solver.simParams, 1: solver.segs, 2: solver.x, 4: this.packed, 5: this.freedBuf });
     this.freed = new Uint32Array(N);
     this.visited = new Uint8Array(N);
     this.queue = new Int32Array(N);

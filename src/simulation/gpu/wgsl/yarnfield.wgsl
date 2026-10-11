@@ -3,7 +3,7 @@
 // parallel spans around it; the spans then take their intact fraction from it, and a span whose yarns
 // have all separated ruptures. Passes, in order: spanStrain (strain snapshot per span), fieldUpdatePick
 // and fieldUpdateWarp (per span and yarn, after sepSnapshot), pullMark and pullApply (per 16 crossings),
-// couple (per span).
+// coupleU and coupleV (per span, one family each).
 
 @group(0) @binding(0) var<uniform> P: SimParams;
 // per layer: first crossing, warps K, picks M, load-sharing reach along picks | along warps << 16
@@ -35,7 +35,8 @@ const CUT: u32 = 255u;
 const PULLED: u32 = 254u;
 
 fn latticeOf(l: u32) -> vec4<u32> { return P.layers[l].lattice; }
-fn cloth(n: u32) -> bool { return x[n].w < 0.5; }
+// in the solve: cloth or a detached piece (not retired)
+fn cloth(n: u32) -> bool { return x[n].w < 1.5; }
 fn bundleF(l: u32, f: u32) -> u32 { return u32(P.layers[l].yarn[f].yarnsPerSpan); }
 fn damageAt(c: u32, f: u32) -> u32 { return (field[c] >> (8u * f)) & 0xFFu; }
 fn areaOfCode(code: u32) -> f32 { return max(0.02, f32(code) / 255.0); }
@@ -373,24 +374,27 @@ fn pullApply(@builtin(global_invocation_id) gid: vec3<u32>) {
   atomicStore(&fieldEvents[0], 1u);
 }
 
-@compute @workgroup_size(128)
-fn couple(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let s = gid.x;
-  if (s >= 2u * P.counts.x || P.counts.z == 0u) { return; }
+fn coupleSpan(a: u32, f: u32) {
+  if (a >= P.counts.x || P.counts.z == 0u) { return; }
+  let s = 2u * a + f;
   var sg = segs[s];
-  if (!segActive(sg)) { return; }
-  let a = s >> 1u;
-  let f = s & 1u;
+  let slipped = (sg.flags & SEG_SLIPPED) != 0u;
+  if (!slipped && !segActive(sg)) { return; }
   let ijl = nodes[a].ijl;
   let l = ijl >> 24u;
   let L = latticeOf(l);
   let i = ijl & 0xFFFu;
   let j = (ijl >> 12u) & 0xFFFu;
-  let b = a + select(L.y, 1u, f == 0u);
-  if (!cloth(a) || !cloth(b)) { return; }
   let F = FU[l];
   let bu = bundleF(l, 1u);
   let bv = bundleF(l, 0u);
+  if (slipped) {
+    partYarns(F, i, j, f, bu, bv, select(1, 0, sg.failSite < 0.5));
+    segs[s].flags = sg.flags & ~SEG_SLIPPED;
+    return;
+  }
+  let b = a + select(L.y, 1u, f == 0u);
+  if (!cloth(a) || !cloth(b)) { return; }
   let B = select(bv, bu, f == 1u);
   let Pn = select(bu, bv, f == 1u);
   var sum = 0.0;
@@ -401,12 +405,7 @@ fn couple(@builtin(global_invocation_id) gid: vec3<u32>) {
     var first = -1;
     var compliance = 0.0;
     for (var p = 0u; p < Pn; p++) {
-      var c: u32;
-      if (f == 1u) {
-        c = F.x + (j * bv + bv / 2u + p) * F.y + i * bu + q;
-      } else {
-        c = F.x + (j * bv + q) * F.y + i * bu + bu / 2u + p;
-      }
+      let c = spanCrossingF(F, i, j, f, bu, bv, q, p);
       let d = damageAt(c, f);
       compliance += 1.0 / areaAt(c, f);
       dmax = max(dmax, d);
@@ -428,6 +427,49 @@ fn couple(@builtin(global_invocation_id) gid: vec3<u32>) {
     tails[4u * a + 2u * f + 1u] += sg.rest * phi;
     tails[4u * b + 2u * f] += sg.rest * (1.0 - phi);
     atomicAdd(&counters[0], 1u);
+    partYarns(F, i, j, f, bu, bv, -1);
   }
   segs[s] = sg;
 }
+
+// A separated span's yarns part from the other side's weave (yarnField.ts partSpanYarns). A ruptured
+// span's yarn belongs, up to its first separation, to the span's owner a and beyond it to b (their
+// tails took its rest length; the renderer draws it so); a span whose yarns slid out of the crossings
+// at one end (slipEnd 0 at a, 1 at b) belongs wholly to the other. The span's first half of crossings
+// is interlaced with yarns of a's column (row, for a v-span), its second half with b's: where the
+// yarn's side and the crossing's disagree, the crossing would still tie a to b after the lattice let
+// them part. The yarn's end slides out there (the crossing yarn has no free end near): pulled out.
+fn partYarns(F: vec4<u32>, i: u32, j: u32, f: u32, bu: u32, bv: u32, slipEnd: i32) {
+  let B = select(bv, bu, f == 1u);
+  let Pn = select(bu, bv, f == 1u);
+  // crossings p < half are interlaced with a's yarns
+  let half = Pn - Pn / 2u;
+  for (var q = 0u; q < B; q++) {
+    var ofA = slipEnd != 0;
+    for (var p = 0u; p < Pn; p++) {
+      let c = spanCrossingF(F, i, j, f, bu, bv, q, p);
+      let word = field[c];
+      if (((word >> (8u * f)) & 0xFFu) >= PULLED) {
+        if (slipEnd < 0) { ofA = false; }
+        continue;
+      }
+      if (ofA != (p < half)) {
+        field[c] = (word & ~(0xFFu << (8u * f))) | (PULLED << (8u * f));
+        atomicStore(&fieldEvents[0], 1u);
+      }
+    }
+  }
+}
+
+// Crossing of yarn q of span (i, j, f) at its p-th crossing from the owner (yarnField.ts spanCrossing).
+fn spanCrossingF(F: vec4<u32>, i: u32, j: u32, f: u32, bu: u32, bv: u32, q: u32, p: u32) -> u32 {
+  if (f == 1u) { return F.x + (j * bv + bv / 2u + p) * F.y + i * bu + q; }
+  return F.x + (j * bv + q) * F.y + i * bu + bu / 2u + p;
+}
+
+// One pass per family: a crossing's word is then written by the one span of that family holding it.
+@compute @workgroup_size(128)
+fn coupleU(@builtin(global_invocation_id) gid: vec3<u32>) { coupleSpan(gid.x, 0u); }
+
+@compute @workgroup_size(128)
+fn coupleV(@builtin(global_invocation_id) gid: vec3<u32>) { coupleSpan(gid.x, 1u); }

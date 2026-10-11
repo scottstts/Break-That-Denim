@@ -410,11 +410,37 @@ export function updateField(
 }
 
 /**
- * Span state from the field: intact fraction and cut-yarn mask of every active span; a span whose
- * yarns have all separated ruptures (its rest length splits into tails at the mean cut position).
- * Returns the number of ruptures. Reference implementation of couple in yarnfield.wgsl.
+ * A separated span's yarns part from the other side's weave. A ruptured span's yarn belongs, up to
+ * its first separation, to the span's owner a and beyond it to the other node b (the tails took its
+ * length so); a span whose yarns slid out of the crossings at one end (crossing slip, `slipEnd` 0 at
+ * a, 1 at b) belongs wholly to the other end. The span's first ceil(P / 2) crossings are interlaced
+ * with yarns of a's column (row, for a v-span), the rest with b's. Where the yarn's side and the
+ * crossing's disagree the crossing would still tie a to b after the lattice let them part: the yarn's
+ * end slides out of it (the crossing yarn has no free end near), DAMAGE_PULLED. Writes family f of the
+ * span's own crossings only.
  */
-export function coupleSpans(layers: readonly LayerInfo[], fls: readonly FieldLayer[], area: Uint8Array, damage: Uint8Array, spans: FieldSpans, isActive: (s: number) => boolean, brokenFlag: number): number {
+function partSpanYarns(fl: FieldLayer, damage: Uint8Array, i: number, j: number, f: number, slipEnd = -1): void {
+  const P = spanLength(fl, f);
+  const half = P - Math.floor(P / 2);
+  for (let q = 0; q < bundleOf(fl, f); q++) {
+    let ofA = slipEnd !== 0;
+    for (let p = 0; p < P; p++) {
+      const e = 2 * spanCrossing(fl, i, j, f, q, p) + f;
+      if (damage[e] >= DAMAGE_SEPARATED) {
+        if (slipEnd < 0) ofA = false;
+      } else if (ofA !== p < half) damage[e] = DAMAGE_PULLED;
+    }
+  }
+}
+
+/**
+ * Span state from the field: intact fraction and cut-yarn mask of every active span; a span whose
+ * yarns have all separated ruptures (its rest length splits into tails at the mean cut position, and
+ * its yarns part from the other side's weave, partSpanYarns), as do those of a span crossing slip broke
+ * since (`slippedFlag`). Returns the number of ruptures. Reference implementation of coupleU / coupleV
+ * in yarnfield.wgsl.
+ */
+export function coupleSpans(layers: readonly LayerInfo[], fls: readonly FieldLayer[], area: Uint8Array, damage: Uint8Array, spans: FieldSpans, isActive: (s: number) => boolean, brokenFlag: number, slippedFlag: number): number {
   let ruptures = 0;
   layers.forEach((L, l) => {
     const fl = fls[l];
@@ -424,6 +450,11 @@ export function coupleSpans(layers: readonly LayerInfo[], fls: readonly FieldLay
           if ((f === 0 && i >= L.nx - 1) || (f === 1 && j >= L.ny - 1)) continue;
           const n = L.nodeOffset + j * L.nx + i;
           const s = 2 * n + f;
+          if (spans.segFlags[s] & slippedFlag) {
+            partSpanYarns(fl, damage, i, j, f, spans.failSite[s] < 0.5 ? 0 : 1);
+            spans.segFlags[s] &= ~slippedFlag;
+            continue;
+          }
           if (!isActive(s)) continue;
           const B = bundleOf(fl, f);
           const P = spanLength(fl, f);
@@ -458,6 +489,7 @@ export function coupleSpans(layers: readonly LayerInfo[], fls: readonly FieldLay
             spans.tails[4 * n + 2 * f + 1] += rest * phi;
             spans.tails[4 * b + 2 * f] += rest * (1 - phi);
             ruptures++;
+            partSpanYarns(fl, damage, i, j, f);
           }
         }
       }

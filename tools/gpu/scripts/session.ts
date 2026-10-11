@@ -89,7 +89,7 @@ const SCRIPTS_10CM: Record<string, Step[]> = {
     { to: [0.0, 0.02, 0.012], t: 0.6 },
     { to: [0.0, 0.035, 0.006], t: 0.5 },
     { release: true },
-    { wait: 1.5 },
+    { wait: Number(process.env.WAIT ?? 1.5) },
   ],
   // one in-plane drag through the worn zone, held
   pull: [
@@ -489,6 +489,23 @@ export default async function main(args: string[]): Promise<void> {
       for (const tn of process.env.TRACK.split(',').map(Number)) {
         const k = interaction.patchNodes.indexOf(tn);
         console.log(`  node ${tn} x=${Array.from(xs.slice(4 * tn, 4 * tn + 4)).map((q) => q.toFixed(4))} v=${Array.from(v.slice(4 * tn, 4 * tn + 3)).map((q) => q.toFixed(3))} grip=${k >= 0}`);
+      }
+    }
+    if (process.env.FASTEST) {
+      // the fastest live nodes: state, surviving span count, height and contact bounds (own, reciprocal)
+      const sg = new Uint32Array(await readBuffer(device, solver.segs));
+      const meta = new Float32Array(await readBuffer(device, solver.contact.meta));
+      const act = (q: number) => (sg[8 * q + 5] & 3) === 1;
+      const L0 = scene.layers[0];
+      const list: Array<[number, number]> = [];
+      for (let n = 0; n < scene.nodeCount; n++) if (xs[4 * n + 3] < 1.5) list.push([Math.hypot(v[4 * n], v[4 * n + 1], v[4 * n + 2]), n]);
+      list.sort((a, b) => b[0] - a[0]);
+      for (const [sp, n] of list.slice(0, Number(process.env.FASTEST))) {
+        const i = n % L0.nx;
+        const j = Math.floor(n / L0.nx);
+        const deg = (i < L0.nx - 1 && act(2 * n) ? 1 : 0) + (i > 0 && act(2 * (n - 1)) ? 1 : 0) + (j < L0.ny - 1 && act(2 * n + 1) ? 1 : 0) + (j > 0 && act(2 * (n - L0.nx) + 1) ? 1 : 0);
+        const b = Array.from(meta.slice(8 * n, 8 * n + 8)).map((q) => (Math.abs(q) > 1e8 ? 'inf' : q.toFixed(4)));
+        console.log(`  fast ${n} (${i},${j}) state ${xs[4 * n + 3]} deg ${deg} v ${sp.toFixed(3)} z ${(1e3 * xs[4 * n + 2]).toFixed(2)} mm bound ${b.join(',')}`);
       }
     }
     if (process.env.STATS) {
@@ -1038,10 +1055,13 @@ async function lineProbe(device: GPUDevice, solver: import('../../../src/simulat
         p.dispatchWorkgroups(g);
       });
       solver.encodeAssemble(p, it === 0);
+    });
+    // the assembled right-hand side (-gradient); PCG overwrites it with its residual
+    const B = new Float32Array(await readBuffer(device, solver.levels[0].B));
+    run((p) => {
       solver.encodePCG(p);
       solver.encodeLineSearch(p);
     });
-    const B = new Float32Array(await readBuffer(device, solver.levels[0].B));
     const D = new Float32Array(await readBuffer(device, solver.delta));
     const P4 = new Float32Array(await readBuffer(device, solver.partial4));
     const C = new Float32Array(await readBuffer(device, solver.counters, 64));
@@ -1070,15 +1090,139 @@ async function lineProbe(device: GPUDevice, solver: import('../../../src/simulat
       const L = solver.scene.layers[0];
       for (const n of ranked) {
         const spans = [0, 1].map((f) => `f${f} rest=${(sg[8 * (2 * n + f)] * 1e3).toFixed(3)}mm intact=${sg[8 * (2 * n + f) + 1].toFixed(3)} flags=${sgu[8 * (2 * n + f) + 5]}`).join(' ');
+        if (process.env.LSCHECK) {
+          // incident spans: strain at the iterate and at 1/8 of the step, rest, intact, flags
+          const P = (q: number, t: number) => [0, 1, 2].map((c) => xs2[4 * q + c] + dx2[4 * q + c] + t * D[4 * q + c]);
+          const parts: string[] = [];
+          for (const [o, f, b] of [[n, 0, n + 1], [n, 1, n + L.nx], [n - 1, 0, n], [n - L.nx, 1, n]] as const) {
+            if (o < 0 || b >= solver.N) continue;
+            const q = 2 * o + f;
+            const rest = sg[8 * q];
+            const len = (t: number) => Math.hypot(...[0, 1, 2].map((c) => P(b, t)[c] - P(o, t)[c]));
+            parts.push(`${o === n ? '+' : '-'}${'uv'[f]}: eps ${(len(0) / rest - 1).toFixed(4)} -> ${(len(0.125) / rest - 1).toFixed(4)} rest ${(rest * 1e3).toFixed(2)} intact ${sg[8 * q + 1].toFixed(3)} flags ${sgu[8 * q + 5]}`);
+          }
+          const ext = new Float32Array(await readBuffer(device, solver.ext));
+          const pr = new Float32Array(await readBuffer(device, solver.pred));
+          console.log(`      node ${n} ext g (${[0, 1, 2].map((c) => ext[12 * n + c].toExponential(2)).join(', ')}) H diag (${[ext[12 * n + 4], ext[12 * n + 7], ext[12 * n + 9]].map((v) => v.toExponential(2)).join(', ')}) pred-dx (${[0, 1, 2].map((c) => ((pr[4 * n + c] - dx2[4 * n + c]) * 1e3).toFixed(2)).join(', ')}) mm held ${interaction.coreNodes.includes(n)}`);
+          console.log(`      node ${n} rhs (${[0, 1, 2].map((c) => B[4 * n + c].toExponential(2)).join(', ')}) d (${[0, 1, 2].map((c) => (D[4 * n + c] * 1e3).toFixed(2)).join(', ')}) mm | ${parts.join(' | ')}`);
+        }
         console.log(`    node ${n} (i=${n % L.nx} j=${Math.floor(n / L.nx)}) w=${xs2[4 * n + 3]} dE=[${Array.from(dbg.slice(8 * n, 8 * n + 4)).map((v) => v.toExponential(2)).join(' ')}] cat(ax,visc,bend,shear)=[${Array.from(dbg.slice(8 * n + 4, 8 * n + 8)).map((v) => v.toExponential(2)).join(' ')}] dx=${(Math.hypot(dx2[4 * n], dx2[4 * n + 1], dx2[4 * n + 2]) * 1e3).toFixed(3)}mm |d|=${Math.hypot(D[4 * n], D[4 * n + 1], D[4 * n + 2]).toExponential(2)} ${spans}`);
       }
     }
+    if (process.env.LSCHECK) await operatorCheck(device, solver, B, D, contrib.slice(0, 3).map(([, n]) => n));
     const top = contrib.slice(0, 4).map(([q, n]) => `${n}(${q.toExponential(1)} w=${xs[4 * n + 3]})`).join(' ');
     console.log(`  LS ${tag} it${it} g.d=${gd.toExponential(3)} e=[${e.map((v) => v.toExponential(2)).join(' ')}] tol=[${m.map((v) => (4e-6 * v).toExponential(1)).join(' ')}] alpha=${C[3]} | ascent nodes ${top}`);
     run((p) => s.dispatch.call(solver, p, 'newtonApply', `newtonApply${it}`, Math.ceil(solver.N / 128)));
   }
   run((p) => solver.encodeFinalize(p));
   await device.queue.onSubmittedWorkDone();
+}
+
+/**
+ * LSCHECK=1 (with LSPROBE): the assembled fine operator in f64 along the PCG direction (d.Ad against
+ * b.d: a PCG iterate on an SPD operator and preconditioner has b.d >= d.Ad / 2 > 0), its symmetry, and
+ * the smallest eigenvalues of each listed node's diagonal block and of the operator restricted to the
+ * 5 x 5 nodes around it.
+ */
+async function operatorCheck(device: GPUDevice, solver: import('../../../src/simulation/gpu/solver').GpuSolver, B: Float32Array, D: Float32Array, focus: number[]): Promise<void> {
+  const L0 = solver.levels[0];
+  const op = new Float32Array(await readBuffer(device, L0.op));
+  const fixed = new Uint32Array(await readBuffer(device, L0.fixed));
+  const L = solver.scene.layers[0];
+  const offs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [-1, 1], [1, -1], [2, 0], [-2, 0], [0, 2], [0, -2]];
+  const sym = (a: number, b: number): number[] => [op[4 * a], op[4 * a + 1], op[4 * a + 2], op[4 * a + 1], op[4 * a + 3], op[4 * b], op[4 * a + 2], op[4 * b], op[4 * b + 1]];
+  const idn = (s: number): number[] => [s, 0, 0, 0, s, 0, 0, 0, s];
+  const block = (n: number, k: number): number[] => {
+    const r = 18 * n;
+    if (k < 0) return sym(r, r + 1);
+    if (k < 8) return sym(r + 2 * k + 2, r + 2 * k + 3);
+    const s = 4 * (r + (k >= 10 ? 3 : 1));
+    return idn(op[s + ((k & 1) === 1 ? 3 : 2)]);
+  };
+  const nb = (n: number, k: number): number => {
+    const i = (n - L.nodeOffset) % L.nx + offs[k][0];
+    const j = Math.floor((n - L.nodeOffset) / L.nx) + offs[k][1];
+    return i < 0 || j < 0 || i >= L.nx || j >= L.ny ? -1 : L.nodeOffset + j * L.nx + i;
+  };
+  const mul = (M: number[], v: number[]): number[] => [0, 1, 2].map((r) => M[3 * r] * v[0] + M[3 * r + 1] * v[1] + M[3 * r + 2] * v[2]);
+  const vecAt = (a: Float32Array, n: number): number[] => [a[4 * n], a[4 * n + 1], a[4 * n + 2]];
+  let dAd = 0;
+  let bd = 0;
+  let asym = 0;
+  for (let n = 0; n < solver.N; n++) {
+    if (fixed[n] !== 0) continue;
+    const dn = vecAt(D, n);
+    bd += dn[0] * B[4 * n] + dn[1] * B[4 * n + 1] + dn[2] * B[4 * n + 2];
+    let y = mul(block(n, -1), dn);
+    for (let k = 0; k < 12; k++) {
+      const m = nb(n, k);
+      if (m < 0) continue;
+      const C = block(n, k);
+      y = y.map((v, q) => v + mul(C, vecAt(D, m))[q]);
+      // the reverse coupling (row m, offset -k) must be the transpose
+      const back = [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10][k];
+      if (fixed[m] === 0) {
+        const Cb = block(m, back);
+        for (let q = 0; q < 9; q++) asym = Math.max(asym, Math.abs(C[q] - Cb[3 * (q % 3) + Math.floor(q / 3)]));
+      }
+    }
+    dAd += dn[0] * y[0] + dn[1] * y[1] + dn[2] * y[2];
+  }
+  const model = [1, 0.5, 0.25, 0.125].map((a) => -a * bd + 0.5 * a * a * dAd);
+  console.log(`    operator: b.d ${bd.toExponential(3)}  d.Ad ${dAd.toExponential(3)}  model dE(1, 1/2, 1/4, 1/8) [${model.map((v) => v.toExponential(2)).join(' ')}]  largest asymmetry ${asym.toExponential(2)}`);
+  for (const n of focus) {
+    const patch: number[] = [];
+    const [i0, j0] = [(n - L.nodeOffset) % L.nx, Math.floor((n - L.nodeOffset) / L.nx)];
+    for (let j = j0 - 2; j <= j0 + 2; j++) for (let i = i0 - 2; i <= i0 + 2; i++) if (i >= 0 && j >= 0 && i < L.nx && j < L.ny && fixed[L.nodeOffset + j * L.nx + i] === 0) patch.push(L.nodeOffset + j * L.nx + i);
+    const P = patch.length;
+    const A = Array.from({ length: 3 * P }, () => new Float64Array(3 * P));
+    patch.forEach((m, a) => {
+      const put = (b: number, M: number[]) => {
+        for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) A[3 * a + r][3 * b + c] += M[3 * r + c];
+      };
+      put(a, block(m, -1));
+      for (let k = 0; k < 12; k++) {
+        const b = patch.indexOf(nb(m, k));
+        if (b >= 0) put(b, block(m, k));
+      }
+    });
+    const ev = jacobiEigen(A).sort((a, b) => a - b);
+    const dg = jacobiEigen([0, 1, 2].map((r) => Float64Array.from(block(n, -1).slice(3 * r, 3 * r + 3)))).sort((a, b) => a - b);
+    console.log(`    node ${n}: diagonal block eigenvalues ${dg.map((v) => v.toExponential(2)).join(' ')}; 5x5 patch smallest ${ev.slice(0, 3).map((v) => v.toExponential(2)).join(' ')} (largest ${ev[ev.length - 1].toExponential(2)})`);
+  }
+}
+
+/** Eigenvalues of a symmetric matrix (cyclic Jacobi, symmetrized). */
+function jacobiEigen(M: Float64Array[]): number[] {
+  const n = M.length;
+  const A = M.map((r, i) => Float64Array.from(r, (v, j) => 0.5 * (v + M[j][i])));
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) off += A[p][q] * A[p][q];
+    if (off < 1e-30) break;
+    for (let p = 0; p < n; p++) {
+      for (let q = p + 1; q < n; q++) {
+        if (Math.abs(A[p][q]) < 1e-300) continue;
+        const th = (A[q][q] - A[p][p]) / (2 * A[p][q]);
+        const t = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+        const c = 1 / Math.sqrt(t * t + 1);
+        const s = t * c;
+        for (let k = 0; k < n; k++) {
+          const akp = A[k][p];
+          const akq = A[k][q];
+          A[k][p] = c * akp - s * akq;
+          A[k][q] = s * akp + c * akq;
+        }
+        for (let k = 0; k < n; k++) {
+          const apk = A[p][k];
+          const aqk = A[q][k];
+          A[p][k] = c * apk - s * aqk;
+          A[q][k] = s * apk + c * aqk;
+        }
+      }
+    }
+  }
+  return A.map((r, i) => r[i]);
 }
 
 let dbgMod: { pipe: GPUComputePipeline; group: GPUBindGroup; buf: GPUBuffer } | null = null;

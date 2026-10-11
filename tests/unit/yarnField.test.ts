@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DENIM } from '../../src/simulation/material';
-import { compileScene, SEG_BROKEN, SEG_EXISTS, type LayerSpec } from '../../src/simulation/scene';
+import { compileScene, SEG_BROKEN, SEG_EXISTS, SEG_SLIPPED, type LayerSpec } from '../../src/simulation/scene';
 import { axialEnergyDensity, axialTension } from '../../src/simulation/axial';
 import { coupleSpans, DAMAGE_CUT, DAMAGE_PULLED, interpolatedStrain, ownSpan, pullOut, recoilLength, SHARE, shareCap, shareFactor, shareReach, spanCrossing, spanLength, updateField } from '../../src/simulation/yarnField';
 
@@ -67,16 +67,65 @@ describe('yarn damage field', () => {
     // cut 3 of the 9 warps (at different crossings), half-damage a fourth
     for (let q = 0; q < 3; q++) damage[2 * spanCrossing(fl, i, j, f, q, q + 1) + f] = DAMAGE_CUT;
     damage[2 * spanCrossing(fl, i, j, f, 3, 0) + f] = 127;
-    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN)).toBe(0);
+    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN, SEG_SLIPPED)).toBe(0);
     expect(s.intact[sIdx]).toBeCloseTo((5 + (1 - 127 / 255)) / 9, 9);
     expect(s.cutMask[sIdx]).toBe(0b111);
     const total = s.tails.reduce((a, b) => a + b, 0);
     for (let q = 0; q < 9; q++) damage[2 * spanCrossing(fl, i, j, f, q, 2) + f] = DAMAGE_CUT;
-    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN)).toBe(1);
+    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN, SEG_SLIPPED)).toBe(1);
     expect(s.segFlags[sIdx] & SEG_BROKEN).toBe(SEG_BROKEN);
     expect(s.intact[sIdx]).toBe(0);
     // the span's rest length moved into its two tails
     expect(s.tails.reduce((a, b) => a + b, 0) - total).toBeCloseTo(s.restLength[sIdx], 12);
+  });
+
+  it("a ruptured span's yarns slide out of the other side's weave, nowhere else", () => {
+    const s = compileScene([coupon()]);
+    const damage = Uint8Array.from(s.fieldDamage);
+    const active = (q: number) => (s.segFlags[q] & (SEG_EXISTS | SEG_BROKEN)) === SEG_EXISTS;
+    const i = 4;
+    const j = 3;
+    const f = 0;
+    const P = spanLength(fl, f);
+    // first separation of each pick: 0 (b's past it), P - 1 (a's before it), 4 (the half boundary),
+    // 1 and 6 (a bit between two separations), the rest at 2
+    const cuts: number[][] = [[0], [P - 1], [4], [1, 6]];
+    for (let q = 0; q < fl.bv; q++) for (const p of cuts[q] ?? [2]) damage[2 * spanCrossing(fl, i, j, f, q, p) + f] = DAMAGE_CUT;
+    const before = Uint8Array.from(damage);
+    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN, SEG_SLIPPED)).toBe(1);
+    // the first ceil(P / 2) crossings lie on warps of a's column
+    expect(P - Math.floor(P / 2)).toBe(5);
+    const pulled = (q: number) => Array.from({ length: P }, (_, p) => (damage[2 * spanCrossing(fl, i, j, f, q, p) + f] === DAMAGE_PULLED ? 1 : 0)).join('');
+    expect(pulled(0)).toBe('011110000');
+    expect(pulled(1)).toBe('000001110');
+    expect(pulled(2)).toBe('000000000');
+    expect(pulled(3)).toBe('001110000');
+    expect(pulled(4)).toBe('000110000');
+    // only the ruptured span's own family changed
+    for (let e = 0; e < damage.length; e++) if (damage[e] !== before[e]) expect(e % 2).toBe(f);
+  });
+
+  it('yarns that slipped out of a node part from its weave only, once', () => {
+    const s = compileScene([coupon()]);
+    const damage = Uint8Array.from(s.fieldDamage);
+    const active = (q: number) => (s.segFlags[q] & (SEG_EXISTS | SEG_BROKEN)) === SEG_EXISTS;
+    const f = 1;
+    const P = spanLength(fl, f);
+    const pulled = (i: number, q: number) => Array.from({ length: P }, (_, p) => (damage[2 * spanCrossing(fl, i, 3, f, q, p) + f] === DAMAGE_PULLED ? 1 : 0)).join('');
+    // slid out at the owner's end (failSite 0) and at the other end (1); a cut in the latter stays
+    for (const [i, site] of [[4, 0], [6, 1]]) {
+      const sIdx = 2 * (3 * L.nx + i) + f;
+      s.segFlags[sIdx] |= SEG_BROKEN | SEG_SLIPPED;
+      s.failSite[sIdx] = site;
+    }
+    damage[2 * spanCrossing(fl, 6, 3, f, 0, 1) + f] = DAMAGE_CUT;
+    expect(coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN, SEG_SLIPPED)).toBe(0);
+    expect(P).toBe(6);
+    for (let q = 0; q < fl.bu; q++) {
+      expect(pulled(4, q)).toBe('111000');
+      expect(pulled(6, q)).toBe('000111');
+    }
+    expect(s.segFlags[2 * (3 * L.nx + 4) + f] & SEG_SLIPPED).toBe(0);
   });
 
   it('a yarn overstretched in one step separates at its weakest crossing only', () => {
@@ -166,7 +215,7 @@ describe('yarn damage field', () => {
     const kEdge = 4 * fl.bu - 1;
     const mCut = 3 * fl.bv + Math.floor(fl.bv / 2) + 1;
     damage[2 * (fl.offset + mCut * fl.K + kEdge) + 1] = DAMAGE_CUT;
-    coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN);
+    coupleSpans(s.layers, s.field, s.fieldArea, damage, s, active, SEG_BROKEN, SEG_SLIPPED);
     const strain = new Float64Array(2 * s.nodeCount).fill(0.2);
     updateField(s.layers, s.field, s.fieldStrength, s.fieldArea, damage, s, strain, active, s.crossingNormal0);
     // warp kEdge + 1 (next bundle) separated within reach of mCut

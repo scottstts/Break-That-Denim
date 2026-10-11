@@ -400,7 +400,7 @@ export class GpuSolver {
     // load-sharing constants from the reference definition (yarnField.ts SHARE)
     const share = yarnFieldWgsl.replace('override SHARE_FRACTION: f32 = 0.6;', `const SHARE_FRACTION: f32 = ${SHARE.fraction.toFixed(6)};`).replace('override SHARE_RUN: u32 = 6u;', `const SHARE_RUN: u32 = ${SHARE.maxRun}u;`);
     this.mod.yarnField = new ComputeModule(d, 'yarnField', commonWgsl + share);
-    for (const e of ['spanStrain', 'sepSnapshot', 'fieldUpdatePick', 'fieldUpdateWarp', 'pullMark', 'pullApply', 'couple']) this.pl[e] = this.mod.yarnField.pipeline(e);
+    for (const e of ['spanStrain', 'sepSnapshot', 'fieldUpdatePick', 'fieldUpdateWarp', 'pullMark', 'pullApply', 'coupleU', 'coupleV']) this.pl[e] = this.mod.yarnField.pipeline(e);
     this.mod.gate = new ComputeModule(d, 'gate', gateWgsl);
     this.pl.gate = this.mod.gate.pipeline('gate');
     this.mod.energy = new ComputeModule(d, 'energy', patch('energy', commonWgsl + dragWgsl + energyWgsl));
@@ -413,7 +413,7 @@ export class GpuSolver {
     const group = (m: string, key: string, entries: Record<number, BindingResource>) => {
       this.bg[key] = this.mod[m].bindGroup(key, entries);
     };
-    group('assemble', 'assemble', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.pred, 5: this.segs, 6: L0.op, 7: L0.B, 8: this.ext });
+    group('assemble', 'assemble', { 0: this.simParams, 1: this.nodes, 2: this.x, 3: this.dx, 4: this.pred, 5: this.segs, 6: L0.op, 7: L0.B, 8: this.ext, 9: this.contact.meta });
     this.levels.forEach((L, k) => {
       const v = k === 0 ? 'Fine' : 'Coarse';
       group(`mg${v}`, `residual${k}`, { 0: L.info, 2: L.op, 3: L.fixed, 6: L.X, 7: L.B, 8: L.R });
@@ -619,7 +619,8 @@ export class GpuSolver {
     // pull-out of loose ends: marked from the codes before the step, then applied
     this.dispatch(pass, 'pullMark', 'pull', pullGroups);
     this.dispatch(pass, 'pullApply', 'pull', pullGroups);
-    this.dispatch(pass, 'couple', 'couple', this.nodeGroups(2 * this.N));
+    this.dispatch(pass, 'coupleU', 'couple', this.nodeGroups(this.N));
+    this.dispatch(pass, 'coupleV', 'couple', this.nodeGroups(this.N));
   }
 
   encodeFinalize(pass: GPUComputePassEncoder): void {

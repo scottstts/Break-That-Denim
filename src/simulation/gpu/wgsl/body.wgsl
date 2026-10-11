@@ -3,6 +3,10 @@
 // term along the capsule's outward normal and Coulomb friction (regularised) on its step relative to
 // the body's surface; gradient and Hessian are added to ext after the self-contact terms (which
 // overwrite it) and before the grips (which add theirs). The body is prescribed: it takes no reaction.
+// Contact is swept: a node's step and a capsule's motion over the substep are both linear, and where
+// the node's path relative to the capsule enters it, the node meets the surface where it first touched
+// (the tangent plane there, carried with the capsule to its end pose) instead of the closest point of
+// its end position, which lies on the far side once a fast limb or a large step has crossed it.
 // Claws pierce: once per substep (after commit), a node under a sharp capsule's point (beyond the end of
 // its segment, within the point's half-width of its axis) that the capsule loads past the yarns'
 // piercing force has every crossing within the point's half-width cut (the field update and span
@@ -26,7 +30,8 @@ struct BodyU {
   count: vec4<u32>,
   // penalty stiffness (N/m), friction coefficient, regularisation speed x h (m), contact distance (m)
   law: vec4<f32>,
-  // bounds of every capsule (expanded by its radius and the contact distance): lo xyz, hi xyz
+  // bounds of every capsule over the substep, start and end poses (expanded by its radius and the
+  // contact distance): lo xyz, hi xyz
   lo: vec4<f32>,
   hi: vec4<f32>,
   // piercing force of the yarns under a claw's point (N), the point's half-width (m), unused...
@@ -47,14 +52,54 @@ struct BodyU {
 @group(0) @binding(8) var<uniform> FU: array<vec4<u32>, 3>;
 @group(0) @binding(9) var<storage, read_write> fieldEvents: array<u32>;
 
+// Distance of p from the surface of capsule (a, b, radius r) (x) and the closest point's parameter (y).
+fn capsuleGap(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> vec2<f32> {
+  let e = b - a;
+  let ee = dot(e, e);
+  let s = select(0.0, clamp(dot(p - a, e) / ee, 0.0, 1.0), ee > 1e-12);
+  return vec2<f32>(length(p - a - s * e) - r, s);
+}
+
+// First time in (0, 1] at which the point x0 + t dp enters capsule C (each end moving linearly over the
+// substep to its pose at t = 1), or -1 where it does not (or starts inside: the closest point then
+// decides). Conservative advancement: the gap shrinks no faster than the largest speed of the point
+// relative to any point of the segment, which is at one of its ends.
+const ENTRY_STEPS: i32 = 16;
+
+fn entryTime(x0: vec3<f32>, dp: vec3<f32>, C: Capsule) -> f32 {
+  let a0 = C.a.xyz - C.da.xyz;
+  let b0 = C.b.xyz - C.db.xyz;
+  let vmax = max(length(dp - C.da.xyz), length(dp - C.db.xyz));
+  var g = capsuleGap(x0, a0, b0, C.a.w).x;
+  if (g <= 0.0 || g >= vmax) { return -1.0; }
+  let tol = 1e-3 * C.a.w;
+  var t = 0.0;
+  for (var k = 0; k < ENTRY_STEPS; k++) {
+    t += g / vmax;
+    if (t >= 1.0) { return -1.0; }
+    g = capsuleGap(x0 + t * dp, a0 + t * C.da.xyz, b0 + t * C.db.xyz, C.a.w).x;
+    if (g <= tol) { return t; }
+  }
+  return -1.0;
+}
+
+// w rotated by the rotation taking unit u to unit v (the shortest arc).
+fn rotateArc(w: vec3<f32>, u: vec3<f32>, v: vec3<f32>) -> vec3<f32> {
+  let c = dot(u, v);
+  if (c < -0.99) { return w; }
+  let k = cross(u, v);
+  return c * w + cross(k, w) + k * (dot(k, w) / (1.0 + c));
+}
+
 @compute @workgroup_size(128)
 fn bodyTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x || B.count.x == 0u) { return; }
   let ex = exempt[n];
-  if ((nodes[n].flags & 1u) != 0u || x[n].w >= 0.5 || ex == 1u) { return; }
-  let p = x[n].xyz + dx[n].xyz;
-  if (any(p < B.lo.xyz) || any(p > B.hi.xyz)) {
+  if ((nodes[n].flags & 1u) != 0u || x[n].w > 1.5 || ex == 1u) { return; }
+  let x0 = x[n].xyz;
+  let p = x0 + dx[n].xyz;
+  if (any(min(x0, p) > B.hi.xyz) || any(max(x0, p) < B.lo.xyz)) {
     if (ex == 2u) { exempt[n] = 0u; }
     return;
   }
@@ -70,14 +115,33 @@ fn bodyTerms(@builtin(global_invocation_id) gid: vec3<u32>) {
     let C = B.caps[c];
     if (C.b.w < 0.5) { continue; }
     let e = C.b.xyz - C.a.xyz;
-    let ee = dot(e, e);
-    let s = select(0.0, clamp(dot(p - C.a.xyz, e) / ee, 0.0, 1.0), ee > 1e-12);
-    let q = C.a.xyz + s * e;
-    let r = p - q;
-    let dist = length(r);
-    let d = dist - C.a.w;
-    if (d >= delta || dist <= 1e-7) { continue; }
-    let nn = r / dist;
+    var s: f32;
+    var d: f32;
+    var nn: vec3<f32>;
+    let te = entryTime(x0, dx[n].xyz, C);
+    if (te >= 0.0) {
+      // the path entered the capsule: the tangent plane where it first touched, moved with the capsule
+      let at = C.a.xyz - (1.0 - te) * C.da.xyz;
+      let bt = C.b.xyz - (1.0 - te) * C.db.xyz;
+      let xt = x0 + te * dx[n].xyz;
+      s = capsuleGap(xt, at, bt, C.a.w).y;
+      let rt = xt - at - s * (bt - at);
+      let lt = length(rt);
+      if (lt <= 1e-7) { continue; }
+      let et = bt - at;
+      nn = rt / lt;
+      if (dot(et, et) > 1e-12 && dot(e, e) > 1e-12) { nn = normalize(rotateArc(nn, normalize(et), normalize(e))); }
+      d = dot(p - C.a.xyz - s * e, nn) - C.a.w;
+      if (d >= delta) { continue; }
+    } else {
+      let ee = dot(e, e);
+      s = select(0.0, clamp(dot(p - C.a.xyz, e) / ee, 0.0, 1.0), ee > 1e-12);
+      let r = p - C.a.xyz - s * e;
+      let dist = length(r);
+      d = dist - C.a.w;
+      if (d >= delta || dist <= 1e-7) { continue; }
+      nn = r / dist;
+    }
     let lam = kc * (delta - d);
     // friction on the step relative to the body's surface there
     let rel = dx[n].xyz - mix(C.da.xyz, C.db.xyz, s);
@@ -131,7 +195,7 @@ fn cutAround(n: u32, radius: f32) {
 fn pierce(@builtin(global_invocation_id) gid: vec3<u32>) {
   let n = gid.x;
   if (n >= P.counts.x || B.count.x == 0u) { return; }
-  if ((nodes[n].flags & 1u) != 0u || x[n].w >= 0.5 || exempt[n] != 0u) { return; }
+  if ((nodes[n].flags & 1u) != 0u || x[n].w > 1.5 || exempt[n] != 0u) { return; }
   let p = x[n].xyz;
   if (any(p < B.lo.xyz) || any(p > B.hi.xyz)) { return; }
   let kc = B.law.x;

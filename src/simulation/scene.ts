@@ -18,6 +18,11 @@ export const SEG_EXISTS = 1;
 export const SEG_BROKEN = 2;
 /** Broken before interaction (authored defect), kept for the material ledger. */
 export const SEG_INITIAL_DEFECT = 4;
+/**
+ * Broken by crossing slip: its yarns slid out of the crossings at one end (failSite 0: the owner's, 1:
+ * the other node's); the field parts them there at the next span coupling (yarnField.ts coupleSpans).
+ */
+export const SEG_SLIPPED = 8;
 
 export interface WearSpec {
   /** World-rest-plane center of the worn zone (m). */
@@ -267,7 +272,7 @@ export function compileScene(specs: LayerSpec[]): CompiledScene {
   // span state from the initial field; spans that lost every yarn start separated
   const active = (q: number) => (scene.segFlags[q] & (SEG_EXISTS | SEG_BROKEN)) === SEG_EXISTS;
   const before = Uint16Array.from(scene.segFlags);
-  coupleSpans(layers, fl.layers, scene.fieldArea, scene.fieldDamage, scene, active, SEG_BROKEN);
+  coupleSpans(layers, fl.layers, scene.fieldArea, scene.fieldDamage, scene, active, SEG_BROKEN, SEG_SLIPPED);
   for (let q = 0; q < scene.segFlags.length; q++) if ((scene.segFlags[q] & SEG_BROKEN) && !(before[q] & SEG_BROKEN)) scene.segFlags[q] |= SEG_INITIAL_DEFECT;
   return scene;
 }

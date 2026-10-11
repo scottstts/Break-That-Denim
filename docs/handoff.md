@@ -1,5 +1,42 @@
 # Handoff (rolling)
 
+Latest (2026-10-11, line-search stalls): `docs/decisions/2026-10-11-pinch-slip.md` (uncommitted).
+The stalls were a grip defect, not a solver one: rim entries torn away from the pinch stayed sprung to
+the hand from any distance. Pinch entries now slip out beyond a pad radius of the patch's own motion;
+claws never slip. Rejections 0 in every gesture (haul 80, hold 82, haul@0.006,-0.004 26 before); tear-outs
+tear less and settle after release. Beneath is bit-identical. setTarget's entry count fixed (it included
+the strip between the pads). Verified headless: `npm run check` 67 unit, `npm run test:gpu` 26/26 +
+19/19 + 5/5. Not seen in a browser.
+- The previous handoff's "g.d > 0" lead was a probe artifact (PCG overwrites the rhs it read); LSPROBE
+  now captures the rhs before PCG, and LSCHECK=1 adds the operator check.
+
+Before (2026-10-11, open items of the assessment round): `docs/decisions/2026-10-11-parted-crossings-and-swept-body.md`.
+A ruptured or slipped-out span's yarns are pulled out of the other side's crossings (both backends;
+couple split into coupleU / coupleV; SEG_SLIPPED defers the slip case one substep). Body contact is
+swept over the substep. maul thread ends > 5 mm off 41 -> 0 (worst 24.5 -> 2.3 mm). With the pinch
+fix, parting does not change how much tears (the increase first measured was the grip defect).
+- **For the user:** "Beneath" opens one clean hole around the mouth at 6 s (901 ruptures; previous
+  build 938, with material bridging the hole): sheet `artifacts/captures/beneath-swept-parting.png`.
+  The re-staging decision from the round below may be moot; it is theirs. Shipped drape still kept.
+
+Latest (2026-10-11, assessment round): `docs/decisions/2026-10-11-detached-coherence.md` (acting on
+artifacts/assessment; uncommitted). Detached pieces stay in the cloth solve (no more ballistic
+nodes); active contact bounds in the Newton operator; cubic contact penalty with a per-iteration
+depth trust region (free light bodies chattered forever); objective bending viscosity (both backends).
+Verified headless: `npm run check` 65 unit, `npm run test:gpu` 26/26 + 13/13 + 5/5 (new
+tests/gpu/detached.ts). maul: worst detached span 1.075x rest (was 84.6x), 0 stretched detached runs
+(were 147). Not seen in a browser.
+- **Decision for the user: "Beneath" tears less.** The lunge's extra tearing was mostly the bound clip
+  stretching spans (old build: maul 581 ruptures at 2x2, 618 converged; new 285 / 229). The staged hole
+  is now smaller and the upper face stays behind cloth at 6-9 s (938 vs 1866 ruptures by 13.7 s; sheet:
+  run `tools/stage/beneath.ts` with FRAMES=6,9,12 in both builds). Re-staging (claw cuts, clip) is
+  theirs to approve; physics was not bent back.
+- Open: attached thread ends drawn 13-26 mm off their chain where a parted span's yarn field stays
+  intact (decision record; `tools/studies/runends.ts <state>`). Shipped drape kept (re-settling with
+  the new viscosity gives another wrinkle state; it is still an exact rest state).
+- Tools: `tools/studies/restcontact.ts <state>` (does a dumped state come to rest),
+  `releasepiece.ts`, session `FASTEST=n` (fastest nodes with state and contact bounds).
+
 Latest (2026-10-11, round 2): "Beneath" re-staged around the head-through-the-hole stare (user: the
 shock hinges on seeing the full face; no thread explosions anywhere). Blender scene re-animated and
 saved (one .blend, the latest: no version copies kept); rim rips dropped, head snap eased (round 3);

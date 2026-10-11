@@ -1,8 +1,9 @@
 /**
  * Interaction and contact contracts on the production kernels (headless: Node + Dawn), on the settled
  * drape. Picking sees only visible material, a grab imposes no displacement, held material survives a
- * pending connectivity analysis, contact bounds are relative and swept, and a claw's point parts the
- * yarns under it.
+ * pending connectivity analysis, material torn out from under a pinch's pads slips out of it (a claw's
+ * hold does not slip), contact bounds are relative and swept, a body's contact is swept over the
+ * substep, and a claw's point parts the yarns under it.
  *   npm run test:gpu
  * Exits non-zero on failure.
  */
@@ -13,6 +14,8 @@ import { BodyContact, BODY_CONTACT, CLAW_PIERCE } from '../../src/simulation/gpu
 import { Interaction } from '../../src/simulation/gpu/interaction';
 import { Topology } from '../../src/simulation/gpu/topology';
 import { Hand } from '../../src/simulation/hand';
+import { GRIP, hookPatch } from '../../src/simulation/grip';
+import { CLAW_HOOK } from '../../src/stage/claws';
 import type { GpuSolver } from '../../src/simulation/gpu/solver';
 import type { CompiledScene } from '../../src/simulation/scene';
 import common from '../../src/simulation/gpu/wgsl/common.wgsl?raw';
@@ -157,13 +160,23 @@ async function topologyRace(device: GPUDevice, solver: GpuSolver, interaction: I
   await drain(device);
   const x2 = new Float32Array(await readBuffer(device, solver.x));
   const v2 = new Float32Array(await readBuffer(device, solver.v));
-  // the piece's nodes (the square inside the cuts): free fall moves them together; flying apart is
-  // their velocity relative to the piece's mean
+  // the piece (the square inside the cuts) stays in the solve once detached: its pinch compression
+  // relaxes and it falls as one body, spans at their rest length; it may tumble (rigid rotation from
+  // the uneven release). Flying apart (the failure: metres per second, spread over centimetres) shows
+  // as stretched spans and fast relative motion.
   const piece: number[] = [];
-  for (let j = cj - r; j <= cj + r; j++) for (let i = ci - r; i <= ci + r; i++) piece.push(j * nx + i);
+  const spans: Array<[number, number]> = [];
+  for (let j = cj - r; j <= cj + r; j++) {
+    for (let i = ci - r; i <= ci + r; i++) {
+      piece.push(j * nx + i);
+      if (i < ci + r) spans.push([j * nx + i, 0]);
+      if (j < cj + r) spans.push([j * nx + i, 1]);
+    }
+  }
+  const strain = Math.max(...spans.map(([a, f]) => Math.abs(dist(vec(x2, a), vec(x2, a + (f === 0 ? 1 : nx))) / scene.restLength[2 * a + f] - 1)));
   const mean = [0, 1, 2].map((q) => piece.reduce((a, k) => a + v2[4 * k + q], 0) / piece.length);
   const apart = Math.max(...piece.map((k) => Math.hypot(v2[4 * k] - mean[0], v2[4 * k + 1] - mean[1], v2[4 * k + 2] - mean[2])));
-  check('release: a crushed piece only the fingers held is freed, and falls instead of flying apart', x2[4 * n + 3] > 0.5 && apart < 0.05, `state ${x2[4 * n + 3]}, fall ${Math.hypot(...mean).toFixed(3)} m/s, largest relative speed ${apart.toFixed(3)} m/s after 0.13 s`);
+  check('release: a crushed piece only the fingers held is freed, and falls as one body', x2[4 * n + 3] > 0.5 && strain < 0.02 && apart < 0.2, `state ${x2[4 * n + 3]}, fall ${Math.hypot(...mean).toFixed(3)} m/s, largest span strain ${(100 * strain).toFixed(2)} %, largest relative speed ${apart.toFixed(3)} m/s after 0.13 s`);
   device.queue.writeBuffer(solver.segs, 0, segs0);
   topology.reset();
   solver.setState(initial);
@@ -289,6 +302,110 @@ async function piercing(device: GPUDevice, solver: GpuSolver, scene: CompiledSce
   device.queue.writeBuffer(solver.field, 0, before);
 }
 
+/**
+ * A pinch entry displaced farther than a pad's radius from where the rest of the patch holds it (cloth
+ * torn away from under the pad) slips out; one displaced within the pad, and the rest, stay held. A
+ * claw's hold keeps the same entry.
+ */
+async function pinchSlip(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, interaction: Interaction, initial: Float32Array, nx: number): Promise<void> {
+  const grip = (interaction as unknown as { grip: GPUBuffer }).grip;
+  const n0 = 60 * nx + 60;
+  const p0 = vec(initial, n0);
+  // entries (node, weight) of slot 0 after one substep with node `far` moved 20 mm and `near` 3 mm
+  const run = async (attach: () => void): Promise<{ before: Map<number, number>; after: Map<number, number>; far: number; near: number }> => {
+    solver.setState(initial);
+    attach();
+    interaction.setTarget(p0);
+    // held entries (weight > 0) among the patch's `count` entries
+    const read = async (count: number) => {
+      const g = new Float32Array(await readBuffer(device, grip));
+      const u = new Uint32Array(g.buffer);
+      const m = new Map<number, number>();
+      for (let q = 0; q < count; q++) if (g[8 * q + 1] > 0) m.set(u[8 * q], g[8 * q + 1]);
+      return m;
+    };
+    const count = (interaction as unknown as { held: Array<{ count: number } | null> }).held[0]?.count ?? 0;
+    const before = await read(count);
+    const rim = [...before].filter(([, w]) => w < 0.5).map(([n]) => n);
+    const far = rim[0];
+    const near = rim[rim.length - 1];
+    const xs = initial.slice();
+    xs[4 * far + 2] += 0.02;
+    xs[4 * near + 2] += 0.003;
+    solver.setState(xs);
+    const enc = device.createCommandEncoder();
+    solver.encodeSubstep(enc);
+    device.queue.submit([enc.finish()]);
+    await drain(device);
+    const after = await read(count);
+    interaction.release(0);
+    return { before, after, far, near };
+  };
+  const pinch = await run(() => interaction.attach(n0, p0, 0));
+  const kept = [...pinch.before].filter(([n, w]) => n !== pinch.far && pinch.after.get(n) === w).length;
+  check('grip: cloth torn from under a pad slips out of the pinch, the rest stays held', !pinch.after.has(pinch.far) && kept === pinch.before.size - 1, `entry 20 mm off ${pinch.after.has(pinch.far) ? 'still held' : 'slipped'}, ${kept} of ${pinch.before.size - 1} others unchanged (pad radius ${GRIP.radius * 1e3} mm)`);
+  const hook = hookPatch(scene, [n0], CLAW_HOOK, interaction.isFree);
+  const claw = hook ? await run(() => interaction.attachPatch(0, n0, hook, p0, CLAW_HOOK.maxLead)) : null;
+  check('grip: a claw keeps what it hooks however it is displaced', !!claw && claw.after.size === claw.before.size, `${claw?.after.size} of ${claw?.before.size} entries held`);
+  solver.setState(initial);
+}
+
+/**
+ * Body contact over the substep: a step through a capsule, or a capsule sweeping through a node, meets
+ * the surface on the side the node came from; a node carried along on a capsule, or one it passes by,
+ * sees only its end-pose contact.
+ */
+async function sweptBody(device: GPUDevice, solver: GpuSolver, scene: CompiledScene, initial: Float32Array, nx: number): Promise<void> {
+  const body = new BodyContact(device, solver, scene);
+  const n = 40 * nx + 40;
+  const r = 0.004;
+  const k = BODY_CONTACT.stiffness;
+  const delta = BODY_CONTACT.distance;
+  // a limb along x at height z, y off the node's line
+  const along = (z: number, y = 0) => ({ a: [-0.01, y, z], b: [0.01, y, z], radius: r, active: true });
+  // gradient of the body terms at node n placed at p0 with step dp, the capsules moving from c0 to c1
+  const run = async (p0: Vec3, dp: Vec3, c0: ReturnType<typeof along>[], c1: ReturnType<typeof along>[]): Promise<Vec3> => {
+    solver.setState(sparse(initial, new Map([[n, p0]])));
+    const dx = new Float32Array(4 * solver.N);
+    dx.set(dp, 4 * n);
+    device.queue.writeBuffer(solver.dx, 0, dx);
+    body.clear();
+    body.setPose(c0, solver.params.h);
+    body.setPose(c1, solver.params.h);
+    const enc = device.createCommandEncoder();
+    enc.clearBuffer(solver.ext);
+    const pass = enc.beginComputePass();
+    body.encode((pipe, group, groups) => {
+      pass.setPipeline(pipe);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(groups);
+    });
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    const ext = new Float32Array(await readBuffer(device, solver.ext));
+    return [ext[12 * n], ext[12 * n + 1], ext[12 * n + 2]];
+  };
+  const sphere = [{ a: [0, 0, 0], b: [0, 0, 0], radius: r, active: true }];
+  const fmt = (g: Vec3) => g.map((v) => v.toFixed(2)).join(', ');
+  // a 20 mm step from 10 mm above a 4 mm sphere to 10 mm below it: pushed back up, 14 mm deep
+  const through = await run([0, 0, 0.01], [0, 0, -0.02], sphere, sphere);
+  const want = -k * (delta + 0.014);
+  check('body: a step through a capsule meets it on the side it came from', Math.abs(through[2] - want) < 0.01 * -want && Math.hypot(through[0], through[1]) < 1e-3, `gradient (${fmt(through)}) N, expected z ${want.toFixed(2)}`);
+  // a limb sweeping 30 mm up through a resting node: the node is on its upper face, 19 mm deep
+  const swept = await run([0, 0, 0], [0, 0, 0], [along(-0.015)], [along(0.015)]);
+  const wantS = -k * (delta + 0.019);
+  check('body: a capsule sweeping through a node carries it on its leading face', Math.abs(swept[2] - wantS) < 0.01 * -wantS, `gradient (${fmt(swept)}) N, expected z ${wantS.toFixed(2)}`);
+  // a node riding 1 mm above a limb that moves 20 mm with it: the end-pose penalty only, no friction
+  const riding = await run([0, 0, -0.01 + r + 0.001], [0, 0, 0.02], [along(-0.01)], [along(0.01)]);
+  const wantR = -k * (delta - 0.001);
+  check('body: a node carried on a moving capsule keeps its end-pose contact', Math.abs(riding[2] - wantR) < 0.02 * -wantR && Math.hypot(riding[0], riding[1]) < 1e-3, `gradient (${fmt(riding)}) N, expected z ${wantR.toFixed(2)}`);
+  // a limb passing 10 mm beside a node (6 mm clear of its surface): nothing
+  const beside = await run([0, 0, 0], [0, 0, 0], [along(-0.015, 0.01)], [along(0.015, 0.01)]);
+  check('body: a capsule passing beside a node does not touch it', Math.hypot(...beside) === 0, `gradient (${fmt(beside)}) N`);
+  body.clear();
+  solver.setState(initial);
+}
+
 export default async function main(): Promise<void> {
   const device = await gpuDevice();
   const { solver, scene } = await settledSolver(device);
@@ -302,6 +419,8 @@ export default async function main(): Promise<void> {
   await topologyRace(device, solver, interaction, initial, nx);
   await contact(device, solver, initial, nx);
   await piercing(device, solver, scene, initial, nx);
+  await sweptBody(device, solver, scene, initial, nx);
+  await pinchSlip(device, solver, scene, interaction, initial, nx);
   device.destroy();
   const failed = results.filter((r) => !r.ok).length;
   console.log(`=== ${results.length - failed}/${results.length} passed`);

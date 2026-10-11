@@ -24,6 +24,8 @@ struct GripSlot {
   // origin + goal - anchor, so a stationary pointer imposes no displacement whatever the pick latency;
   // lattice pitch along the pads' closing axis (w; grip.ts GripPatch.padPitch)
   anchor: vec4<f32>,
+  // slip distance of an entry (x, m; 0: the hold does not slip; grip.ts GripPatch.slip), unused...
+  hold: vec4<f32>,
 };
 
 struct GripU {
@@ -86,7 +88,11 @@ fn gathered(e: GripEntry, S: GripSlot, axis: vec3<f32>) -> vec3<f32> {
 
 // Once per substep, from committed positions: each grip's effective handle is the requested one,
 // moved to within the largest lead of its weighted patch centroid (bounded total force). One
-// workgroup per grip.
+// workgroup per grip. A pinch entry whose own handle position (where it sits less its target offset)
+// lies farther than a pad's radius from the patch's weighted mean is no longer under a pad: the cloth
+// tore it away from the material the fingers hold, and it slips out for good (weight 0). Left in, its
+// spring pulled torn-off cloth toward the hand from any distance (a 1 % rim entry 18 cm away: 6.6 N on
+// a node held by one slack span, whose Newton step overshot until the line search stalled the sheet).
 @compute @workgroup_size(256)
 fn gripLead(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
   let g = wg.x;
@@ -126,14 +132,22 @@ fn gripLead(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: 
     workgroupBarrier();
     s = s / 2u;
   }
+  let held = leadSum[0];
+  if (held.w > 0.0 && S.hold.x > 0.0) {
+    let c = held.xyz / held.w;
+    for (var k = t; k < count; k += 256u) {
+      let e = grip[g * SLOT_ENTRIES + k];
+      if (e.w > 0.0 && live(e.node) && length(x[e.node].xyz - gathered(e, S, axis) - c) > S.hold.x) { grip[g * SLOT_ENTRIES + k].w = 0.0; }
+    }
+  }
   if (t == 0u) {
     gripGoal[3u * g + 2u] = vec4<f32>(axis, 0.0);
-    if (leadSum[0].w <= 0.0) {
+    if (held.w <= 0.0) {
       // nothing held is still cloth: the handle exerts nothing
       gripGoal[3u * g] = vec4<f32>(gripGoal[3u * g + 1u].xyz, 0.0);
       return;
     }
-    let c = leadSum[0].xyz / leadSum[0].w;
+    let c = held.xyz / held.w;
     let requested = gripGoal[3u * g + 1u].xyz + S.goal.xyz - S.anchor.xyz;
     var lead = requested - c;
     let l = length(lead);
