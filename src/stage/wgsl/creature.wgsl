@@ -117,6 +117,12 @@ fn fsMain(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
   let Lp = dp * inverseSqrt(r2);
   c += (skinDiffuse(N, Lp, albedo) + vec3<f32>(ggxSpec(N, V, Lp, a, f0))) * CU.pitColor.rgb / r2;
 
+  // the camera's light
+  if (F.torchPos.w > 0.0) {
+    let tl = torchLight(in.world);
+    c += (skinDiffuse(N, tl.xyz, albedo) + vec3<f32>(ggxSpec(N, V, tl.xyz, a, f0))) * tl.w * F.torchColor.rgb;
+  }
+
   c += F.ambient.rgb * albedo * ao * (0.55 + 0.45 * N.z);
   return vec4<f32>(c, 1.0);
 }

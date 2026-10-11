@@ -1,7 +1,8 @@
 /**
  * Offline sound of a staged run (tools/stage/beneath.ts AUDIO=file.json): the tear voice from the
  * acoustic records with the claws' holds as the product applies them (a source sounds only while held),
- * the laugh (whole, at its own level) and the signal-noise bursts at their cues, mixed at the product's levels into a
+ * the laugh (whole, at its own level), the ambience (from its cue, faded out over the breakup) and the
+ * signal-noise bursts at their cues, mixed at the product's levels into a
  * 16-bit stereo WAV.
  *   node tools/gpu/run.mjs tools/stage/audio.ts <run.json> <out.wav>
  */
@@ -70,9 +71,19 @@ export default async function main(args: string[]): Promise<void> {
       R[start + i] += env * sample(i, 1);
     }
   };
+  const ambient = decode('public/exprerience_sounds/ambiant.mp3', fs, 2);
+  const fade = cues.find((c) => c.kind === 'ambientFade');
   for (const c of cues) {
     const start = Math.round((c.t + FRAME) * fs);
-    if (c.kind === 'laugh') {
+    if (c.kind === 'ambient') {
+      const f0 = fade ? Math.round((fade.t + FRAME) * fs) - start : Infinity;
+      const fn = fade?.kind === 'ambientFade' ? Math.round(fade.duration * fs) : 1;
+      for (let i = 0; i < ambient.length / 2 && start + i < N && i < f0 + fn; i++) {
+        const g = i < f0 ? 1 : 1 - (i - f0) / fn;
+        L[start + i] += g * ambient[2 * i];
+        R[start + i] += g * ambient[2 * i + 1];
+      }
+    } else if (c.kind === 'laugh') {
       for (let i = 0; i < laugh.length / 2 && start + i < N; i++) {
         L[start + i] += laugh[2 * i];
         R[start + i] += laugh[2 * i + 1];

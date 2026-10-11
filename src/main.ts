@@ -123,6 +123,7 @@ function openMenu(open: boolean) {
   audio.prefetchStaged();
   for (const item of items) post({ type: 'prefetch', name: item.dataset.experience as ExperienceName });
 }
+audio.onLaugh = (envelope, start) => post({ type: 'laugh', envelope, start });
 menu.addEventListener('click', () => {
   audio.unlock();
   openMenu(!menuOpen());

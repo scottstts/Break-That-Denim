@@ -109,6 +109,15 @@ describe('Beneath clip', () => {
     expect(laughs.map((e) => e.t)).toEqual([LAUGH_AT]);
   });
 
+  it('starts the ambience with the scene and fades it out over the final breakup', () => {
+    expect(events[0]).toEqual({ t: 0, kind: 'ambient' });
+    const glitches = events.filter((e) => e.kind === 'glitch');
+    const last = glitches[glitches.length - 1];
+    const fade = events.filter((e) => e.kind === 'ambientFade');
+    expect(fade).toEqual([{ t: last.t, kind: 'ambientFade', duration: last.kind === 'glitch' ? last.duration : NaN }]);
+    expect(last.t + (last.kind === 'glitch' ? last.duration : 0)).toBeCloseTo(clip.duration, 1);
+  });
+
   it('opens on a clean picture and ends on a frozen, broken one that is still the picture', () => {
     const s0 = clip.sample(0);
     expect(s0.glitch).toBe(0);

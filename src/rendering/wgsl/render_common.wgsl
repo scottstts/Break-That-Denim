@@ -32,6 +32,11 @@ struct FrameU {
   // key cone: cos where it reaches full strength, share of light outside the cone, unused; key colour
   keyShape: vec4<f32>,
   keyColor: vec4<f32>,
+  // a light on the camera (staged; w = 0 off): position and radiant intensity (W/sr), aim and cos where
+  // its cone's soft edge starts, colour and cos where it is full
+  torchPos: vec4<f32>,
+  torchAxis: vec4<f32>,
+  torchColor: vec4<f32>,
 };
 
 struct LayerR {

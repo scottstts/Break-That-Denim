@@ -7,6 +7,9 @@
  * CAM='{"eye":[..],"target":[..],"up":[..]}' renders from a debug camera instead of the stage's; LIT=1 lights
  * it flat (the product's key, a bright fill, no film) to see the mechanics;
  * AUDIO=file.json records the acoustic records, holds and sound cues (tools/stage/audio.ts renders them).
+ * TRACE=1 prints the rupture count every 0.1 s.
+ * The laugh moves the jaw as heard in the browser, where the run takes PACE (default 22/13.8) times its
+ * simulated time.
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { AcousticLog } from '../../src/engine/acousticLog';
@@ -25,7 +28,9 @@ import { Rig } from '../../src/stage/rig';
 import { Stage } from '../../src/stage/stage';
 import { CAPTURES, drain, gpuDevice, saveTexture } from '../gpu/env';
 import { settledSolver } from '../gpu/scripts/render';
-import { loadClip, loadCreature } from './env';
+import { loudness, loudnessAt } from '../../src/audio/envelope';
+import { LAUGH_AT } from '../../src/stage/beneath';
+import { decodeAudio, loadClip, loadCreature } from './env';
 
 export default async function main(args: string[]): Promise<void> {
   const name = args[0] ?? 'beneath';
@@ -56,6 +61,9 @@ export default async function main(args: string[]): Promise<void> {
   const audioRecords: number[][] = [];
   const holds: [number, number, boolean][] = [];
   const cues: StageEvent[] = [];
+  const laugh = loudness(decodeAudio('public/exprerience_sounds/creepy_laugh.mp3', 48000), 48000);
+  const pace = Number(process.env.PACE ?? 22 / 13.8);
+  let simTime = 0;
   const stage = new Stage({
     device,
     scene,
@@ -82,6 +90,7 @@ export default async function main(args: string[]): Promise<void> {
       holds.push([audioRecords.length, slot, held]);
       if (process.env.STATS) console.log(`  slot ${slot} ${held ? 'held' : 'released'}`);
     },
+    laugh: () => loudnessAt(laugh, (simTime - LAUGH_AT) * pace),
   });
   const until = Number(process.env.UNTIL ?? stage.duration);
   const video = !!process.env.VIDEO;
@@ -99,6 +108,7 @@ export default async function main(args: string[]): Promise<void> {
   for (let k = 0; stage.time < until; k++) {
     const t0 = performance.now();
     if (k % perFrame === 0) acoustic?.begin();
+    simTime = stage.time + H;
     stage.substep(H);
     const enc = device.createCommandEncoder();
     solver.encodeSubstep(enc, refine-- > 0 ? RELEASE_REFINEMENT.newtonIterations : 0);
@@ -123,6 +133,8 @@ export default async function main(args: string[]): Promise<void> {
     await counters.mapAsync(GPUMapMode.READ);
     const c = new Uint32Array(counters.getMappedRange().slice(0));
     counters.unmap();
+    // TRACE=1: ruptures every 0.1 s (where the cloth fails, and how fast)
+    if (process.env.TRACE && frame % 3 === 0) console.log(`trace t=${stage.time.toFixed(2)} ruptures=${c[0]} freed=${topology.freedCount}`);
     if (c[0] + c[1] !== events) {
       events = c[0] + c[1];
       await topology.request();

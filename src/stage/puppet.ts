@@ -1,6 +1,6 @@
 import type { BodyCapsule } from '../simulation/gpu/body';
 import type { Clip, ClipSample } from './clip';
-import { fitCapsules, v3, type BoneCapsule, type Rig, type V } from './rig';
+import { fitCapsules, quat, v3, type BoneCapsule, type Q, type Rig, type V } from './rig';
 
 export type Side = 'L' | 'R';
 
@@ -30,6 +30,8 @@ export class Puppet {
   /** Rig joint of each clip joint, for the clip this puppet was bound to. */
   private clipJoints: Int32Array | null = null;
   private boundClip: Clip | null = null;
+  /** The bound clip's jaw joint (rig index). */
+  private jawJoint = -1;
 
   constructor(rig: Rig) {
     this.rig = rig;
@@ -71,15 +73,26 @@ export class Puppet {
     clip.bindT.forEach((t, k) => rig.localT.set(t, 3 * this.clipJoints![k]));
     rig.restT.set(rig.localT);
     rig.setSkeletonPlacement(clip.skeleton);
+    this.jawJoint = rig.joint(clip.jaw.joint);
     this.boundClip = clip;
   }
 
-  /** The creature as the clip has it at one sample. */
-  play(s: ClipSample): void {
+  /**
+   * The creature as the clip has it at one sample; `laugh` (0..1), the laugh's loudness heard now,
+   * opens the jaw further by as much as the clip lets it.
+   */
+  play(s: ClipSample, laugh = 0): void {
     const map = this.clipJoints!;
     const rig = this.rig;
     for (let k = 0; k < map.length; k++) rig.localR.set(s.rotations.subarray(4 * k, 4 * k + 4), 4 * map[k]);
     rig.localT.set(s.rootT, 3 * map[this.boundClip!.root]);
+    const extra = Math.min(1, s.jawOpen + s.jawLaugh * laugh) - s.jawOpen;
+    if (extra > 0) {
+      const jaw = this.boundClip!.jaw;
+      const o = 4 * this.jawJoint;
+      const q = Array.from(rig.localR.subarray(o, o + 4)) as Q;
+      rig.localR.set(quat.mul(q, quat.axisAngle(jaw.axis, extra * jaw.rad)), o);
+    }
     rig.update();
   }
 

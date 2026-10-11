@@ -202,6 +202,15 @@ export class Renderer {
   keyInner = 1.0;
   keyLeak = 0.05;
   keyColor: Vec3 = [1, 1, 1];
+  /**
+   * A light on the camera (a staged experience; off at zero intensity): position, aim, radiant intensity
+   * (W/sr), cosines of its cone's soft edge start and full strength, colour. Unshadowed: it sits at the lens.
+   */
+  torchPos: Vec3 = [0, 0, 1];
+  torchAim: Vec3 = [0, 0, -1];
+  torchIntensity = 0;
+  torchCone: [number, number] = [0.8, 0.95];
+  torchColor: Vec3 = [1, 1, 1];
   /** Radiance behind the cloth (the void seen through openings). */
   background: Vec3 = [0.002, 0.002, 0.003];
   /**
@@ -1046,6 +1055,9 @@ export class Renderer {
     fu.set([this.overAngle, OVER_FAR - OVER_NEAR, 2 * OVER_HALF, OVER_SIZE / COV_BLOCK], 88);
     fu.set([this.keyInner, this.keyLeak, 0, 0], 92);
     fu.set([...this.keyColor, 0], 96);
+    fu.set([...this.torchPos, this.torchIntensity], 100);
+    fu.set([...this.torchAim, this.torchCone[0]], 104);
+    fu.set([...this.torchColor, this.torchCone[1]], 108);
     this.device.queue.writeBuffer(this.frameU, 0, fu);
     // the overhead light's shadow pass: its projection in place of the key's, and the loose threads'
     // ribbons turned toward it (they face keyPos when drawn from the light)

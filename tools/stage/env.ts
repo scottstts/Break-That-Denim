@@ -15,6 +15,13 @@ function decode(img: GltfImage): FloorImage {
   return { width, height, data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength) };
 }
 
+/** A sound file's channels at `rate` (ffmpeg). */
+export function decodeAudio(path: string, rate: number, channels = 2): Float32Array[] {
+  const raw = execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', resolve(ROOT, path), '-ar', String(rate), '-ac', String(channels), '-f', 'f32le', '-acodec', 'pcm_f32le', '-'], { maxBuffer: 1 << 28 });
+  const all = new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength));
+  return Array.from({ length: channels }, (_, c) => all.filter((_, i) => i % channels === c));
+}
+
 function read(path: string): ArrayBuffer {
   const buf = readFileSync(resolve(ROOT, path));
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);

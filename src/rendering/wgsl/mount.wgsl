@@ -47,6 +47,8 @@ fn fsMount(in: VOut) -> @location(0) vec4<f32> {
   let a = MOUNT_ALBEDO * (1.0 / PI);
   var c = a * max(key.z, 0.0) * key.w * F.keyColor.rgb * shadowFactor(in.world, N);
   c += a * max(F.overDir.z, 0.0) * F.overColor.rgb * shadowOver(in.world, N);
+  let cam = torchLight(in.world);
+  c += a * max(cam.z, 0.0) * cam.w * F.torchColor.rgb;
   c += F.ambient.rgb * MOUNT_ALBEDO;
   return vec4<f32>(c, 1.0);
 }

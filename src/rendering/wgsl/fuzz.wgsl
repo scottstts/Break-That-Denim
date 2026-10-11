@@ -144,13 +144,19 @@ fn fibreDirect(Ld: vec3<f32>, E: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3
   return o;
 }
 
-// The key (through tau), the overhead light (through tauO) and the fill.
-fn fibreLight(key: vec4<f32>, over: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32, tauO: f32) -> FibreLit {
+// The key (through tau), the overhead light (through tauO), the camera's light (through tauC, from the
+// camera's side) and the fill.
+fn fibreLight(key: vec4<f32>, over: vec4<f32>, cam: vec4<f32>, T: vec3<f32>, V: vec3<f32>, Nc: vec3<f32>, a: vec3<f32>, tau: f32, tauO: f32, tauC: f32) -> FibreLit {
   let k = fibreDirect(key.xyz, key.w * F.keyColor.rgb, T, V, Nc, a, tau);
   let o2 = fibreDirect(over.xyz, F.overColor.rgb * over.w, T, V, Nc, a, tauO);
   var o: FibreLit;
   o.single = k.single + o2.single;
   o.multi = k.multi + o2.multi + F.ambient.rgb * a * exp(-diffusion(a) * tau);
+  if (cam.w > 0.0) {
+    let c = fibreDirect(cam.xyz, cam.w * F.torchColor.rgb, T, V, Nc, a, tauC);
+    o.single += c.single;
+    o.multi += c.multi;
+  }
   return o;
 }
 
@@ -210,12 +216,15 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
   o.keyAcross = dot(normalize(F.keyPos.xyz - P), B) * sideSign;
   let key = fibreKey(P, dP, V);
   let over = fibreOver(P, dP, V);
+  // the camera's light reaches the fringe from the camera's side (h: height toward the camera)
+  let cam = torchLight(P);
+  let tauC = h * tau0;
   if (m.n > 0.0) {
-    let u = fibreLight(key, over, dP, V, N, undyed, tau, tauO);
+    let u = fibreLight(key, over, cam, dP, V, N, undyed, tau, tauO, tauC);
     o.litU = u.single;
     o.msU = u.multi;
     if (m.dyed > 0.0) {
-      let d = fibreLight(key, over, dP, V, N, DYED_FIBRE, tau, tauO);
+      let d = fibreLight(key, over, cam, dP, V, N, DYED_FIBRE, tau, tauO, tauC);
       o.litD = d.single;
       o.msD = d.multi;
     } else {
@@ -225,7 +234,7 @@ fn strand(root: vec3<f32>, dir: vec3<f32>, len: f32, bend: vec3<f32>, wave: vec3
   } else {
     // the compact yarn end: a warp shows its dyed surface, paling as it untwists toward the fans
     let a = select(WEFT_FIBRE, mix(vec3<f32>(0.054, 0.078, 0.16), mix(DYED_FIBRE, CORE_FIBRE, 0.5), t * t), m.undyed == 0u);
-    let e = fibreLight(key, over, dP, V, N, a, tau, tauO);
+    let e = fibreLight(key, over, cam, dP, V, N, a, tau, tauO, tauC);
     o.litU = e.single + e.multi;
   }
   return o;

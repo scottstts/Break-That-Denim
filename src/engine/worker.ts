@@ -16,6 +16,7 @@ import { CreatureRenderer } from '../stage/creatureRenderer';
 import { Puppet } from '../stage/puppet';
 import { Rig } from '../stage/rig';
 import { Stage } from '../stage/stage';
+import { loudnessAt } from '../audio/envelope';
 import { ACOUSTIC_SLOT, ACOUSTIC_SLOTS, RECORD_FLOATS, SOURCES, decodeRecord, fracturePosition } from '../audio/record';
 import { AcousticLog } from './acousticLog';
 
@@ -94,6 +95,8 @@ class Engine {
   private creatureLoad: Promise<StagedAssets> | null = null;
   /** Bumped whenever an experience is asked for or ended: a slower load does not start a stale one. */
   private experienceToken = 0;
+  /** The staged laugh as heard: its loudness envelope and when it started (ms since the epoch). */
+  private laugh: { envelope: Float32Array; start: number } | null = null;
   /** When an experience ran to its end (ms, frame clock): the picture comes back through a reacquiring signal. */
   private reacquire = -Infinity;
   /** Ruptures + pull-outs at the last connectivity analysis. */
@@ -270,6 +273,10 @@ class Engine {
     return this.creatureLoad;
   }
 
+  heardLaugh(envelope: Float32Array, start: number): void {
+    this.laugh = { envelope, start };
+  }
+
   prefetch(name: ExperienceName): void {
     if (this.ready && name === 'beneath') void this.loadCreature().catch(() => {});
   }
@@ -296,6 +303,7 @@ class Engine {
     this.releaseAll();
     this.restoreCloth();
     send({ type: 'cue', cue: { kind: 'stop' } });
+    this.laugh = null;
     this.stage = new Stage({
       device: this.device,
       scene: this.scene,
@@ -318,9 +326,12 @@ class Engine {
       },
       cue: (e) => {
         if (e.kind === 'laugh') send({ type: 'cue', cue: { kind: 'laugh' } });
+        else if (e.kind === 'ambient') send({ type: 'cue', cue: { kind: 'ambient' } });
+        else if (e.kind === 'ambientFade') send({ type: 'cue', cue: { kind: 'ambientFade', duration: e.duration } });
         else if (e.kind === 'glitch') send({ type: 'cue', cue: { kind: 'glitch', duration: e.duration, level: e.level } });
       },
       held: (slot, held) => this.audioPort?.postMessage({ grip: slot, held }),
+      laugh: () => (this.laugh ? loudnessAt(this.laugh.envelope, (performance.timeOrigin + performance.now() - this.laugh.start) / 1000) : 0),
     });
     this.wake();
     this.dirty = true;
@@ -338,7 +349,10 @@ class Engine {
     this.reacquire = now;
     this.stage = null;
     stage.stop();
-    if (now === -Infinity) send({ type: 'cue', cue: { kind: 'stop' } });
+    if (now === -Infinity) {
+      send({ type: 'cue', cue: { kind: 'stop' } });
+      this.laugh = null;
+    }
     for (let slot = 0; slot < MAX_GRIPS; slot++) this.audioPort?.postMessage({ grip: slot, held: false });
     this.restoreCloth();
     if (announce) {
@@ -742,6 +756,9 @@ scope.onmessage = (ev: MessageEvent<ToEngine>) => {
       break;
     case 'prefetch':
       engine.prefetch(m.name);
+      break;
+    case 'laugh':
+      engine.heardLaugh(m.envelope, m.start);
       break;
     case 'visibility':
       engine.setVisible(m.visible);

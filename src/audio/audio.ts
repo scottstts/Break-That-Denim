@@ -1,10 +1,12 @@
 import workletUrl from './worklet.ts?worker&url';
 import type { SoundCue } from '../shared/messages';
+import { loudness } from './envelope';
 import { glitchNoise } from './glitch';
 import { prepareSource } from './tearVoice';
 
 const recordingUrl = `${import.meta.env.BASE_URL}fabric_tear_sound_sample.mp3`;
 const laughUrl = `${import.meta.env.BASE_URL}exprerience_sounds/creepy_laugh.mp3`;
+const ambientUrl = `${import.meta.env.BASE_URL}exprerience_sounds/ambiant.mp3`;
 /** Fades at the edges of a signal-noise burst (s). */
 const EDGE = 0.015;
 
@@ -21,10 +23,17 @@ export class TearAudio {
   private starting: Promise<void> | null = null;
   private readonly connect: (port: MessagePort) => void;
   private readonly recording: Promise<ArrayBuffer | null>;
-  /** Staged sounds: the laugh (fetched when an experience is in view, decoded once audio runs) and what plays. */
-  private laughBytes: Promise<ArrayBuffer | null> | null = null;
-  private laugh: Promise<AudioBuffer | null> | null = null;
+  /** Staged recordings by URL (fetched when an experience is in view, decoded once audio runs) and what plays. */
+  private readonly staged = new Map<string, { bytes: Promise<ArrayBuffer | null>; buffer: Promise<AudioBuffer | null> | null }>();
   private readonly playing = new Set<AudioScheduledSourceNode>();
+  /** The ambience playing, and the gain that fades it. */
+  private ambient: { src: AudioBufferSourceNode; gain: GainNode } | null = null;
+  private laughEnvelope: Float32Array | null = null;
+  /**
+   * The laugh started: its loudness envelope (envelope.ts) and when it is heard from (ms since the
+   * epoch: performance.timeOrigin + now, comparable across threads).
+   */
+  onLaugh: ((envelope: Float32Array, start: number) => void) | null = null;
 
   constructor(connect: (port: MessagePort) => void) {
     this.connect = connect;
@@ -69,18 +78,28 @@ export class TearAudio {
 
   /** Fetch the staged sounds ahead of use (an experience is about to be chosen); decoded once audio runs. */
   prefetchStaged(): void {
-    this.laughBytes ??= fetch(laughUrl)
-      .then((r) => (r.ok ? r.arrayBuffer() : null))
-      .catch(() => null);
-    if (this.context) void this.laughBuffer(this.context);
+    for (const url of [laughUrl, ambientUrl]) {
+      this.stagedEntry(url);
+      if (this.context) void this.stagedBuffer(this.context, url);
+    }
   }
 
-  private laughBuffer(context: AudioContext): Promise<AudioBuffer | null> {
-    this.laughBytes ??= fetch(laughUrl)
-      .then((r) => (r.ok ? r.arrayBuffer() : null))
-      .catch(() => null);
-    this.laugh ??= this.laughBytes.then((b) => (b ? context.decodeAudioData(b) : null)).catch(() => null);
-    return this.laugh;
+  private stagedEntry(url: string) {
+    let e = this.staged.get(url);
+    if (!e) {
+      const bytes = fetch(url)
+        .then((r) => (r.ok ? r.arrayBuffer() : null))
+        .catch(() => null);
+      e = { bytes, buffer: null };
+      this.staged.set(url, e);
+    }
+    return e;
+  }
+
+  private stagedBuffer(context: AudioContext, url: string): Promise<AudioBuffer | null> {
+    const e = this.stagedEntry(url);
+    e.buffer ??= e.bytes.then((b) => (b ? context.decodeAudioData(b) : null)).catch(() => null);
+    return e.buffer;
   }
 
   /** Play (or stop) a staged experience's sound now. */
@@ -97,17 +116,47 @@ export class TearAudio {
         }
       }
       this.playing.clear();
+      this.ambient = null;
+      return;
+    }
+    if (c.kind === 'ambient') {
+      // the room's sound under everything, from the start, at its own level
+      const at = context.currentTime;
+      void this.stagedBuffer(context, ambientUrl).then((buffer) => {
+        if (!buffer) return;
+        const src = context.createBufferSource();
+        src.buffer = buffer;
+        const gain = context.createGain();
+        src.connect(gain).connect(context.destination);
+        // a late decode starts it where it would be by now
+        src.start(context.currentTime, Math.min(buffer.duration, context.currentTime - at));
+        this.track(src);
+        this.ambient = { src, gain };
+      });
+      return;
+    }
+    if (c.kind === 'ambientFade') {
+      const a = this.ambient;
+      if (!a) return;
+      const t = context.currentTime;
+      a.gain.gain.setValueAtTime(a.gain.gain.value, t);
+      a.gain.gain.linearRampToValueAtTime(0, t + c.duration);
+      a.src.stop(t + c.duration);
+      this.ambient = null;
       return;
     }
     if (c.kind === 'laugh') {
       // the recording as it is: whole, at its own level
-      void this.laughBuffer(context).then((buffer) => {
+      void this.stagedBuffer(context, laughUrl).then((buffer) => {
         if (!buffer) return;
         const src = context.createBufferSource();
         src.buffer = buffer;
         src.connect(context.destination);
         src.start();
         this.track(src);
+        this.laughEnvelope ??= loudness(Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c)), buffer.sampleRate);
+        const latency = context.outputLatency || context.baseLatency || 0;
+        this.onLaugh?.(this.laughEnvelope, performance.timeOrigin + performance.now() + 1000 * latency);
       });
       return;
     }

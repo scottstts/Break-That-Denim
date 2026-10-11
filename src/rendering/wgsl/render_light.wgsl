@@ -16,6 +16,17 @@ fn keyLight(P: vec3<f32>) -> vec4<f32> {
   return vec4<f32>(Ld, F.keyPos.w * fall * mix(F.keyShape.y, 1.0, cone));
 }
 
+// The camera's light (direction to it, irradiance; times F.torchColor where used): a small source at the
+// lens, so nothing the camera sees is in its shadow (no shadow map); inverse square, its cone.
+fn torchLight(P: vec3<f32>) -> vec4<f32> {
+  if (F.torchPos.w <= 0.0) { return vec4<f32>(0.0, 0.0, 1.0, 0.0); }
+  let d = F.torchPos.xyz - P;
+  let r2 = max(dot(d, d), 1e-4);
+  let Ld = d * inverseSqrt(r2);
+  let cone = smoothstep(F.torchAxis.w, F.torchColor.w, dot(-Ld, F.torchAxis.xyz));
+  return vec4<f32>(Ld, F.torchPos.w * cone / r2);
+}
+
 // Fibre BRDF times cos for one light: diffuse from a fibrous yarn surface, a longitudinal specular
 // lobe on the fibre direction T, and grazing sheen from loose surface fibres.
 fn fiberShade(N: vec3<f32>, T: vec3<f32>, V: vec3<f32>, Ldir: vec3<f32>, albedo: vec3<f32>, fuzz: f32) -> vec3<f32> {

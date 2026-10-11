@@ -383,8 +383,9 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
   let shO = shadowOver(in.world, Nf);
   let over = F.overColor.rgb * shO;
   let amb = F.ambient.rgb * (0.55 + 0.45 * Nf.z);
+  let cam = torchLight(in.world);
   // direct irradiance on the cloth's plane, for the haze of fibres bridging the grooves
-  let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) * F.keyColor.rgb + over * max(dot(Nf, F.overDir.xyz), 0.0);
+  let hazeE = key.w * sh * max(dot(Nf, key.xyz), 0.0) * F.keyColor.rgb + over * max(dot(Nf, F.overDir.xyz), 0.0) + cam.w * max(dot(Nf, cam.xyz), 0.0) * F.torchColor.rgb;
   // the rim's loose fibres: pale albedo, more sheen, weave washed out toward the edge
   var fib = vec4<f32>(0.0);
   if (rim.rim > 0.0) { fib = rimFibres(rest, rim.dir, in.layer, pix); }
@@ -491,6 +492,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let Nl = normalize(nSum);
     let Tl = normalize(tSum - dot(tSum, Nl) * Nl + 1e-6 * Tu);
     acc = fiberShade(Nl, Tl, Vv, key.xyz, albDirect * inv, fuzz * inv) * (key.w * sh) * F.keyColor.rgb + fiberShade(Nl, Tl, Vv, F.overDir.xyz, albDirect * inv, fuzz * inv) * over + amb * albAmb * inv;
+    if (cam.w > 0.0) { acc += fiberShade(Nl, Tl, Vv, cam.xyz, albDirect * inv, fuzz * inv) * cam.w * F.torchColor.rgb; }
     // loose fibres bridging the grooves: a faint haze lifts the deepest points
     acc = mix(acc, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * groove * inv * fuzz * inv);
     acc *= cnt;
@@ -522,6 +524,7 @@ fn fsMain(in: VOut, @builtin(front_facing) ff: bool) -> FsOut {
     let fz = mix(lf.fuzz, lw.fuzz, wf) + rimFuzz + 0.5 * weak;
     let albD = albedo * mix(0.55, 1.0, ao);
     var ct = fiberShade(Ny, Tf, Vv, key.xyz, albD, fz) * (key.w * sh) * F.keyColor.rgb + fiberShade(Ny, Tf, Vv, F.overDir.xyz, albD, fz) * over + amb * albedo * ao;
+    if (cam.w > 0.0) { ct += fiberShade(Ny, Tf, Vv, cam.xyz, albD, fz) * cam.w * F.torchColor.rgb; }
     ct = mix(ct, (hazeE * 0.06 + amb * 0.6) * vec3<f32>(0.32, 0.36, 0.48), 0.12 * (1.0 - ao) * fz);
     color = select(mix(color, ct, lodTile), ct, cnt == 0.0);
     if (lodTile >= 1.0) {

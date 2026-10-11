@@ -18,6 +18,13 @@ export interface ClipEvent {
   args: number[];
 }
 
+/** The jaw: its joint, opening axis in that joint's frame, radians per unit of opening. */
+export interface ClipJaw {
+  joint: string;
+  axis: [number, number, number];
+  rad: number;
+}
+
 interface ClipHeader {
   version: number;
   fps: number;
@@ -28,6 +35,7 @@ interface ClipHeader {
   skeleton: number[];
   channels: { name: string; size: number }[];
   events: ClipEvent[];
+  jaw: ClipJaw;
 }
 
 /** Everything a frame of the clip says, at one time (channel arrays are reused between samples). */
@@ -45,6 +53,12 @@ export interface ClipSample {
   bulbCone: [number, number];
   bulbI: number;
   bulbColor: V;
+  /** The camera's light: position, unit aim, cosines of its outer and inner cone, radiant intensity, colour. */
+  torchPos: V;
+  torchAim: V;
+  torchCone: [number, number];
+  torchI: number;
+  torchColor: V;
   /** The pit glow below the cloth: position, radiant intensity per channel. */
   pitPos: V;
   pitI: V;
@@ -58,6 +72,9 @@ export interface ClipSample {
   glitch: number;
   /** The picture holds (a frozen frame of the broken signal). */
   freeze: boolean;
+  /** The jaw's keyed opening (0..1) and how far the laugh's loudness (0..1) opens it further. */
+  jawOpen: number;
+  jawLaugh: number;
 }
 
 export class Clip {
@@ -71,6 +88,7 @@ export class Clip {
   /** World matrix of the skeleton's parent space (the glTF space the joints' locals are in), column-major. */
   readonly skeleton: Float64Array;
   readonly events: ClipEvent[];
+  readonly jaw: ClipJaw;
   private readonly data: Float32Array;
   private readonly quats: Int16Array;
   private readonly width: number;
@@ -82,7 +100,7 @@ export class Clip {
     if (head.getUint32(0, true) !== MAGIC) throw new Error('not a clip');
     const len = head.getUint32(4, true);
     const h = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, len))) as ClipHeader;
-    if (h.version !== 1) throw new Error(`clip version ${h.version}`);
+    if (h.version !== 2) throw new Error(`clip version ${h.version}`);
     this.fps = h.fps;
     this.frames = h.frames;
     this.duration = (h.frames - 1) / h.fps;
@@ -91,6 +109,7 @@ export class Clip {
     this.root = h.root;
     this.skeleton = Float64Array.from(h.skeleton);
     this.events = h.events;
+    this.jaw = h.jaw;
     let w = 0;
     for (const c of h.channels) {
       this.offset[c.name] = w;
@@ -112,6 +131,11 @@ export class Clip {
       bulbCone: [0, 1],
       bulbI: 0,
       bulbColor: [1, 1, 1],
+      torchPos: [0, 0, 0],
+      torchAim: [0, 0, -1],
+      torchCone: [0, 1],
+      torchI: 0,
+      torchColor: [1, 1, 1],
       pitPos: [0, 0, 0],
       pitI: [0, 0, 0],
       over: 0,
@@ -122,6 +146,8 @@ export class Clip {
       vignette: 0,
       glitch: 0,
       freeze: false,
+      jawOpen: 0,
+      jawLaugh: 0,
     };
   }
 
@@ -150,6 +176,11 @@ export class Clip {
     v('bulbCone', s.bulbCone);
     s.bulbI = ch('bulbI');
     v('bulbColor', s.bulbColor);
+    v('torchPos', s.torchPos);
+    v('torchAim', s.torchAim);
+    v('torchCone', s.torchCone);
+    s.torchI = ch('torchI');
+    v('torchColor', s.torchColor);
     v('pitPos', s.pitPos);
     v('pitI', s.pitI);
     s.over = ch('over');
@@ -158,6 +189,8 @@ export class Clip {
     s.grade = ch('grade');
     s.grain = ch('grain');
     s.vignette = ch('vignette');
+    s.jawOpen = ch('jawOpen');
+    s.jawLaugh = ch('jawLaugh');
     // the glitch's look changes from frame to frame (no blending between corrupted pictures)
     s.glitch = this.data[Math.round(x) * this.width + this.offset.glitch];
     s.freeze = this.data[f0 * this.width + this.offset.freeze] >= 0.5;

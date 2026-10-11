@@ -31,6 +31,8 @@ export interface StageHost {
   /** A sound cue for the main thread, and holds starting or ending (the tear voice). */
   cue(e: StageEvent): void;
   held(slot: number, held: boolean): void;
+  /** Loudness (0..1) of the staged laugh as heard now: it moves the jaw. */
+  laugh(): number;
 }
 
 /** A hand's hold: fixed in the frame of the joint that is in the cloth; the nodes it holds. */
@@ -55,7 +57,7 @@ const SIDES = ['L', 'R'] as const;
 const TARGET_Z = DEFAULT_CAMERA.target[2];
 
 /** The renderer's lighting and film as the product has them (restored when the stage ends). */
-type Lighting = Pick<Renderer, 'keyIntensity' | 'overIntensity' | 'exposure' | 'keyOffset' | 'keyAim' | 'keyCone' | 'keyInner' | 'keyLeak' | 'keyColor' | 'ambient'>;
+type Lighting = Pick<Renderer, 'keyIntensity' | 'overIntensity' | 'exposure' | 'keyOffset' | 'keyAim' | 'keyCone' | 'keyInner' | 'keyLeak' | 'keyColor' | 'ambient' | 'torchIntensity'>;
 
 /**
  * One run of the staged experience: the clip's events (hooks, grabs, releases, sound cues) applied on
@@ -94,6 +96,7 @@ export class Stage {
       keyLeak: r.keyLeak,
       keyColor: [...r.keyColor],
       ambient: [...r.ambient],
+      torchIntensity: r.torchIntensity,
     };
     r.showFloor = false;
     // the room's lights stay put while the camera moves; the bulb is placed relative to this anchor
@@ -147,6 +150,12 @@ export class Stage {
     r.keyLeak = 0;
     r.keyColor = [...s.bulbColor];
     r.overIntensity = s.over;
+    // the camera's light, on the same failing supply as the bulb
+    r.torchPos = [...s.torchPos];
+    r.torchAim = [...s.torchAim];
+    r.torchCone = [s.torchCone[0], s.torchCone[1]];
+    r.torchIntensity = s.torchI;
+    r.torchColor = [...s.torchColor];
     r.ambient = [b.ambient[0] * s.ambient, b.ambient[1] * s.ambient, b.ambient[2] * s.ambient];
     r.exposure = b.exposure * s.exposure;
     this.host.creature.setFrame(this.host.puppet.rig.skinMatrices(), s.pitPos, s.pitI);
@@ -197,7 +206,7 @@ export class Stage {
     const s = this.clip.sample(t);
     if (t === 0) this.placeCamera(s);
     const puppet = this.host.puppet;
-    puppet.play(s);
+    puppet.play(s, this.host.laugh());
     for (const side of SIDES) puppet.reach(side, this.correction(side, t));
   }
 

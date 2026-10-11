@@ -11,7 +11,8 @@ import type { Side } from './puppet';
  *
  * The laugh (public/exprerience_sounds/creepy_laugh.mp3) is one recording, already cut to the
  * experience as it plays in the browser: started once at LAUGH_AT and played whole (the clip's laugh
- * markers cue the bursts of an earlier recording and are not used).
+ * markers cue the bursts of an earlier recording and are not used). The ambience (ambiant.mp3) plays
+ * from the start and fades out over the final breakup, as its glitch sound plays.
  */
 
 /** Something the stage does at a time (Stage applies them in order). */
@@ -26,8 +27,10 @@ export type StageEvent =
   | { t: number; kind: 'grab'; side: Side }
   /** A hand lets go. */
   | { t: number; kind: 'release'; side: Side }
-  /** A sound: the laugh recording (whole), or a burst of signal noise. */
+  /** A sound: the laugh recording (whole), the ambience (start, fade out), or a burst of signal noise. */
   | { t: number; kind: 'laugh' }
+  | { t: number; kind: 'ambient' }
+  | { t: number; kind: 'ambientFade'; duration: number }
   | { t: number; kind: 'glitch'; duration: number; level: number };
 
 export const BENEATH_CLIP_URL = '/stage/smilie.clip';
@@ -66,6 +69,9 @@ export function stageEvents(clip: Clip): StageEvent[] {
         throw new Error(`unknown clip event ${e.name}`);
     }
   });
-  events.push({ t: LAUGH_AT, kind: 'laugh' });
+  events.push({ t: LAUGH_AT, kind: 'laugh' }, { t: 0, kind: 'ambient' });
+  // the ambience fades out over the final breakup (the last glitch, which runs to the end)
+  const breakup = events.reduce<StageEvent | null>((last, e) => (e.kind === 'glitch' && (!last || e.t >= last.t) ? e : last), null);
+  if (breakup?.kind === 'glitch') events.push({ t: breakup.t, kind: 'ambientFade', duration: breakup.duration });
   return events.sort((a, b) => a.t - b.t);
 }

@@ -1,5 +1,13 @@
 # Handoff (rolling)
 
+Latest (2026-10-11, round 2): "Beneath" re-staged around the head-through-the-hole stare (user: the
+shock hinges on seeing the full face; no thread explosions anywhere). Blender scene re-animated and
+saved (one .blend, the latest: no version copies kept); rim rips dropped, head snap eased (round 3);
+runtime: camera light, laugh-driven jaw, clip v2. Decision record updated (same file). Verify with
+`TRACE=1 node tools/gpu/run.mjs tools/stage/beneath.ts` (ruptures per 0.1 s), `LIT=1` + `CAM` for side
+views, `tools/stage/clawprobe.ts`; review sheet `artifacts/captures/beneath-stare-review.png`. Re-bake:
+background Blender runs animate.py, saves, runs export.py (no live Blender needed).
+
 Latest (2026-10-11): "Beneath" now plays the Blender-approved clip (user approved the poses; the old
 source model `smily_horror_monster.glb` was removed at their request; `public/models/smilie.glb` is the
 model, gitignored). Decision record: `docs/decisions/2026-10-11-staged-beneath.md`.
